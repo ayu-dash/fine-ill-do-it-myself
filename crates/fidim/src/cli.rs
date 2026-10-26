@@ -59,6 +59,19 @@ pub fn start_all(cli: &CliEnv) -> Result<Vec<String>> {
     )
 }
 
+/// Start one named service (php-<ver>, mariadb, or a web server).
+pub fn start_service(
+    cli: &CliEnv,
+    name: &str,
+) -> Result<fine_ill_do_it_myself::service::ServiceStatus> {
+    orchestrator::start_service(&cli.env, &cli.ports, &RealRunner, &cli.php_default, name)
+}
+
+/// Stop one named service (php-<ver>, mariadb, or a web server).
+pub fn stop_service(cli: &CliEnv, name: &str) -> Result<()> {
+    orchestrator::stop_service(&cli.env, &cli.ports, &RealRunner, name)
+}
+
 pub fn stop_all(cli: &CliEnv) -> Result<()> {
     orchestrator::stop_all(&cli.env, &cli.ports, &RealRunner)
 }

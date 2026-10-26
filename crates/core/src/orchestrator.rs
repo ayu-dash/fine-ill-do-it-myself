@@ -244,6 +244,21 @@ pub fn start_service<R: Runner + Clone>(
     let spec = service_cmds(env, ports, php_version)?
         .into_iter()
         .find(|(n, ..)| n == name)
+        .or_else(|| {
+            // a web server that is installed but not the chosen default
+            if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name) {
+                resolve_web_bin(env, name).ok().map(|bin| {
+                    (
+                        name.to_string(),
+                        bin.display().to_string(),
+                        web_args(env, name),
+                        env.paths.logs().join(format!("{name}.log")),
+                    )
+                })
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
     let (name, bin, args, log) = spec;
     check_port(fpm_port, &bin)?;
@@ -365,6 +380,21 @@ fn check_port(_port: u16, bin: &str) -> Result<()> {
         return Err(Error::Other(format!("missing binary {bin}")));
     }
     Ok(())
+}
+
+/// Stop a single named service (php-<ver>, mariadb, or a web server).
+pub fn stop_service<R: Runner + Clone>(
+    env: &Env,
+    ports: &PortPlan,
+    runner: &R,
+    name: &str,
+) -> Result<()> {
+    Supervisor {
+        env: env.clone(),
+        ports: ports.clone(),
+        runner: runner.clone(),
+    }
+    .stop(name)
 }
 
 /// Stop every service with a pid file.

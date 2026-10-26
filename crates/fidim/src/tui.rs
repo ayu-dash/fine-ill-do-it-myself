@@ -451,6 +451,7 @@ pub fn run_tui(
                     app.on_key(k.code);
                     while let Some(a) = app.actions.pop() {
                         act(&mut app, &a);
+                        refresh(&mut app);
                     }
                 }
             }

@@ -20,8 +20,14 @@ struct Cli {
 enum Commands {
     /// Open the interactive TUI
     Tui,
-    Start,
-    Stop,
+    Start {
+        /// Start a single service instead of everything
+        service: Option<String>,
+    },
+    Stop {
+        /// Stop a single service instead of everything
+        service: Option<String>,
+    },
     Restart,
     Status,
     /// Manage /etc/hosts entries for .test projects
@@ -104,15 +110,27 @@ fn main() {
 
 fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
     match cli.command {
-        Some(Commands::Start) => {
-            for s in cli::start_all(&env)? {
-                println!("{s}");
+        Some(Commands::Start { service }) => match service.as_deref() {
+            None => {
+                for s in cli::start_all(&env)? {
+                    println!("{s}");
+                }
             }
-        }
-        Some(Commands::Stop) => {
-            cli::stop_all(&env)?;
-            println!("stopped");
-        }
+            Some(name) => {
+                let s = cli::start_service(&env, name)?;
+                println!("{}: {:?}", s.name, s.state);
+            }
+        },
+        Some(Commands::Stop { service }) => match service.as_deref() {
+            None => {
+                cli::stop_all(&env)?;
+                println!("stopped");
+            }
+            Some(name) => {
+                cli::stop_service(&env, name)?;
+                println!("{name} stopped");
+            }
+        },
         Some(Commands::Restart) => {
             cli::stop_all(&env)?;
             for s in cli::start_all(&env)? {
