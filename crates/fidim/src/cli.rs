@@ -154,3 +154,8 @@ pub fn hosts_missing(cli: &CliEnv) -> Result<Vec<String>> {
 }
 
 const HOST_TLD: &str = "test";
+
+/// Run the unix-socket daemon until terminated.
+pub fn daemon(env: &Env, sock: &std::path::Path) -> Result<()> {
+    crate::daemon::run_daemon(env.clone(), sock)
+}
