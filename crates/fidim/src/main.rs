@@ -26,6 +26,8 @@ enum Commands {
     Status,
     /// Manage /etc/hosts entries for .test projects
     Hosts,
+    /// Run the background daemon exposing a unix socket
+    Daemon,
     Projects,
     /// Download and install a managed binary (caddy, php-fpm-8.4, ...)
     Install {
@@ -139,6 +141,10 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("php {version} removed");
             }
         },
+        Some(Commands::Daemon) => {
+            let sock = env.env.paths.data().join("fidim.sock");
+            cli::daemon(&env.env, &sock)?;
+        }
         Some(Commands::Tui) | None => {
             tui::run_tui(&env.env)?;
         }
@@ -177,4 +183,5 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     }
 }
+mod daemon;
 mod tui;
