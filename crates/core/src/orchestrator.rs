@@ -16,10 +16,23 @@ use crate::supervisor::{with_log_append, Env, PortPlan, Supervisor};
 use crate::web::caddyfile::generate_caddyfile_for_projects_tls;
 
 pub const CADDY: &str = "caddy";
+pub const NGINX: &str = "nginx";
+pub const APACHE: &str = "httpd";
 pub const PHP_BASE_PORT: u16 = 9000;
 
 pub fn default_php(lock: &Lock) -> String {
     lock.php_default.clone().unwrap_or_else(|| "8.4".into())
+}
+
+/// Which web server the user picked (caddy | apache | nginx).
+pub fn default_web(lock: &Lock) -> String {
+    lock.web_default.clone().unwrap_or_else(|| CADDY.into())
+}
+
+/// Load the default web server from lock.toml (caddy when unset).
+pub fn web_server(env: &Env) -> String {
+    let lock = Lock::load(&env.lock_path()).unwrap_or_default();
+    default_web(&lock)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,29 +85,70 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
         eprintln!("warn: certificate generation skipped: {e}");
     }
     let certs_dir = env.paths.etc().join("certs");
-    let tls_line = |p: &String| {
-        let cert = certs_dir.join(format!("{p}.crt"));
-        if cert.exists() {
-            format!(
-                "\ttls {} {}\n",
-                cert.display(),
-                certs_dir.join(format!("{p}.key")).display()
-            )
-        } else {
-            "\ttls internal\n".to_string()
-        }
+    let certs_str = certs_dir.display().to_string();
+    let lock = Lock::load(&env.lock_path()).unwrap_or_default();
+    let web = default_web(&lock);
+    let certs_pair = |p: &str| {
+        let crt = certs_dir.join(format!("{p}.crt"));
+        let key = certs_dir.join(format!("{p}.key"));
+        (crt.exists() && key.exists()).then_some((crt, key))
     };
-    std::fs::write(
-        env.caddyfile_path(),
-        generate_caddyfile_for_projects_tls(
-            &sites,
-            fpm_port,
-            &projects,
-            ports.http,
-            ports.https,
-            &tls_line,
-        )?,
-    )?;
+    match web.as_str() {
+        APACHE => {
+            let bin = resolve_web_bin(env, APACHE)?;
+            crate::web::apache::regenerate(
+                &env.paths.etc(),
+                &apache_server_root(&bin).display().to_string(),
+                &env.paths.pids().join("httpd.pid").display().to_string(),
+                &env.paths.logs().join("httpd.log").display().to_string(),
+                &sites,
+                &projects,
+                fpm_port,
+                ports.http,
+                ports.https,
+                Some(&certs_str),
+            )?;
+        }
+        NGINX => {
+            crate::web::nginx::regenerate(
+                &env.paths.etc(),
+                &env.paths.pids().join("nginx.pid").display().to_string(),
+                &env.paths.logs().join("nginx.log").display().to_string(),
+                &sites,
+                &projects,
+                fpm_port,
+                ports.http,
+                ports.https,
+                Some(&certs_str),
+            )?;
+        }
+        _ => {
+            let tls_line = |p: &String| {
+                let cert = certs_dir.join(format!("{p}.crt"));
+                if cert.exists() {
+                    format!(
+                        "\ttls {} {}\n",
+                        cert.display(),
+                        certs_dir.join(format!("{p}.key")).display()
+                    )
+                } else {
+                    "\ttls internal\n".to_string()
+                }
+            };
+            std::fs::write(
+                env.caddyfile_path(),
+                generate_caddyfile_for_projects_tls(
+                    &sites,
+                    fpm_port,
+                    &projects,
+                    ports.http,
+                    ports.https,
+                    &tls_line,
+                )?,
+            )?;
+        }
+    }
+    let _ = certs_pair;
     std::fs::write(
         env.fpm_conf_path(php_version),
         generate_fpm_conf(
@@ -133,39 +187,37 @@ pub fn start_all<R: Runner + Clone>(
     let fpm_name = format!("php-{php_version}");
 
     // reap ghost owners of our generated configs (pid files were lost)
+    let web = web_server(env);
+    let conf_needle = web_config_path(env, &web).display().to_string();
     let needles = vec![
-        env.caddyfile_path().display().to_string(),
+        conf_needle,
         env.fpm_conf_path(php_version).display().to_string(),
     ];
     let ghosts = reap_owners(&needles);
     let _ = ghosts;
 
-    let mut cmds = vec![
-        (
-            CADDY.to_string(),
-            env.caddy_bin().display().to_string(),
-            vec![
-                "run".to_string(),
-                "--config".to_string(),
-                env.caddyfile_path().display().to_string(),
-            ],
-            env.caddy_log(),
-        ),
-        (
-            fpm_name.clone(),
-            env.paths
-                .bin()
-                .join(format!("php-fpm-{php_version}"))
-                .display()
-                .to_string(),
-            vec![
-                "-F".to_string(),
-                "-y".to_string(),
-                env.fpm_conf_path(php_version).display().to_string(),
-            ],
-            env.paths.logs().join(format!("php-{php_version}.log")),
-        ),
-    ];
+    let web = web_server(env);
+    let server_bin = resolve_web_bin(env, &web)?;
+    let mut cmds = vec![(
+        web.clone(),
+        server_bin.display().to_string(),
+        web_args(env, &web),
+        env.paths.logs().join(format!("{web}.log")),
+    )];
+    cmds.push((
+        fpm_name.clone(),
+        env.paths
+            .bin()
+            .join(format!("php-fpm-{php_version}"))
+            .display()
+            .to_string(),
+        vec![
+            "-F".to_string(),
+            "-y".to_string(),
+            env.fpm_conf_path(php_version).display().to_string(),
+        ],
+        env.paths.logs().join(format!("php-{php_version}.log")),
+    ));
     // mariadb (system binary) when available
     if let Ok(true) = mariadb_available(env) {
         let mariadb_cnf = env.paths.etc().join("my.cnf");
@@ -196,6 +248,79 @@ pub fn start_all<R: Runner + Clone>(
     }
 
     Ok(out)
+}
+
+/// Binary path and CLI args per web server choice.
+pub fn web_bin_path(env: &Env, web: &str) -> std::path::PathBuf {
+    match web {
+        NGINX => env.paths.bin().join("nginx"),
+        APACHE => env.paths.bin().join("httpd"),
+        _ => env.caddy_bin(),
+    }
+}
+
+/// Data-root binary when present, otherwise `PATH` fallback; error when
+/// neither exists.
+pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
+    let local = web_bin_path(env, web);
+    if local.exists() {
+        return Ok(local);
+    }
+    if let Some(sys) = which_system(web) {
+        return Ok(sys);
+    }
+    Err(Error::Other(format!(
+        "missing {web} binary: install via `fidim install {web}` or ensure it is on PATH"
+    )))
+}
+
+/// Absolute `PATH`-resolved binary name (httpd/nginx/caddy); None when absent
+/// from PATH or data/bin.
+pub fn which_system(bin: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("/usr/bin/which")
+        .arg(bin)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let p = String::from_utf8_lossy(&out.stdout);
+        let p = p.trim();
+        (!p.is_empty()).then(|| PathBuf::from(p))
+    } else {
+        None
+    }
+}
+
+pub fn web_config_path(env: &Env, web: &str) -> std::path::PathBuf {
+    match web {
+        NGINX => env.paths.etc().join("nginx/nginx.conf"),
+        APACHE => env.paths.etc().join("apache/httpd.conf"),
+        _ => env.caddyfile_path(),
+    }
+}
+
+/// Directory that contains `modules/` next to an httpd binary:
+/// `<bin>/../..` when a `modules` dir sits there (XAMPP layout), else bin dir.
+pub fn apache_server_root(bin: &std::path::Path) -> std::path::PathBuf {
+    for cand in [
+        bin.parent().unwrap_or(Path::new(".")),
+        bin.parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(Path::new(".")),
+    ] {
+        if cand.join("modules").is_dir() {
+            return cand.to_path_buf();
+        }
+    }
+    bin.parent().unwrap_or(Path::new(".")).to_path_buf()
+}
+
+pub fn web_args(env: &Env, web: &str) -> Vec<String> {
+    let conf = web_config_path(env, web).display().to_string();
+    match web {
+        NGINX => vec!["-c".into(), conf],
+        APACHE => vec!["-f".into(), conf, "-DFOREGROUND".into()],
+        _ => vec!["run".into(), "--config".into(), conf],
+    }
 }
 
 /// Fail early with a helpful message and alternative port when something
@@ -232,8 +357,7 @@ pub fn status_all<R: Runner + Clone>(
         runner: runner.clone(),
     };
     let mut names = sup.known_services();
-    {
-        let n = CADDY;
+    for n in [CADDY, NGINX, APACHE, MARIADB] {
         if !names.iter().any(|e| e == n) {
             names.push(n.to_string());
         }
@@ -255,6 +379,64 @@ pub fn list_projects(env: &Env) -> Vec<String> {
     Vec::new()
 }
 
+#[cfg(test)]
+mod webchoice_tests {
+    use super::*;
+
+    #[test]
+    fn default_web_falls_back_to_caddy() {
+        assert_eq!(default_web(&Lock::default()), CADDY);
+        let lock = Lock {
+            web_default: Some(NGINX.into()),
+            ..Lock::default()
+        };
+        assert_eq!(default_web(&lock), NGINX);
+    }
+
+    #[test]
+    fn web_paths_and_args_per_server() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().to_path_buf(), t.path().join("Sites"));
+        assert!(web_config_path(&env, CADDY)
+            .display()
+            .to_string()
+            .contains("Caddyfile"));
+        let apache = web_config_path(&env, APACHE);
+        assert!(apache.display().to_string().ends_with("apache/httpd.conf"));
+        let nginx = web_config_path(&env, NGINX);
+        assert!(nginx.display().to_string().ends_with("nginx/nginx.conf"));
+        assert_eq!(
+            web_args(&env, APACHE),
+            vec![
+                "-f".to_string(),
+                apache.display().to_string(),
+                "-DFOREGROUND".to_string()
+            ]
+        );
+        assert_eq!(
+            web_args(&env, NGINX),
+            vec!["-c".to_string(), nginx.display().to_string()]
+        );
+        assert_eq!(
+            web_args(&env, CADDY),
+            vec![
+                "run".to_string(),
+                "--config".to_string(),
+                env.caddyfile_path().display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn apache_server_root_prefers_modules_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join("opt/httpd/bin/httpd");
+        std::fs::create_dir_all(t.path().join("opt/httpd/bin")).unwrap();
+        std::fs::create_dir_all(t.path().join("opt/httpd/modules")).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        assert_eq!(apache_server_root(&bin), t.path().join("opt/httpd"));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

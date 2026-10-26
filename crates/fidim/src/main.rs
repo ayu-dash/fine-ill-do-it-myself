@@ -40,6 +40,19 @@ enum Commands {
         #[command(subcommand)]
         cmd: PhpCommands,
     },
+    /// Choose the web server: caddy, apache (httpd) or nginx
+    Web {
+        #[command(subcommand)]
+        cmd: WebCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebCommands {
+    /// Use one of: caddy, apache, nginx
+    Use { server: String },
+    /// Show currently selected web server
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -146,6 +159,19 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             PhpCommands::Remove { version } => {
                 cli::php_remove(&env, &version)?;
                 println!("php {version} removed");
+            }
+        },
+        Some(Commands::Web { cmd }) => match cmd {
+            WebCommands::Use { server } => {
+                cli::web_use(&env, &server)?;
+                println!("web server: {server}");
+            }
+            WebCommands::Show => {
+                let lock = fine_ill_do_it_myself::Lock::load(&env.env.lock_path())?;
+                println!(
+                    "{}",
+                    fine_ill_do_it_myself::orchestrator::default_web(&lock)
+                );
             }
         },
         Some(Commands::Daemon) => {

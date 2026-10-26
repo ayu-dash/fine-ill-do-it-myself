@@ -142,6 +142,24 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     Ok(())
 }
 
+/// Persist the chosen web server into lock.toml.
+pub fn web_use(cli: &CliEnv, server: &str) -> Result<()> {
+    let name = match server {
+        "caddy" => fine_ill_do_it_myself::orchestrator::CADDY,
+        "apache" | "httpd" => fine_ill_do_it_myself::orchestrator::APACHE,
+        "nginx" => fine_ill_do_it_myself::orchestrator::NGINX,
+        other => {
+            return Err(fine_ill_do_it_myself::Error::Other(format!(
+                "unknown web server {other}; use caddy, apache or nginx"
+            )))
+        }
+    };
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    lock.web_default = Some(name.to_string());
+    lock.save(&cli.env.lock_path())?;
+    Ok(())
+}
+
 /// Uninstall a php version.
 pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
     let mut lock = Lock::load(&cli.env.lock_path())?;

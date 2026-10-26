@@ -39,6 +39,8 @@ fidim projects
 fidim hosts     # prints the missing /etc/hosts lines (needs root to apply)
 fidim           # TUI
 fidim trust     # prints the root steps to trust the local CA
+fidim web use apache   # pick the web server: caddy (default), apache, nginx
+fidim web show         # print the server currently selected
 fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim.sock
 ```
 

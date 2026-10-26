@@ -62,6 +62,8 @@ pub struct Lock {
     pub php: Vec<String>,
     #[serde(default)]
     pub php_default: Option<String>,
+    #[serde(default)]
+    pub web_default: Option<String>,
 }
 
 impl Lock {
