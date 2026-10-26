@@ -243,9 +243,10 @@ pub fn run_tui(
                     .collect();
                 let mut lst = ListState::default();
                 lst.select(Some(app.cursor.min(app.services.len().saturating_sub(1))));
+                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
                 let services_block = List::new(items).block(
                     Block::default()
-                        .title(" services ")
+                        .title(format!(" services ({web_name}) "))
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::Cyan)),

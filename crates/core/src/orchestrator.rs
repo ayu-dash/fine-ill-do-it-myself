@@ -357,7 +357,9 @@ pub fn status_all<R: Runner + Clone>(
         runner: runner.clone(),
     };
     let mut names = sup.known_services();
-    for n in [CADDY, NGINX, APACHE, MARIADB] {
+    // only advertise the chosen web server (+ mariadb when system bin exists)
+    let web = web_server(env);
+    for n in [web.as_str(), MARIADB] {
         if !names.iter().any(|e| e == n) {
             names.push(n.to_string());
         }
@@ -483,6 +485,27 @@ mod tests {
         assert!(st
             .iter()
             .all(|s| s.state == crate::service::ServiceState::Stopped));
+    }
+
+    #[test]
+    fn status_all_shows_chosen_web_only() {
+        let (env, _t) = env();
+        let lock = Lock {
+            web_default: Some(APACHE.into()),
+            ..Lock::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+        let f = FakeRunner::default();
+        let st = status_all(&env, &PortPlan::default(), &f);
+        let names: Vec<_> = st.iter().map(|s| s.name.as_str().to_string()).collect();
+        assert!(
+            names.contains(&"httpd".to_string()),
+            "chosen apache shows as httpd"
+        );
+        assert!(
+            !names.contains(&"caddy".to_string()),
+            "caddy hidden when not chosen"
+        );
     }
 
     #[test]
