@@ -13,6 +13,9 @@ pub use service::{Service, ServiceRegistry, ServiceState, ServiceStatus};
 pub fn app_display_name() -> &'static str {
     "fine ill do it myself"
 }
+pub mod orchestrator;
 pub mod php;
 pub mod supervisor;
 pub mod web;
+pub use proc::{RealRunner, Runner};
+pub use supervisor::{Env, PortPlan};

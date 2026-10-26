@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
 fine_ill_do_it_myself = { path = "../core" }
 
 [[bin]]
 name = "fidim"
 path = "src/main.rs"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+tempfile = "3.27.0"
