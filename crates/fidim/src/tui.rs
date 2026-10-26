@@ -229,6 +229,36 @@ pub fn quick_create_plan(sites: &str, name: &str) -> Vec<String> {
     plan
 }
 
+/// Which panel is focused given a cursor that walks services then projects.
+pub fn focused_panel(app: &App) -> &'static str {
+    if app.cursor < app.services.len() {
+        "services"
+    } else if app.cursor < app.services.len() + app.projects.len() {
+        "projects"
+    } else {
+        "services"
+    }
+}
+
+/// Port label per service row, shown beside its name.
+pub fn ports_label(name: &str, php_row: &str, ports: &fine_ill_do_it_myself::PortPlan) -> String {
+    if name == "mariadb" {
+        "3306".to_string()
+    } else if let Some(ver) = name.strip_prefix("php-") {
+        if php_row != ver {
+            return String::new();
+        }
+        format!(
+            "fpm {}",
+            fine_ill_do_it_myself::php::fpm::fpm_port_for(ver, 9000, ports)
+        )
+    } else if name == "caddy" || name == "httpd" || name == "nginx" {
+        format!("http:{} https:{}", ports.http, ports.https)
+    } else {
+        String::new()
+    }
+}
+
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
 pub fn run_tui(
     env: &fine_ill_do_it_myself::Env,
@@ -284,6 +314,10 @@ pub fn run_tui(
                             ServiceState::Running => ("● ", s.name.as_str(), Color::Green),
                             _ => ("○ ", s.name.as_str(), Color::DarkGray),
                         };
+                        let lock =
+                            fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                        let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                        let p = ports_label(&s.name, &php_row, &ports);
                         ListItem::new(Line::from(vec![
                             Span::styled(mark, Style::default().fg(color)),
                             Span::styled(
@@ -292,20 +326,33 @@ pub fn run_tui(
                                     .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
                             ),
+                            Span::styled(format!("  {p}"), Style::default().fg(Color::DarkGray)),
                         ]))
                     })
                     .collect();
+                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
+                let svc_focus = focused_panel(&app) == "projects";
                 let mut lst = ListState::default();
                 lst.select(Some(app.cursor.min(app.services.len().saturating_sub(1))));
-                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
-                let services_block = List::new(items).block(
-                    Block::default()
-                        .title(format!(" services ({web_name}) "))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::Cyan)),
-                );
-                f.render_stateful_widget(services_block, services, &mut lst);
+                let svc_marker = if svc_focus { " " } else { "▶ " };
+                let svc_list = List::new(items)
+                    .highlight_symbol(svc_marker.to_owned())
+                    .highlight_style(Style::default().bg(Color::Cyan))
+                    .block(
+                        Block::default()
+                            .title(format!(
+                                " services ({web_name}){} ",
+                                if svc_focus { "" } else { " ◀" }
+                            ))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(if svc_focus {
+                                Color::DarkGray
+                            } else {
+                                Color::Cyan
+                            })),
+                    );
+                f.render_stateful_widget(svc_list, services, &mut lst);
 
                 // projects panel
                 let proj_items: Vec<ListItem> = app
@@ -325,14 +372,25 @@ pub fn run_tui(
                         .saturating_sub(app.services.len())
                         .min(app.projects.len().saturating_sub(1)),
                 ));
-                let proj_block = List::new(proj_items).block(
-                    Block::default()
-                        .title(format!(" projects ({}: ~/Sites) ", app.projects.len()))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::Blue)),
-                );
-                f.render_stateful_widget(proj_block, projects, &mut plst);
+                let proj_list = List::new(proj_items)
+                    .highlight_symbol(if svc_focus { "▶ " } else { " " }.to_owned())
+                    .highlight_style(Style::default().bg(Color::Blue))
+                    .block(
+                        Block::default()
+                            .title(format!(
+                                " projects ({}: ~/Sites){} ",
+                                app.projects.len(),
+                                if svc_focus { " ◀" } else { "" }
+                            ))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(if svc_focus {
+                                Color::Blue
+                            } else {
+                                Color::DarkGray
+                            })),
+                    );
+                f.render_stateful_widget(proj_list, projects, &mut plst);
 
                 // footer with key hints
                 let hints = vec![
@@ -595,6 +653,29 @@ mod tests {
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Char('r'));
         assert_eq!(a.actions[0], Action::RestartAll);
+    }
+
+    #[test]
+    fn focused_panel_follows_cursor_into_projects() {
+        let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        assert_eq!(focused_panel(&a), "services");
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "projects");
+        a.on_key(KeyCode::Up);
+        assert_eq!(focused_panel(&a), "services");
+    }
+
+    #[test]
+    fn ports_label_per_service() {
+        let ports = fine_ill_do_it_myself::PortPlan {
+            http: 8080,
+            https: 8443,
+        };
+        assert_eq!(ports_label("caddy", "8.4", &ports), "http:8080 https:8443");
+        assert_eq!(ports_label("httpd", "8.4", &ports), "http:8080 https:8443");
+        assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
+        assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
+        assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");
     }
 
     #[test]
