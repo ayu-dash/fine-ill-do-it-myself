@@ -140,7 +140,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             }
         },
         Some(Commands::Tui) | None => {
-            println!("TUI goes here");
+            tui::run_tui(&env.env)?;
         }
     }
     Ok(())
@@ -177,3 +177,4 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     }
 }
+mod tui;
