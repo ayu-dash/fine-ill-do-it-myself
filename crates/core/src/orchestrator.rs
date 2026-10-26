@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use crate::database::{datadir_missing, generate_mariadb_cnf, start_cmd as mariadb_start_cmd};
 use crate::proc::Runner;
 use crate::supervisor::{with_log_append, Env, PortPlan, Supervisor};
-use crate::web::caddyfile::generate_caddyfile_for_projects;
+use crate::web::caddyfile::generate_caddyfile_for_projects_tls;
 
 pub const CADDY: &str = "caddy";
 pub const PHP_BASE_PORT: u16 = 9000;
@@ -67,9 +67,33 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
     let sites = env.paths.sites().display().to_string();
     let fpm_port = fpm_port_for(php_version, 9000, ports);
     let projects = list_projects(env);
+    // local CA + per-project leaf certs (silent no-op without openssl)
+    if let Err(e) = crate::web::certs::regenerate(&env.paths.etc(), &projects) {
+        eprintln!("warn: certificate generation skipped: {e}");
+    }
+    let certs_dir = env.paths.etc().join("certs");
+    let tls_line = |p: &String| {
+        let cert = certs_dir.join(format!("{p}.crt"));
+        if cert.exists() {
+            format!(
+                "\ttls {} {}\n",
+                cert.display(),
+                certs_dir.join(format!("{p}.key")).display()
+            )
+        } else {
+            "\ttls internal\n".to_string()
+        }
+    };
     std::fs::write(
         env.caddyfile_path(),
-        generate_caddyfile_for_projects(&sites, fpm_port, &projects, ports.http, ports.https)?,
+        generate_caddyfile_for_projects_tls(
+            &sites,
+            fpm_port,
+            &projects,
+            ports.http,
+            ports.https,
+            &tls_line,
+        )?,
     )?;
     std::fs::write(
         env.fpm_conf_path(php_version),
@@ -449,5 +473,39 @@ mod mariadb_tests {
         std::env::set_var("PATH", "");
         assert!(!mariadb_available(&env).unwrap());
         std::env::remove_var("PATH");
+    }
+}
+
+/// Generate caddyfile with explicit leaf-certs, falling back to `tls internal`.
+pub fn tls_caddyfile_paths(env: &Env, projects: &[String]) -> Vec<String> {
+    let certs_dir = env.paths.etc().join("certs");
+    projects
+        .iter()
+        .map(|p| certs_dir.join(format!("{p}.crt")).display().to_string())
+        .collect()
+}
+
+/// /etc/hosts snippet for the given project names, using the .test TLD.
+pub fn hosts_entries(ip: &str, projects: &[String]) -> String {
+    let mut lines = Vec::new();
+    for p in projects {
+        lines.push(format!("{ip} {}.test", p));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod hosts_tests {
+    use super::*;
+
+    #[test]
+    fn hosts_entry_lists_each_project() {
+        let out = hosts_entries("127.0.0.1", &["blog".into(), "sub".into()]);
+        assert_eq!(out, "127.0.0.1 blog.test\n127.0.0.1 sub.test");
+    }
+
+    #[test]
+    fn hosts_entry_empty_projects() {
+        assert_eq!(hosts_entries("10.0.0.2", &[]), "");
     }
 }

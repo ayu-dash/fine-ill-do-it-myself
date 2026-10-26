@@ -17,6 +17,7 @@ pub mod orchestrator;
 pub mod php;
 pub mod supervisor;
 pub mod web;
+pub use orchestrator::{hosts_entries, list_projects};
 pub use proc::{RealRunner, Runner};
 pub use supervisor::{Env, PortPlan};
 pub mod installer;
