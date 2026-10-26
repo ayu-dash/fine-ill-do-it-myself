@@ -422,6 +422,7 @@ name = "fine_ill_do_it_myself"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "libc",
  "reqwest",
  "serde",
  "sha2",

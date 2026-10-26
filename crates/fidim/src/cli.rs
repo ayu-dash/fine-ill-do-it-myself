@@ -142,5 +142,15 @@ pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {}
+/// Compose the missing /etc/hosts lines for ".test" projects.
+pub fn hosts_missing(cli: &CliEnv) -> Result<Vec<String>> {
+    let projects = fine_ill_do_it_myself::list_projects(&cli.env);
+    let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+    Ok(projects
+        .into_iter()
+        .filter(|p| !hosts.contains(&format!("{p}.{HOST_TLD}")))
+        .map(|p| format!("127.0.0.1 {p}.{HOST_TLD}"))
+        .collect())
+}
+
+const HOST_TLD: &str = "test";

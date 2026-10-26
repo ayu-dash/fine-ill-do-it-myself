@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 
 /// Process control abstraction so management logic can be tested without
@@ -19,12 +20,21 @@ impl Runner for RealRunner {
                 "empty command",
             ));
         }
-        std::process::Command::new(&cmd[0])
+        let mut cmd_c = std::process::Command::new(&cmd[0]);
+        cmd_c
             .args(&cmd[1..])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|c| c.id())
+            .stdin(std::process::Stdio::null());
+        unsafe {
+            cmd_c.pre_exec(|| {
+                // detach from the caller's process group so services
+                // survive the parent (terminal/daemon) exiting
+                libc::setsid();
+                Ok(())
+            });
+        }
+        cmd_c.spawn().map(|c| c.id())
     }
     fn is_running(&self, pid: u32) -> bool {
         std::path::Path::new(format!("/proc/{pid}").as_str()).exists()

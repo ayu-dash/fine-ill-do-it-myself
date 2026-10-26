@@ -24,6 +24,8 @@ enum Commands {
     Stop,
     Restart,
     Status,
+    /// Manage /etc/hosts entries for .test projects
+    Hosts,
     Projects,
     /// Download and install a managed binary (caddy, php-fpm-8.4, ...)
     Install {
@@ -91,6 +93,23 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             for s in cli::status(&env)? {
                 println!("{s}");
             }
+        }
+        Some(Commands::Hosts) => {
+            match cli::hosts_missing(&env) {
+                Ok(entries) => {
+                    if entries.is_empty() {
+                        println!("hosts up to date");
+                    } else {
+                        for e in &entries {
+                            println!("{e}");
+                        }
+                        let all = entries.join("\n");
+                        println!("sudo tee -a /etc/hosts <<'EOF'\n{all}\nEOF");
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }?;
         }
         Some(Commands::Install { name }) => {
             let p = cli::install(&env, &name)?;
