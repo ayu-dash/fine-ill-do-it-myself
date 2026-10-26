@@ -654,6 +654,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fine_ill_do_it_myself",
+ "libc",
  "ratatui",
  "tempfile",
 ]

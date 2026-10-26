@@ -180,6 +180,11 @@ pub fn run_tui(env: &fine_ill_do_it_myself::Env) -> Result<(), fine_ill_do_it_my
     use ratatui::backend::CrosstermBackend;
     use ratatui::widgets::{Block, BorderType, Paragraph};
     use ratatui::Terminal;
+    // refuse to hijack a non-terminal; scripted invocations keep working
+    if unsafe { libc::isatty(1) } != 1 {
+        println!("TUI requires a tty; use: status");
+        return Ok(());
+    }
     let _ = terminal::enable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
 

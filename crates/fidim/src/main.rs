@@ -175,6 +175,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut cmd = Command::cargo_bin("fidim").unwrap();
         let out = cmd
+            .env("HOME", t.path())
             .arg("--data-root")
             .arg(t.path())
             .arg("projects")

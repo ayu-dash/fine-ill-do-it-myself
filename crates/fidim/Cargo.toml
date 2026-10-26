@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 fine_ill_do_it_myself = { path = "../core" }
+libc = "0.2"
 ratatui = "0.30.2"
 
 [[bin]]

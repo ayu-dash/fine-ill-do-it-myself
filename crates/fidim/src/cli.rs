@@ -17,9 +17,22 @@ pub struct CliEnv {
 impl CliEnv {
     /// Test helper: everything under the given temporary root.
     pub fn with_data_root(root: std::path::PathBuf) -> Self {
+        let sites = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Sites");
+        let rp = |k: &str, d: u16| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         CliEnv {
-            env: Env::new(root.join("app"), root.join("Sites")),
-            ports: PortPlan::default(),
+            env: Env::new(root, sites),
+            ports: PortPlan {
+                http: rp("FIDIM_HTTP_PORT", 80),
+                https: rp("FIDIM_HTTPS_PORT", 443),
+            },
             php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
         }
     }
