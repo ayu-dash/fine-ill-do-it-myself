@@ -21,18 +21,11 @@ impl CliEnv {
             .map(std::path::PathBuf::from)
             .unwrap_or_default()
             .join("Sites");
-        let rp = |k: &str, d: u16| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
+        let env = Env::new(root, sites);
+        let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         CliEnv {
-            env: Env::new(root, sites),
-            ports: PortPlan {
-                http: rp("FIDIM_HTTP_PORT", 80),
-                https: rp("FIDIM_HTTPS_PORT", 443),
-            },
+            env,
+            ports,
             php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
         }
     }
@@ -42,21 +35,14 @@ impl CliEnv {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .map_err(|_| fine_ill_do_it_myself::Error::Other("set $HOME".into()))?;
-        let rp = |k: &str, d: u16| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
+        let env = Env::new(
+            home.join(".local/share/fine-ill-do-it-myself"),
+            home.join("Sites"),
+        );
+        let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         Ok(CliEnv {
-            env: Env::new(
-                home.join(".local/share/fine-ill-do-it-myself"),
-                home.join("Sites"),
-            ),
-            ports: PortPlan {
-                http: rp("FIDIM_HTTP_PORT", 80),
-                https: rp("FIDIM_HTTPS_PORT", 443),
-            },
+            env,
+            ports,
             php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
         })
     }
@@ -119,19 +105,26 @@ pub fn php_install(cli: &CliEnv, version: &str) -> Result<()> {
 }
 
 pub fn php_list(cli: &CliEnv) -> Result<Vec<String>> {
+    let mut out = PhpManager.installed(&Lock::load(&cli.env.lock_path())?, &cli.env.paths.bin());
+    for v in PhpManager.dropped_in(&cli.env.paths.root().join("php")) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn php_list_old(cli: &CliEnv) -> Result<Vec<String>> {
     let lock = Lock::load(&cli.env.lock_path())?;
     Ok(PhpManager.installed(&lock, &cli.env.paths.bin()))
 }
 
 /// Set the default PHP version used by `fidim start`.
 pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
-    if !cli
-        .env
-        .paths
-        .bin()
-        .join(format!("php-fpm-{version}"))
-        .exists()
-    {
+    if fine_ill_do_it_myself::orchestrator::php_binary_for(&cli.env, version).is_none() {
         return Err(fine_ill_do_it_myself::Error::PhpNotInstalled(
             version.into(),
         ));
@@ -142,15 +135,37 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set one port key in `etc/ports.toml`.
+pub fn port_set(etc: &std::path::Path, key: &str, value: u16) -> Result<()> {
+    let allowed = ["http", "https", "fpm_base", "mariadb"];
+    if !allowed.contains(&key) {
+        return Err(fine_ill_do_it_myself::Error::Other(format!(
+            "unknown port key {key}; use http, https, fpm_base or mariadb"
+        )));
+    }
+    std::fs::create_dir_all(etc)?;
+    let path = etc.join("ports.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(&format!("{key} =")))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("{key} = {value}"));
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 /// Persist the chosen web server into lock.toml.
 pub fn web_use(cli: &CliEnv, server: &str) -> Result<()> {
     let name = match server {
         "caddy" => fine_ill_do_it_myself::orchestrator::CADDY,
         "apache" | "httpd" => fine_ill_do_it_myself::orchestrator::APACHE,
         "nginx" => fine_ill_do_it_myself::orchestrator::NGINX,
+        "lighttpd" => fine_ill_do_it_myself::orchestrator::LIGHTTPD,
         other => {
             return Err(fine_ill_do_it_myself::Error::Other(format!(
-                "unknown web server {other}; use caddy, apache or nginx"
+                "unknown web server {other}; use caddy, apache, nginx or lighttpd"
             )))
         }
     };

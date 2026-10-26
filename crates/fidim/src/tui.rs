@@ -252,7 +252,7 @@ pub fn ports_label(name: &str, php_row: &str, ports: &fine_ill_do_it_myself::Por
             "fpm {}",
             fine_ill_do_it_myself::php::fpm::fpm_port_for(ver, 9000, ports)
         )
-    } else if name == "caddy" || name == "httpd" || name == "nginx" {
+    } else if name == "caddy" || name == "httpd" || name == "nginx" || name == "lighttpd" {
         format!("http:{} https:{}", ports.http, ports.https)
     } else {
         String::new()
@@ -310,9 +310,14 @@ pub fn run_tui(
                     .services
                     .iter()
                     .map(|s| {
-                        let (name, mark, color) = match s.state {
-                            ServiceState::Running => ("● ", s.name.as_str(), Color::Green),
-                            _ => ("○ ", s.name.as_str(), Color::DarkGray),
+                        let (name, mark, color) = match &s.state {
+                            ServiceState::Running => {
+                                ("● ".to_string(), s.name.clone(), Color::Green)
+                            }
+                            ServiceState::Error(msg) => {
+                                ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                            }
+                            _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
                         };
                         let lock =
                             fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
@@ -430,7 +435,11 @@ pub fn run_tui(
                 if !app.message.is_empty() {
                     spans.push(Span::styled(
                         format!(" {} ", app.message),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(if app.message.to_lowercase().contains("error") {
+                            Color::Red
+                        } else {
+                            Color::Yellow
+                        }),
                     ));
                 }
                 f.render_widget(Paragraph::new(Line::from(spans)), footer);
@@ -670,6 +679,8 @@ mod tests {
         let ports = fine_ill_do_it_myself::PortPlan {
             http: 8080,
             https: 8443,
+            fpm_base: 9000,
+            mariadb: 3306,
         };
         assert_eq!(ports_label("caddy", "8.4", &ports), "http:8080 https:8443");
         assert_eq!(ports_label("httpd", "8.4", &ports), "http:8080 https:8443");

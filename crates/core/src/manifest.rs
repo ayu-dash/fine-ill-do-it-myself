@@ -140,15 +140,54 @@ impl PhpManager {
         v.dedup();
         v
     }
+
+    /// Versions the user dropped as extracted folders under a `php/` dir
+    /// (each folder must contain a runnable php-fpm binary).
+    pub fn dropped_in(&self, php_root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(php_root) {
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                if php_binary_in(&e.path()).is_some() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+/// Version prefix used by `php-fpm-<v>` bin names: "8.4.23" -> "8.4".
+pub fn short_version(ver: &str) -> String {
+    match ver.find('.') {
+        Some(pos) => match ver[pos + 1..].find('.') {
+            Some(i) => ver[..pos + 1 + i].to_string(),
+            None => ver.to_string(),
+        },
+        None => ver.to_string(),
+    }
+}
+
+/// Binary inside an extracted php root dir: `<dir>/php-fpm`,
+/// `<dir>/bin/php-fpm` or `<dir>/sbin/php-fpm`.
+pub fn php_binary_in(dir: &Path) -> Option<PathBuf> {
+    [
+        dir.join("php-fpm"),
+        dir.join("bin/php-fpm"),
+        dir.join("sbin/php-fpm"),
+    ]
+    .into_iter()
+    .find(|c| c.is_file())
 }
 
 fn push_version(list: &mut Vec<String>, ver: &str) {
-    if let Some(pos) = ver.find('.') {
-        let minor_end = ver[pos + 1..].find('.').map(|i| pos + 1 + i);
-        let short = minor_end.map(|e| &ver[..e]).unwrap_or(ver);
-        if !list.iter().any(|v| v == short) {
-            list.push(short.to_string());
-        }
+    let short = short_version(ver);
+    if !list.contains(&short) {
+        list.push(short);
     }
 }
 

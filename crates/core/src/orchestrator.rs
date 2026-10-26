@@ -18,6 +18,7 @@ use crate::web::caddyfile::generate_caddyfile_for_projects_tls;
 pub const CADDY: &str = "caddy";
 pub const NGINX: &str = "nginx";
 pub const APACHE: &str = "httpd";
+pub const LIGHTTPD: &str = "lighttpd";
 pub const PHP_BASE_PORT: u16 = 9000;
 
 pub fn default_php(lock: &Lock) -> String {
@@ -78,7 +79,7 @@ fn target_path_for(env: &Env, name: &str) -> std::path::PathBuf {
 pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Result<()> {
     env.ensure_dirs()?;
     let sites = env.paths.sites().display().to_string();
-    let fpm_port = fpm_port_for(php_version, 9000, ports);
+    let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
     let projects = list_projects(env);
     // local CA + per-project leaf certs (silent no-op without openssl)
     if let Err(e) = crate::web::certs::regenerate(&env.paths.etc(), &projects) {
@@ -94,6 +95,24 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
         (crt.exists() && key.exists()).then_some((crt, key))
     };
     match web.as_str() {
+        LIGHTTPD => {
+            crate::web::lighttpd::regenerate(
+                &env.paths.etc(),
+                &env.paths.pids().join("lighttpd.pid").display().to_string(),
+                &env.paths.logs().join("lighttpd.log").display().to_string(),
+                &env.paths
+                    .logs()
+                    .join("lighttpd-access.log")
+                    .display()
+                    .to_string(),
+                &sites,
+                &projects,
+                fpm_port,
+                ports.http,
+                ports.https,
+                Some(&certs_str),
+            )?;
+        }
         APACHE => {
             let bin = resolve_web_bin(env, APACHE)?;
             crate::web::apache::regenerate(
@@ -183,7 +202,7 @@ pub fn start_all<R: Runner + Clone>(
         runner: runner.clone(),
     };
     regenerate_ghosts(env, ports, php_version)?;
-    let fpm_port = fpm_port_for(php_version, 9000, ports);
+    let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
     let mut out = Vec::new();
     for (name, bin, args, log) in specs {
         if sup.status(&name).state == crate::service::ServiceState::Running {
@@ -221,7 +240,7 @@ pub fn start_service<R: Runner + Clone>(
         ports: ports.clone(),
         runner: runner.clone(),
     };
-    let fpm_port = fpm_port_for(php_version, 9000, ports);
+    let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
     let spec = service_cmds(env, ports, php_version)?
         .into_iter()
         .find(|(n, ..)| n == name)
@@ -252,6 +271,7 @@ pub fn web_bin_path(env: &Env, web: &str) -> std::path::PathBuf {
     match web {
         NGINX => env.paths.bin().join("nginx"),
         APACHE => env.paths.bin().join("httpd"),
+        LIGHTTPD => env.paths.bin().join("lighttpd"),
         _ => env.caddy_bin(),
     }
 }
@@ -273,6 +293,22 @@ pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
 
 /// Absolute `PATH`-resolved binary name (httpd/nginx/caddy); None when absent
 /// from PATH or data/bin.
+/// php-fpm binary for `version`: `bin/php-fpm-<v>` first, then a drop-in
+/// folder under `data/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
+pub fn php_binary_for(env: &Env, version: &str) -> Option<std::path::PathBuf> {
+    if let Ok(rd) = std::fs::read_dir(env.paths.bin()) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(v) = n.strip_prefix("php-fpm-") {
+                if crate::manifest::short_version(v) == version {
+                    return Some(e.path());
+                }
+            }
+        }
+    }
+    crate::manifest::php_binary_in(&env.paths.root().join("php").join(version))
+}
+
 pub fn which_system(bin: &str) -> Option<std::path::PathBuf> {
     let out = std::process::Command::new("/usr/bin/which")
         .arg(bin)
@@ -291,6 +327,7 @@ pub fn web_config_path(env: &Env, web: &str) -> std::path::PathBuf {
     match web {
         NGINX => env.paths.etc().join("nginx/nginx.conf"),
         APACHE => env.paths.etc().join("apache/httpd.conf"),
+        LIGHTTPD => env.paths.etc().join("lighttpd/lighttpd.conf"),
         _ => env.caddyfile_path(),
     }
 }
@@ -316,6 +353,7 @@ pub fn web_args(env: &Env, web: &str) -> Vec<String> {
     match web {
         NGINX => vec!["-c".into(), conf],
         APACHE => vec!["-f".into(), conf, "-DFOREGROUND".into()],
+        LIGHTTPD => vec!["-D".into(), "-f".into(), conf],
         _ => vec!["run".into(), "--config".into(), conf],
     }
 }
@@ -354,7 +392,12 @@ pub fn status_all<R: Runner + Clone>(
         runner: runner.clone(),
     };
     let mut names = sup.known_services();
-    // always show chosen web server + default php (+ mariadb when system bin)
+    // show every installed web server, plus the chosen one, php and mariadb
+    for w in [CADDY, APACHE, NGINX, LIGHTTPD] {
+        if web_bin_path(env, w).exists() && !names.iter().any(|n| n == w) {
+            names.push(w.to_string());
+        }
+    }
     let web = web_server(env);
     let phps: Vec<String> = (0..90).map(|i| format!("php-{i}")).collect();
     let _ = phps;
@@ -490,6 +533,7 @@ mod tests {
 
     #[test]
     fn status_all_shows_chosen_web_only() {
+        // apache binary is absent in the temp env, yet the chosen one is listed
         let (env, _t) = env();
         let lock = Lock {
             web_default: Some(APACHE.into()),
@@ -792,7 +836,7 @@ mod owners_tests {
 type CmdSpec = (String, String, Vec<String>, std::path::PathBuf);
 
 #[allow(clippy::type_complexity)]
-fn service_cmds(env: &Env, _ports: &PortPlan, php_version: &str) -> Result<Vec<CmdSpec>> {
+fn service_cmds(env: &Env, ports: &PortPlan, php_version: &str) -> Result<Vec<CmdSpec>> {
     let mut cmds = Vec::new();
     let web = web_server(env);
     let server_bin = resolve_web_bin(env, &web)?;
@@ -802,13 +846,14 @@ fn service_cmds(env: &Env, _ports: &PortPlan, php_version: &str) -> Result<Vec<C
         web_args(env, &web),
         env.paths.logs().join(format!("{web}.log")),
     ));
+    let php_bin = php_binary_for(env, php_version).ok_or_else(|| {
+        Error::Other(format!(
+            "php {php_version} not installed (fidim install php-fpm-{php_version}              or drop an extracted build into data/php/{php_version})"
+        ))
+    })?;
     cmds.push((
         format!("php-{php_version}"),
-        env.paths
-            .bin()
-            .join(format!("php-fpm-{php_version}"))
-            .display()
-            .to_string(),
+        php_bin.display().to_string(),
         vec![
             "-F".to_string(),
             "-y".to_string(),
@@ -821,8 +866,13 @@ fn service_cmds(env: &Env, _ports: &PortPlan, php_version: &str) -> Result<Vec<C
         let mariadb_cnf = env.paths.etc().join("my.cnf");
         let db_data = env.paths.data().join("mariadb");
         std::fs::create_dir_all(&db_data)?;
-        if let Ok(Some(cmd)) = mariadb_config(env, &mariadb_cnf, &db_data, &env.paths.pids(), 3306)
-        {
+        if let Ok(Some(cmd)) = mariadb_config(
+            env,
+            &mariadb_cnf,
+            &db_data,
+            &env.paths.pids(),
+            ports.mariadb,
+        ) {
             cmds.push((
                 MARIADB.to_string(),
                 cmd[0].clone(),

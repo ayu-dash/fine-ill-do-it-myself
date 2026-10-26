@@ -40,11 +40,24 @@ enum Commands {
         #[command(subcommand)]
         cmd: PhpCommands,
     },
+    /// Show or change port assignments (etc/ports.toml)
+    Ports {
+        #[command(subcommand)]
+        cmd: PortCommands,
+    },
     /// Choose the web server: caddy, apache (httpd) or nginx
     Web {
         #[command(subcommand)]
         cmd: WebCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum PortCommands {
+    /// Show current ports
+    Show,
+    /// Set a port key: http, https, fpm_base or mariadb
+    Set { key: String, value: u16 },
 }
 
 #[derive(Subcommand)]
@@ -159,6 +172,23 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             PhpCommands::Remove { version } => {
                 cli::php_remove(&env, &version)?;
                 println!("php {version} removed");
+            }
+        },
+        Some(Commands::Ports { cmd }) => match cmd {
+            PortCommands::Show => {
+                let p = &env.ports;
+                println!(
+                    "http = {p}\nhttps = {p2}\nfpm_base = {p3}\nmariadb = {p4}",
+                    p = p.http,
+                    p2 = p.https,
+                    p3 = p.fpm_base,
+                    p4 = p.mariadb
+                );
+            }
+            PortCommands::Set { key, value } => {
+                let etc = env.env.paths.etc();
+                cli::port_set(&etc, &key, value)?;
+                println!("{key} = {value}");
             }
         },
         Some(Commands::Web { cmd }) => match cmd {

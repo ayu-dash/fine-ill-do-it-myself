@@ -73,6 +73,9 @@ impl Env {
 pub struct PortPlan {
     pub http: u16,
     pub https: u16,
+    /// base port for php-fpm listeners (stacks per minor version)
+    pub fpm_base: u16,
+    pub mariadb: u16,
 }
 
 impl Default for PortPlan {
@@ -80,7 +83,53 @@ impl Default for PortPlan {
         Self {
             http: 80,
             https: 443,
+            fpm_base: 9000,
+            mariadb: 3306,
         }
+    }
+}
+
+impl PortPlan {
+    /// Resolve ports: `<etc>/ports.toml < env vars > defaults`.
+    /// `env` maps a variable name (FIDIM_HTTP_PORT, ...) to its numeric value.
+    pub fn resolve(etc: &std::path::Path, env: impl Fn(&str) -> Option<String>) -> Self {
+        let text = std::fs::read_to_string(etc.join("ports.toml")).unwrap_or_default();
+        let mut plan = Self::parse(&text);
+        if let Some(v) = env("FIDIM_HTTP_PORT").and_then(|v| v.parse().ok()) {
+            plan.http = v;
+        }
+        if let Some(v) = env("FIDIM_HTTPS_PORT").and_then(|v| v.parse().ok()) {
+            plan.https = v;
+        }
+        if let Some(v) = env("FIDIM_FPM_BASE").and_then(|v| v.parse().ok()) {
+            plan.fpm_base = v;
+        }
+        if let Some(v) = env("FIDIM_MARIADB_PORT").and_then(|v| v.parse().ok()) {
+            plan.mariadb = v;
+        }
+        plan
+    }
+
+    /// Parse a `http = 8080` style ports.toml (missing keys keep defaults).
+    pub fn parse(text: &str) -> Self {
+        let mut p = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim().trim_matches('"');
+                if let Ok(n) = val.parse::<u16>() {
+                    match key {
+                        "http" => p.http = n,
+                        "https" => p.https = n,
+                        "fpm_base" => p.fpm_base = n,
+                        "mariadb" => p.mariadb = n,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        p
     }
 }
 
@@ -116,6 +165,28 @@ impl<R: Runner> Supervisor<R> {
             self.runner.kill(pid)?;
             remove_pid_file(&self.env.paths.pids(), name);
         }
+        // reap any orphan still holding the service port (workers outlive the master)
+        let port = if name == "mariadb" {
+            Some(self.ports.mariadb)
+        } else if name == crate::orchestrator::CADDY
+            || name == crate::orchestrator::APACHE
+            || name == crate::orchestrator::NGINX
+            || name == crate::orchestrator::LIGHTTPD
+        {
+            Some(self.ports.http)
+        } else {
+            name.strip_prefix("php-")
+                .map(|v| crate::php::fpm::fpm_port_for(v, 9000, &self.ports))
+        };
+        if let Some(port) = port {
+            if port != 0 {
+                if let Ok(pids) = crate::proc::listening_pids(port) {
+                    for pid in pids {
+                        let _ = self.runner.kill(pid);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -123,13 +194,17 @@ impl<R: Runner> Supervisor<R> {
         let pid = read_pid_file(&self.env.paths.pids(), name).ok().flatten();
         let alive = pid.filter(|p| self.runner.is_running(*p));
         let _ = &self.ports;
+        let state = if alive.is_some() {
+            ServiceState::Running
+        } else if pid.is_some() {
+            // we launched it at some point but the process is gone
+            ServiceState::Error("process exited; see logs".into())
+        } else {
+            ServiceState::Stopped
+        };
         ServiceStatus {
             name: name.into(),
-            state: if alive.is_some() {
-                ServiceState::Running
-            } else {
-                ServiceState::Stopped
-            },
+            state,
             pid: alive,
         }
     }
@@ -209,6 +284,8 @@ mod tests {
             ports: PortPlan {
                 http: 80,
                 https: 443,
+                fpm_base: 9000,
+                mariadb: 3306,
             },
             runner: FakeRunner::default(),
         }

@@ -39,10 +39,16 @@ fidim projects
 fidim hosts     # prints the missing /etc/hosts lines (needs root to apply)
 fidim           # TUI
 fidim trust     # prints the root steps to trust the local CA
-fidim web use apache   # pick the web server: caddy (default), apache, nginx
+fidim web use apache   # pick the web server: caddy (default), apache, nginx, lighttpd
 fidim web show         # print the server currently selected
+fidim ports show       # active HTTP/HTTPS/FPM/MariaDB ports
+fidim ports set http 8080   # override ports in etc/ports.toml
 fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim.sock
 ```
+
+**PHP drop-in**: drop an extracted PHP tree (containing `php-fpm`) under
+`~/.local/share/fine-ill-do-it-myself/php/<version>/` and `fidim php list`
+picks it up automatically (`fidim php use <version>` selects it).
 
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
 keys (defaults q/r/s/x/a):
