@@ -60,6 +60,8 @@ pub struct Lock {
     pub binaries: std::collections::BTreeMap<String, ManifestEntry>,
     #[serde(default)]
     pub php: Vec<String>,
+    #[serde(default)]
+    pub php_default: Option<String>,
 }
 
 impl Lock {
