@@ -122,6 +122,11 @@ pub fn regenerate(
         includes.push(format!("{}/{}.conf", sites_dir.display(), p));
     }
     let system_mime = "/etc/nginx/mime.types";
+    let fparams = conf_dir.join("fastcgi_params");
+    if std::fs::exists(&fparams).map(|e| !e).unwrap_or(true) {
+        std::fs::write(&fparams, FASTCGI_PARAMS)
+            .map_err(|e| Error::Other(format!("write fastcgi_params: {e}")))?;
+    }
     let mime = std::path::Path::new(system_mime)
         .exists()
         .then_some(system_mime.to_string())
@@ -133,6 +138,23 @@ pub fn regenerate(
     std::fs::write(conf_dir.join("nginx.conf"), conf)
         .map_err(|e| Error::Other(format!("write nginx.conf: {e}")))
 }
+
+/// The fastcgi_params file the server blocks `include`.
+pub const FASTCGI_PARAMS: &str = r#"fastcgi_param  QUERY_STRING       $query_string;
+fastcgi_param  REQUEST_METHOD     $request_method;
+fastcgi_param  CONTENT_TYPE       $content_type;
+fastcgi_param  CONTENT_LENGTH     $content_length;
+fastcgi_param  REQUEST_URI        $request_uri;
+fastcgi_param  DOCUMENT_URI       $document_uri;
+fastcgi_param  DOCUMENT_ROOT      $document_root;
+fastcgi_param  GATEWAY_INTERFACE  CGI/1.1;
+fastcgi_param  SERVER_SOFTWARE    nginx;
+fastcgi_param  REMOTE_ADDR        $remote_addr;
+fastcgi_param  REMOTE_PORT        $remote_port;
+fastcgi_param  SERVER_ADDR        $server_addr;
+fastcgi_param  SERVER_PORT        $server_port;
+fastcgi_param  SERVER_NAME        $server_name;
+"#;
 
 #[cfg(test)]
 mod tests {

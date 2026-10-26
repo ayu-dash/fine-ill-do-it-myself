@@ -40,12 +40,112 @@ impl Runner for RealRunner {
         std::path::Path::new(format!("/proc/{pid}").as_str()).exists()
     }
     fn kill(&self, pid: u32) -> std::result::Result<(), std::io::Error> {
+        // kill the whole process tree: php-fpm/nginx masters respawn children
+        for p in child_pids(pid) {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(p.to_string())
+                .output();
+        }
         std::process::Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
             .output()?;
+        // grace period: escalate anything left
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if RealRunner.is_running(pid) && child_pids(pid).is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for p in child_pids(pid) {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(p.to_string())
+                .output();
+        }
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .output();
         Ok(())
     }
+}
+
+/// PIDs whose parent is `parent` by reading /proc/<pid>/stat (Linux).
+pub fn child_pids(parent: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let pid = match name.to_str().and_then(|s| s.parse::<u32>().ok()) {
+                Some(p) if p != parent => p,
+                _ => continue,
+            };
+            if let Ok(stat) = std::fs::read(e.path().join("stat")) {
+                if let Ok(txt) = String::from_utf8(stat) {
+                    // comm may contain spaces/parens: take after last ')'
+                    if let Some(idx) = txt.rfind(')') {
+                        let rest = &txt[idx + 1..];
+                        let fields: Vec<&str> = rest.split_whitespace().collect();
+                        // after ')' the offsets are already shifted by state
+                        let (state, ppid) =
+                            { (fields[0], fields.get(1).and_then(|s| s.parse::<u32>().ok())) };
+                        let _ = state;
+                        if ppid == Some(parent) {
+                            out.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// PIDs of processes LISTENing on `port` (TCP, all interfaces) by matching
+/// /proc/net/tcp inodes against /proc/<pid>/fd entries.
+pub fn listening_pids(port: u16) -> std::result::Result<Vec<u32>, std::io::Error> {
+    let hex_port = format!("{:04X}", port);
+    let mut inodes: Vec<String> = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(table) {
+            for line in text.lines().skip(1) {
+                let col: Vec<&str> = line.split_whitespace().collect();
+                if col.len() >= 10 && col[1].ends_with(&hex_port) && col[3] == "0A" {
+                    inodes.push(col[9].to_string());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let pid = match e.file_name().to_str().and_then(|p| p.parse::<u32>().ok()) {
+                Some(p) => p,
+                None => continue,
+            };
+            let fd_dir = e.path().join("fd");
+            if let Ok(fds) = std::fs::read_dir(&fd_dir) {
+                for fd in fds.flatten() {
+                    if let Ok(target) = std::fs::read_link(fd.path()) {
+                        let t = target.to_string_lossy().to_string();
+                        if let Some(inode) =
+                            t.strip_prefix("socket:[").and_then(|x| x.strip_suffix(']'))
+                        {
+                            if inodes.iter().any(|i| i == inode) {
+                                out.push(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 pub fn write_pid_file(dir: &Path, name: &str, pid: u32) -> Result<(), std::io::Error> {

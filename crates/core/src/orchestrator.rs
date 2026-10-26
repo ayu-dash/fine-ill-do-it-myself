@@ -189,6 +189,13 @@ pub fn start_all<R: Runner + Clone>(
         if sup.status(&name).state == crate::service::ServiceState::Running {
             continue;
         }
+        // orphaned php-fpm pool children survive master death without a pid
+        // file: reclaim by killing whatever already listens on the fpm port
+        if name.starts_with("php-") {
+            for p in crate::proc::listening_pids(fpm_port)? {
+                let _ = crate::proc::RealRunner.kill(p);
+            }
+        }
         check_port(fpm_port, &bin)?;
         let mut full = vec![bin];
         full.extend(args);
