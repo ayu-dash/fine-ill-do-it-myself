@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use fine_ill_do_it_myself::{ServiceState, ServiceStatus};
 
 #[derive(Clone)]
@@ -185,38 +183,14 @@ pub fn run_tui(
     use crossterm::event::{Event, KeyEventKind};
     use crossterm::terminal;
     use ratatui::backend::CrosstermBackend;
-    use ratatui::widgets::{Block, BorderType, Paragraph};
     use ratatui::Terminal;
     // refuse to hijack a non-terminal; scripted invocations keep working
     if unsafe { libc::isatty(1) } != 1 {
         println!("TUI requires a tty; use: status");
         return Ok(());
     }
-    let refresh = |app: &mut App| {
-        let statuses = fine_ill_do_it_myself::orchestrator::status_all(
-            env,
-            &fine_ill_do_it_myself::PortPlan::default(),
-            &fine_ill_do_it_myself::RealRunner,
-        );
-        app.services = statuses;
-        app.clamp_now();
-    };
-    let act = |app: &mut App, action: &str| {
-        let runner = fine_ill_do_it_myself::RealRunner;
-        let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-        let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-        let r: Result<Vec<_>, _> = if action == "restart" {
-            fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, &runner).and_then(|_| {
-                fine_ill_do_it_myself::orchestrator::start_all(env, &ports, &runner, &php)
-            })
-        } else {
-            fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, &runner).map(|_| Vec::new())
-        };
-        match r {
-            Ok(_) => app.message = format!("{action} ok"),
-            Err(e) => app.message = format!("{action}: {e}"),
-        }
-    };
+    let refresh = make_refresh(env.clone());
+    let act = make_actioner(env.clone(), ports.clone());
     let _ = terminal::enable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
 
@@ -225,52 +199,125 @@ pub fn run_tui(
     app.keybinds = load_keybinds(
         &std::fs::read_to_string(env.paths.etc().join("keys.toml")).unwrap_or_default(),
     );
-    let conflines: BTreeMap<(), Vec<String>> = BTreeMap::new();
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut term = Terminal::new(backend).ok();
     refresh(&mut app);
     loop {
-        use std::io::Write;
-        refresh(&mut app);
-        let _ = std::io::stdout().flush();
         if let Some(t) = term.as_mut() {
             let _ = t.draw(|f| {
-                use ratatui::layout::{Constraint, Layout, VerticalAlignment};
+                use ratatui::layout::{Constraint, Layout};
+                use ratatui::style::{Color, Modifier, Style};
                 use ratatui::text::{Line, Span};
-                let [top, bottom] =
-                    Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
-                let _ = conflines.get(&());
-                let spans = app
+                use ratatui::widgets::{
+                    Block, BorderType, Borders, List, ListItem, ListState, Paragraph,
+                };
+
+                let area = f.area();
+                let [services, projects, footer] = Layout::vertical([
+                    Constraint::Length(app.services.len() as u16 + 2),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+
+                // services panel
+                let items: Vec<ListItem> = app
                     .services
                     .iter()
                     .map(|s| {
-                        let st = match s.state {
-                            ServiceState::Running => "RUNNING",
-                            _ => "STOPPED",
+                        let (name, mark, color) = match s.state {
+                            ServiceState::Running => ("● ", s.name.as_str(), Color::Green),
+                            _ => ("○ ", s.name.as_str(), Color::DarkGray),
                         };
-                        Span::default().content(format!("{} {}\n", s.name, st))
+                        ListItem::new(Line::from(vec![
+                            Span::styled(mark, Style::default().fg(color)),
+                            Span::styled(
+                                name.to_string(),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]))
                     })
-                    .collect::<Vec<_>>();
-                let mut lines: Vec<Line> = vec![Line::from(
-                    "fine-ill-do-it-myself — q: quit, j/k: move, r: restart",
-                )];
-                for sp in spans {
-                    lines.push(Line::from(vec![sp]));
-                }
-                lines.push(Line::from(
-                    app.projects
-                        .iter()
-                        .map(|p| Span::default().content(format!("  {p}\n")))
-                        .collect::<Vec<_>>(),
+                    .collect();
+                let mut lst = ListState::default();
+                lst.select(Some(app.cursor.min(app.services.len().saturating_sub(1))));
+                let services_block = List::new(items).block(
+                    Block::default()
+                        .title(" services ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+                f.render_stateful_widget(services_block, services, &mut lst);
+
+                // projects panel
+                let proj_items: Vec<ListItem> = app
+                    .projects
+                    .iter()
+                    .map(|p| {
+                        ListItem::new(Line::from(vec![
+                            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+                            Span::styled(p.clone(), Style::default().fg(Color::White)),
+                            Span::styled(".test  ", Style::default().fg(Color::DarkGray)),
+                        ]))
+                    })
+                    .collect();
+                let mut plst = ListState::default();
+                plst.select(Some(
+                    app.cursor
+                        .saturating_sub(app.services.len())
+                        .min(app.projects.len().saturating_sub(1)),
                 ));
-                lines.push(Line::from("press q to quit"));
-                let _ = Block::default();
-                let para = Paragraph::new(lines);
-                let _ = BorderType::Rounded;
-                f.render_widget(para, top);
-                let _ = (bottom, VerticalAlignment::Center);
-                f.render_widget(Paragraph::new(Line::from(app.message.as_str())), bottom);
+                let proj_block = List::new(proj_items).block(
+                    Block::default()
+                        .title(format!(" projects ({}: ~/Sites) ", app.projects.len()))
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Blue)),
+                );
+                f.render_stateful_widget(proj_block, projects, &mut plst);
+
+                // footer with key hints
+                let hints = vec![
+                    (app.keybinds.quit, "quit"),
+                    (crossterm::event::KeyCode::Char('j'), "down"),
+                    (crossterm::event::KeyCode::Char('k'), "up"),
+                    (app.keybinds.restart, "restart"),
+                ];
+                let mut spans: Vec<Span> = Vec::new();
+                for (code, label) in hints {
+                    let key = match code {
+                        crossterm::event::KeyCode::Char(c) => format!("{c}"),
+                        _ => format!("{code:?}"),
+                    };
+                    spans.push(Span::styled(
+                        format!(" {key} "),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" {label} "),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+                if let Some((d, tot)) = app.progress {
+                    let pct = (d * 100).checked_div(tot).unwrap_or(0);
+                    spans.push(Span::styled(
+                        format!(" {pct}% "),
+                        Style::default().fg(Color::Green),
+                    ));
+                }
+                if !app.message.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" {} ", app.message),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                f.render_widget(Paragraph::new(Line::from(spans)), footer);
             });
         }
         if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
@@ -293,6 +340,39 @@ pub fn run_tui(
     Ok(())
 }
 
+fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
+    move |app: &mut App| {
+        let statuses = fine_ill_do_it_myself::orchestrator::status_all(
+            &env,
+            &fine_ill_do_it_myself::PortPlan::default(),
+            &fine_ill_do_it_myself::RealRunner,
+        );
+        app.services = statuses;
+        app.clamp_now();
+    }
+}
+
+fn make_actioner(
+    env: fine_ill_do_it_myself::Env,
+    ports: fine_ill_do_it_myself::PortPlan,
+) -> impl Fn(&mut App, &str) {
+    move |app: &mut App, action: &str| {
+        let runner = fine_ill_do_it_myself::RealRunner;
+        let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+        let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+        let r: Result<Vec<_>, _> = if action == "restart" {
+            fine_ill_do_it_myself::orchestrator::stop_all(&env, &ports, &runner).and_then(|_| {
+                fine_ill_do_it_myself::orchestrator::start_all(&env, &ports, &runner, &php)
+            })
+        } else {
+            fine_ill_do_it_myself::orchestrator::stop_all(&env, &ports, &runner).map(|_| Vec::new())
+        };
+        match r {
+            Ok(_) => app.message = format!("{action} ok"),
+            Err(e) => app.message = format!("{action}: {e}"),
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
