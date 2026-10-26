@@ -146,7 +146,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             cli::daemon(&env.env, &sock)?;
         }
         Some(Commands::Tui) | None => {
-            tui::run_tui(&env.env)?;
+            tui::run_tui(&env.env, env.ports)?;
         }
     }
     Ok(())

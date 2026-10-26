@@ -40,7 +40,11 @@ fn run_cli(env: &Env, cmd: &str) -> Result<String, fine_ill_do_it_myself::Error>
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    }
+    Ok(text)
 }
 
 pub fn run_daemon(
@@ -49,7 +53,11 @@ pub fn run_daemon(
 ) -> Result<(), fine_ill_do_it_myself::Error> {
     let _ = std::fs::remove_file(socket_path);
     match UnixListener::bind(socket_path) {
-        Ok(l) => serve(env, l),
+        Ok(l) => {
+            let r = serve(env, l);
+            let _ = std::fs::remove_file(socket_path);
+            r
+        }
         Err(e) => Err(fine_ill_do_it_myself::Error::Io(e)),
     }
 }

@@ -125,6 +125,10 @@ impl App {
         self.clamp_cursor();
     }
 
+    pub fn clamp_now(&mut self) {
+        self.clamp_cursor()
+    }
+
     fn clamp_cursor(&mut self) {
         let len = self.services.len().max(self.projects.len()).max(1);
         if self.cursor >= len {
@@ -174,7 +178,10 @@ pub fn quick_create_plan(sites: &str, name: &str) -> Vec<String> {
 }
 
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
-pub fn run_tui(env: &fine_ill_do_it_myself::Env) -> Result<(), fine_ill_do_it_myself::Error> {
+pub fn run_tui(
+    env: &fine_ill_do_it_myself::Env,
+    ports: fine_ill_do_it_myself::PortPlan,
+) -> Result<(), fine_ill_do_it_myself::Error> {
     use crossterm::event::{Event, KeyEventKind};
     use crossterm::terminal;
     use ratatui::backend::CrosstermBackend;
@@ -185,17 +192,47 @@ pub fn run_tui(env: &fine_ill_do_it_myself::Env) -> Result<(), fine_ill_do_it_my
         println!("TUI requires a tty; use: status");
         return Ok(());
     }
+    let refresh = |app: &mut App| {
+        let statuses = fine_ill_do_it_myself::orchestrator::status_all(
+            env,
+            &fine_ill_do_it_myself::PortPlan::default(),
+            &fine_ill_do_it_myself::RealRunner,
+        );
+        app.services = statuses;
+        app.clamp_now();
+    };
+    let act = |app: &mut App, action: &str| {
+        let runner = fine_ill_do_it_myself::RealRunner;
+        let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+        let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+        let r: Result<Vec<_>, _> = if action == "restart" {
+            fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, &runner).and_then(|_| {
+                fine_ill_do_it_myself::orchestrator::start_all(env, &ports, &runner, &php)
+            })
+        } else {
+            fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, &runner).map(|_| Vec::new())
+        };
+        match r {
+            Ok(_) => app.message = format!("{action} ok"),
+            Err(e) => app.message = format!("{action}: {e}"),
+        }
+    };
     let _ = terminal::enable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
 
     let projects: Vec<String> = fine_ill_do_it_myself::list_projects(env);
     let mut app = App::new(Vec::new(), projects);
+    app.keybinds = load_keybinds(
+        &std::fs::read_to_string(env.paths.etc().join("keys.toml")).unwrap_or_default(),
+    );
     let conflines: BTreeMap<(), Vec<String>> = BTreeMap::new();
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut term = Terminal::new(backend).ok();
+    refresh(&mut app);
     loop {
         use std::io::Write;
+        refresh(&mut app);
         let _ = std::io::stdout().flush();
         if let Some(t) = term.as_mut() {
             let _ = t.draw(|f| {
@@ -240,6 +277,9 @@ pub fn run_tui(env: &fine_ill_do_it_myself::Env) -> Result<(), fine_ill_do_it_my
             if let Ok(Event::Key(k)) = crossterm::event::read() {
                 if k.kind == KeyEventKind::Press {
                     app.on_key(k.code);
+                    while let Some(a) = app.actions.pop() {
+                        act(&mut app, a);
+                    }
                 }
             }
         }

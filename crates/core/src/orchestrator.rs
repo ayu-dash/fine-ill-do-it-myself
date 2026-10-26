@@ -132,6 +132,14 @@ pub fn start_all<R: Runner + Clone>(
     let fpm_port = fpm_port_for(php_version, 9000, ports);
     let fpm_name = format!("php-{php_version}");
 
+    // reap ghost owners of our generated configs (pid files were lost)
+    let needles = vec![
+        env.caddyfile_path().display().to_string(),
+        env.fpm_conf_path(php_version).display().to_string(),
+    ];
+    let ghosts = reap_owners(&needles);
+    let _ = ghosts;
+
     let mut cmds = vec![
         (
             CADDY.to_string(),
@@ -507,5 +515,69 @@ mod hosts_tests {
     #[test]
     fn hosts_entry_empty_projects() {
         assert_eq!(hosts_entries("10.0.0.2", &[]), "");
+    }
+}
+
+/// Find hostile-orphan pids: processes whose cmdline references one of our
+/// generated config files (so shutdown-less ghosts can be reaped).
+pub fn find_owners(proc_dir: &Path, needles: &[String]) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(proc_dir) {
+        for e in rd.flatten() {
+            if let Ok(n) = e.file_name().to_string_lossy().parse::<u32>() {
+                if let Ok(c) = std::fs::read_to_string(e.path().join("cmdline")) {
+                    if !needles.iter().any(|need| c.contains(need)) {
+                        continue;
+                    }
+                    if c.split('\0').all(|t| t != "kill") {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Kill (SIGKILL) all ghost processes owning our configs before start.
+pub fn reap_owners(needles: &[String]) -> usize {
+    let mut killed = 0;
+    for pid in find_owners(Path::new("/proc"), needles) {
+        if std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .output()
+            .is_ok()
+        {
+            killed += 1;
+        }
+    }
+    killed
+}
+
+#[cfg(test)]
+mod owners_tests {
+    use super::*;
+
+    #[test]
+    fn find_owners_matches_cmdline_and_ignores_others() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path();
+        // pid dir 100: cmdline containing needle
+        std::fs::create_dir(p.join("100")).unwrap();
+        std::fs::write(
+            p.join("100/cmdline"),
+            "caddy\0run\0--config\0/etc/Caddyfile\0",
+        )
+        .unwrap();
+        // pid dir 101: unrelated
+        std::fs::create_dir(p.join("101")).unwrap();
+        std::fs::write(p.join("101/cmdline"), b"sleep\x001000\x00").unwrap();
+        // pid dir 102: the reaper itself
+        std::fs::create_dir(p.join("102")).unwrap();
+        std::fs::write(p.join("102/cmdline"), "kill\0-9\0").unwrap();
+        let found = find_owners(p, &["/etc/Caddyfile".to_string()]);
+        assert_eq!(found, vec![100]);
+        assert!(find_owners(p, &["void-str".to_string()]).is_empty());
     }
 }

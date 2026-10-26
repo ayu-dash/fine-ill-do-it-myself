@@ -5,7 +5,7 @@ pub mod proc;
 pub mod service;
 
 pub use error::{Error, Result};
-pub use manifest::{Manifest, PhpManager};
+pub use manifest::{Lock, Manifest, PhpManager};
 pub use paths::Paths;
 pub use service::{Service, ServiceRegistry, ServiceState, ServiceStatus};
 
