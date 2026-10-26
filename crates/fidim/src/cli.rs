@@ -168,6 +168,24 @@ pub fn hosts_missing(cli: &CliEnv) -> Result<Vec<String>> {
 
 const HOST_TLD: &str = "test";
 
+/// Print the (root) steps to trust the fidim local CA system-wide.
+pub fn trust(cli: &CliEnv) -> Result<Vec<String>> {
+    let ca = cli.env.paths.etc().join("ca.crt");
+    Ok(vec![
+        "sudo mkdir -p /usr/local/share/ca-certificates".to_string(),
+        format!(
+            "sudo cp {} /usr/local/share/ca-certificates/fidim-ca.crt",
+            ca.display()
+        ),
+        "sudo update-ca-certificates".into(),
+        "apt install libnss3-tools   # browsers (NSS)".into(),
+        format!(
+            "certutil -d sql:$HOME/.pki/nssdb -A -t 'CT,c,c' -n fidim-ca -i {path}",
+            path = ca.display()
+        ),
+    ])
+}
+
 /// Run the unix-socket daemon until terminated.
 pub fn daemon(env: &Env, sock: &std::path::Path) -> Result<()> {
     crate::daemon::run_daemon(env.clone(), sock)

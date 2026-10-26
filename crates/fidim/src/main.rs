@@ -26,6 +26,8 @@ enum Commands {
     Status,
     /// Manage /etc/hosts entries for .test projects
     Hosts,
+    /// Print steps to trust the local CA (needs root)
+    Trust,
     /// Run the background daemon exposing a unix socket
     Daemon,
     Projects,
@@ -112,6 +114,11 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 }
                 Err(e) => Err(e),
             }?;
+        }
+        Some(Commands::Trust) => {
+            for line in cli::trust(&env)? {
+                println!("{line}");
+            }
         }
         Some(Commands::Install { name }) => {
             let p = cli::install(&env, &name)?;

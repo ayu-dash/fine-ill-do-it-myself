@@ -38,8 +38,12 @@ fidim status
 fidim projects
 fidim hosts     # prints the missing /etc/hosts lines (needs root to apply)
 fidim           # TUI
+fidim trust     # prints the root steps to trust the local CA
 fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim.sock
 ```
+
+Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
+keys: `quit = z`, `restart = a` (defaults q/r).
 
 Non-standard ports (no root needed):
 
