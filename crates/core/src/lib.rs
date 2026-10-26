@@ -19,3 +19,8 @@ pub mod supervisor;
 pub mod web;
 pub use proc::{RealRunner, Runner};
 pub use supervisor::{Env, PortPlan};
+pub mod installer;
+
+pub fn installer_defaults() -> &'static str {
+    include_str!("default_manifest.toml")
+}

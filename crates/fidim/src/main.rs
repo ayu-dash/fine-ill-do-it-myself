@@ -18,11 +18,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open the interactive TUI
+    Tui,
     Start,
     Stop,
     Restart,
     Status,
     Projects,
+    /// Download and install a managed binary (caddy, php-fpm-8.4, ...)
+    Install {
+        name: String,
+    },
     /// Manage PHP versions
     Php {
         #[command(subcommand)]
@@ -39,9 +45,7 @@ enum PhpCommands {
 fn resolve(cli: &Cli) -> cli::CliEnv {
     match &cli.data_root {
         Some(root) => cli::CliEnv::with_data_root(root.clone()),
-        None => cli::CliEnv::with_data_root(
-            std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
-        ),
+        None => cli::CliEnv::real().expect("cannot resolve $HOME"),
     }
 }
 
@@ -79,6 +83,10 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{s}");
             }
         }
+        Some(Commands::Install { name }) => {
+            let p = cli::install(&env, &name)?;
+            println!("installed {name} -> {}", p.display());
+        }
         Some(Commands::Projects) => {
             for p in cli::projects(&env)? {
                 println!("{p}: http://{p}.test");
@@ -95,7 +103,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 }
             }
         },
-        None => {
+        Some(Commands::Tui) | None => {
             println!("TUI goes here");
         }
     }

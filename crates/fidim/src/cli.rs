@@ -1,6 +1,6 @@
 //! Non-interactive subcommands, thin orchestration over `core`.
 use fine_ill_do_it_myself::error::Result;
-use fine_ill_do_it_myself::manifest::{Downloader, Lock, Manifest, PhpManager};
+use fine_ill_do_it_myself::manifest::{Lock, Manifest, PhpManager};
 use fine_ill_do_it_myself::orchestrator;
 use fine_ill_do_it_myself::proc::RealRunner;
 use fine_ill_do_it_myself::supervisor::PortPlan;
@@ -15,12 +15,28 @@ pub struct CliEnv {
 }
 
 impl CliEnv {
+    /// Test helper: everything under the given temporary root.
     pub fn with_data_root(root: std::path::PathBuf) -> Self {
         CliEnv {
             env: Env::new(root.join("app"), root.join("Sites")),
             ports: PortPlan::default(),
             php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
         }
+    }
+    /// Real layout: data under $HOME/.local/share/fine-ill-do-it-myself,
+    /// projects under $HOME/Sites.
+    pub fn real() -> Result<Self> {
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .map_err(|_| fine_ill_do_it_myself::Error::Other("set $HOME".into()))?;
+        Ok(CliEnv {
+            env: Env::new(
+                home.join(".local/share/fine-ill-do-it-myself"),
+                home.join("Sites"),
+            ),
+            ports: PortPlan::default(),
+            php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
+        })
     }
 }
 
@@ -50,17 +66,29 @@ pub fn projects(cli: &CliEnv) -> Result<Vec<String>> {
     Ok(orchestrator::list_projects(&cli.env))
 }
 
+/// Download + install a binary by name (caddy, php-fpm-8.4, ...).
+pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
+    cli.env.ensure_dirs()?;
+    let manifest = load_or_default_manifest(cli)?;
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    let fetcher = fine_ill_do_it_myself::installer::HttpFetcher;
+    let out =
+        fine_ill_do_it_myself::installer::install(&cli.env, &manifest, &mut lock, name, &fetcher)?;
+    Ok(out)
+}
+
+pub fn load_or_default_manifest(cli: &CliEnv) -> Result<Manifest> {
+    let path = cli.env.manifest_path();
+    if !path.exists() {
+        std::fs::write(&path, fine_ill_do_it_myself::installer_defaults())?;
+    }
+    Manifest::load(&path).map_err(fine_ill_do_it_myself::Error::Io)
+}
+
 /// Install a php version from the manifest (download static build).
 pub fn php_install(cli: &CliEnv, version: &str) -> Result<()> {
-    let manifest = Manifest::load(&cli.env.manifest_path())?;
+    install(cli, &format!("php-fpm-{version}"))?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
-    let src = manifest
-        .find(&format!("php-fpm-{version}"))
-        .ok_or_else(|| fine_ill_do_it_myself::Error::MissingBinary(version.to_string()))?
-        .clone();
-    let bin = cli.env.paths.bin();
-    std::fs::create_dir_all(&bin)?;
-    Downloader.download(&src, &bin.join(format!("php-{version}")))?;
     lock.php.push(version.to_string());
     lock.php.sort();
     lock.php.dedup();
