@@ -45,7 +45,15 @@ fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim
 ```
 
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
-keys: `quit = z`, `restart = a` (defaults q/r).
+keys (defaults q/r/s/x/a):
+
+```toml
+quit = z
+restart = t      # restart service under the cursor
+start = b        # start service under the cursor
+stop = n         # stop service under the cursor
+restart_all = g  # stop+start everything
+```
 
 Non-standard ports (no root needed):
 

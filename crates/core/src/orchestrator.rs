@@ -176,65 +176,16 @@ pub fn start_all<R: Runner + Clone>(
     runner: &R,
     php_version: &str,
 ) -> Result<Vec<crate::service::ServiceStatus>> {
-    let mut out = Vec::new();
-    generate_configs(env, ports, php_version)?;
+    let specs = service_cmds(env, ports, php_version)?;
     let sup = Supervisor {
         env: env.clone(),
         ports: ports.clone(),
         runner: runner.clone(),
     };
+    regenerate_ghosts(env, ports, php_version)?;
     let fpm_port = fpm_port_for(php_version, 9000, ports);
-    let fpm_name = format!("php-{php_version}");
-
-    // reap ghost owners of our generated configs (pid files were lost)
-    let web = web_server(env);
-    let conf_needle = web_config_path(env, &web).display().to_string();
-    let needles = vec![
-        conf_needle,
-        env.fpm_conf_path(php_version).display().to_string(),
-    ];
-    let ghosts = reap_owners(&needles);
-    let _ = ghosts;
-
-    let web = web_server(env);
-    let server_bin = resolve_web_bin(env, &web)?;
-    let mut cmds = vec![(
-        web.clone(),
-        server_bin.display().to_string(),
-        web_args(env, &web),
-        env.paths.logs().join(format!("{web}.log")),
-    )];
-    cmds.push((
-        fpm_name.clone(),
-        env.paths
-            .bin()
-            .join(format!("php-fpm-{php_version}"))
-            .display()
-            .to_string(),
-        vec![
-            "-F".to_string(),
-            "-y".to_string(),
-            env.fpm_conf_path(php_version).display().to_string(),
-        ],
-        env.paths.logs().join(format!("php-{php_version}.log")),
-    ));
-    // mariadb (system binary) when available
-    if let Ok(true) = mariadb_available(env) {
-        let mariadb_cnf = env.paths.etc().join("my.cnf");
-        let db_data = env.paths.data().join("mariadb");
-        std::fs::create_dir_all(&db_data)?;
-        if let Ok(Some(cmd)) = mariadb_config(env, &mariadb_cnf, &db_data, &env.paths.pids(), 3306)
-        {
-            cmds.push((
-                MARIADB.to_string(),
-                cmd[0].clone(),
-                cmd[1..].to_vec(),
-                env.paths.logs().join("mariadb.log"),
-            ));
-        }
-    }
-
-    for (name, bin, args, log) in cmds {
+    let mut out = Vec::new();
+    for (name, bin, args, log) in specs {
         if sup.status(&name).state == crate::service::ServiceState::Running {
             continue;
         }
@@ -246,8 +197,47 @@ pub fn start_all<R: Runner + Clone>(
         sup.write_pid(&name, pid)?;
         out.push(sup.status(&name));
     }
-
     Ok(out)
+}
+
+/// Start a single service by name (php-8.4, caddy, httpd, nginx, mariadb).
+pub fn start_service<R: Runner + Clone>(
+    env: &Env,
+    ports: &PortPlan,
+    runner: &R,
+    php_version: &str,
+    name: &str,
+) -> Result<crate::service::ServiceStatus> {
+    generate_configs(env, ports, php_version)?;
+    let sup = Supervisor {
+        env: env.clone(),
+        ports: ports.clone(),
+        runner: runner.clone(),
+    };
+    let fpm_port = fpm_port_for(php_version, 9000, ports);
+    let spec = service_cmds(env, ports, php_version)?
+        .into_iter()
+        .find(|(n, ..)| n == name)
+        .ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
+    let (name, bin, args, log) = spec;
+    check_port(fpm_port, &bin)?;
+    let mut full = vec![bin];
+    full.extend(args);
+    let wrapped = with_log_append(&full, &log)?;
+    let pid = sup.runner.spawn(&wrapped)?;
+    sup.write_pid(&name, pid)?;
+    Ok(sup.status(&name))
+}
+
+/// Replay configs + reap ghost processes that own them (pid files were lost).
+fn regenerate_ghosts(env: &Env, ports: &PortPlan, php_version: &str) -> Result<()> {
+    generate_configs(env, ports, php_version)?;
+    let web = web_server(env);
+    let conf_needle = web_config_path(env, &web).display().to_string();
+    let fpm_needle = env.fpm_conf_path(php_version).display().to_string();
+    let ghosts = reap_owners(&[conf_needle, fpm_needle]);
+    let _ = ghosts;
+    Ok(())
 }
 
 /// Binary path and CLI args per web server choice.
@@ -357,9 +347,13 @@ pub fn status_all<R: Runner + Clone>(
         runner: runner.clone(),
     };
     let mut names = sup.known_services();
-    // only advertise the chosen web server (+ mariadb when system bin exists)
+    // always show chosen web server + default php (+ mariadb when system bin)
     let web = web_server(env);
-    for n in [web.as_str(), MARIADB] {
+    let phps: Vec<String> = (0..90).map(|i| format!("php-{i}")).collect();
+    let _ = phps;
+    let lock = Lock::load(&env.lock_path()).unwrap_or_default();
+    let php = format!("php-{}", default_php(&lock));
+    for n in [web.as_str(), php.as_str(), MARIADB] {
         if !names.iter().any(|e| e == n) {
             names.push(n.to_string());
         }
@@ -785,4 +779,50 @@ mod owners_tests {
         assert_eq!(found, vec![100]);
         assert!(find_owners(p, &["void-str".to_string()]).is_empty());
     }
+}
+
+/// Build the command specs: (name, bin, args, log) for every service row.
+type CmdSpec = (String, String, Vec<String>, std::path::PathBuf);
+
+#[allow(clippy::type_complexity)]
+fn service_cmds(env: &Env, _ports: &PortPlan, php_version: &str) -> Result<Vec<CmdSpec>> {
+    let mut cmds = Vec::new();
+    let web = web_server(env);
+    let server_bin = resolve_web_bin(env, &web)?;
+    cmds.push((
+        web.clone(),
+        server_bin.display().to_string(),
+        web_args(env, &web),
+        env.paths.logs().join(format!("{web}.log")),
+    ));
+    cmds.push((
+        format!("php-{php_version}"),
+        env.paths
+            .bin()
+            .join(format!("php-fpm-{php_version}"))
+            .display()
+            .to_string(),
+        vec![
+            "-F".to_string(),
+            "-y".to_string(),
+            env.fpm_conf_path(php_version).display().to_string(),
+        ],
+        env.paths.logs().join(format!("php-{php_version}.log")),
+    ));
+    // mariadb (system binary) when available
+    if let Ok(true) = mariadb_available(env) {
+        let mariadb_cnf = env.paths.etc().join("my.cnf");
+        let db_data = env.paths.data().join("mariadb");
+        std::fs::create_dir_all(&db_data)?;
+        if let Ok(Some(cmd)) = mariadb_config(env, &mariadb_cnf, &db_data, &env.paths.pids(), 3306)
+        {
+            cmds.push((
+                MARIADB.to_string(),
+                cmd[0].clone(),
+                cmd[1..].to_vec(),
+                env.paths.logs().join("mariadb.log"),
+            ));
+        }
+    }
+    Ok(cmds)
 }

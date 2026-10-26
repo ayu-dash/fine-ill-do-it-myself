@@ -1,9 +1,28 @@
 use fine_ill_do_it_myself::{ServiceState, ServiceStatus};
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    /// Restart every service (stop_all + start_all).
+    RestartAll,
+    /// Start the service under the cursor.
+    StartService(usize),
+    /// Stop the service under the cursor.
+    StopService(usize),
+    /// Restart the service under the cursor.
+    RestartService(usize),
+}
+
 #[derive(Clone)]
 pub struct Keybinds {
     pub quit: crossterm::event::KeyCode,
+    /// per-service restart (r)
     pub restart: crossterm::event::KeyCode,
+    /// per-service start (s)
+    pub start: crossterm::event::KeyCode,
+    /// per-service stop (x)
+    pub stop: crossterm::event::KeyCode,
+    /// restart everything (a)
+    pub restart_all: crossterm::event::KeyCode,
 }
 
 impl Default for Keybinds {
@@ -11,6 +30,9 @@ impl Default for Keybinds {
         Self {
             quit: crossterm::event::KeyCode::Char('q'),
             restart: crossterm::event::KeyCode::Char('r'),
+            start: crossterm::event::KeyCode::Char('s'),
+            stop: crossterm::event::KeyCode::Char('x'),
+            restart_all: crossterm::event::KeyCode::Char('a'),
         }
     }
 }
@@ -27,6 +49,9 @@ pub fn load_keybinds(text: &str) -> Keybinds {
             match key.trim() {
                 "quit" => k.quit = code,
                 "restart" => k.restart = code,
+                "start" => k.start = code,
+                "stop" => k.stop = code,
+                "restart_all" => k.restart_all = code,
                 _ => {}
             }
         }
@@ -61,6 +86,15 @@ pub fn progress_bar(done: u64, total: u64, width: usize) -> String {
     s
 }
 
+/// True when the cursor sits on a service row and the key matches the binding.
+pub fn cursor_is_service_row(
+    app: &App,
+    want: crossterm::event::KeyCode,
+    recv: crossterm::event::KeyCode,
+) -> bool {
+    app.cursor < app.services.len() && want == recv
+}
+
 pub struct App {
     pub services: Vec<ServiceStatus>,
     pub projects: Vec<String>,
@@ -68,7 +102,7 @@ pub struct App {
     pub message: String,
     pub quit: bool,
     pub keybinds: Keybinds,
-    pub actions: Vec<&'static str>,
+    pub actions: Vec<Action>,
     #[allow(dead_code)]
     pub progress: Option<(u64, u64)>,
 }
@@ -109,9 +143,26 @@ impl App {
                 self.cursor = self.cursor.saturating_add(1);
                 self.clamp_cursor();
             }
+            _ if cursor_is_service_row(self, key, self.keybinds.start) => {
+                self.message = "start requested".into();
+                self.actions.push(Action::StartService(self.cursor));
+            }
+            _ if cursor_is_service_row(self, key, self.keybinds.stop) => {
+                self.message = "stop requested".into();
+                self.actions.push(Action::StopService(self.cursor));
+            }
             _ if key == self.keybinds.restart => {
-                self.message = "restart requested".into();
-                self.actions.push("restart");
+                if self.cursor < self.services.len() {
+                    self.message = "service restart requested".into();
+                    self.actions.push(Action::RestartService(self.cursor));
+                } else {
+                    self.message = "stop+start all requested".into();
+                    self.actions.push(Action::RestartAll);
+                }
+            }
+            _ if key == self.keybinds.restart_all => {
+                self.message = "stop+start all requested".into();
+                self.actions.push(Action::RestartAll);
             }
             _ => {}
         }
@@ -128,10 +179,13 @@ impl App {
     }
 
     fn clamp_cursor(&mut self) {
-        let len = self.services.len().max(self.projects.len()).max(1);
-        if self.cursor >= len {
-            self.cursor = len - 1;
+        // cursor walks services first, then projects
+        let len = self.services.len() + self.projects.len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
         }
+        self.cursor = self.cursor.min(len - 1);
     }
 }
 
@@ -285,7 +339,10 @@ pub fn run_tui(
                     (app.keybinds.quit, "quit"),
                     (crossterm::event::KeyCode::Char('j'), "down"),
                     (crossterm::event::KeyCode::Char('k'), "up"),
+                    (app.keybinds.start, "start"),
+                    (app.keybinds.stop, "stop"),
                     (app.keybinds.restart, "restart"),
+                    (app.keybinds.restart_all, "all"),
                 ];
                 let mut spans: Vec<Span> = Vec::new();
                 for (code, label) in hints {
@@ -326,7 +383,7 @@ pub fn run_tui(
                 if k.kind == KeyEventKind::Press {
                     app.on_key(k.code);
                     while let Some(a) = app.actions.pop() {
-                        act(&mut app, a);
+                        act(&mut app, &a);
                     }
                 }
             }
@@ -353,24 +410,56 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
     }
 }
 
+/// Execute one queued action against the real system; sets the status-bar
+/// message with the outcome.
 fn make_actioner(
     env: fine_ill_do_it_myself::Env,
     ports: fine_ill_do_it_myself::PortPlan,
-) -> impl Fn(&mut App, &str) {
-    move |app: &mut App, action: &str| {
+) -> impl Fn(&mut App, &Action) {
+    move |app: &mut App, action: &Action| {
         let runner = fine_ill_do_it_myself::RealRunner;
         let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
         let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-        let r: Result<Vec<_>, _> = if action == "restart" {
-            fine_ill_do_it_myself::orchestrator::stop_all(&env, &ports, &runner).and_then(|_| {
-                fine_ill_do_it_myself::orchestrator::start_all(&env, &ports, &runner, &php)
-            })
-        } else {
-            fine_ill_do_it_myself::orchestrator::stop_all(&env, &ports, &runner).map(|_| Vec::new())
+        let r: Result<Vec<_>, _> = match action {
+            Action::RestartAll => {
+                fine_ill_do_it_myself::orchestrator::stop_all(&env, &ports, &runner).and_then(
+                    |_| fine_ill_do_it_myself::orchestrator::start_all(&env, &ports, &runner, &php),
+                )
+            }
+            Action::StartService(i) => {
+                let name = app.services[*i].name.clone();
+                fine_ill_do_it_myself::orchestrator::start_service(
+                    &env, &ports, &runner, &php, &name,
+                )
+                .map(|s| vec![s])
+            }
+            Action::StopService(i) => {
+                let name = app.services[*i].name.clone();
+                let sup = fine_ill_do_it_myself::supervisor::Supervisor {
+                    env: env.clone(),
+                    ports: ports.clone(),
+                    runner: runner.clone(),
+                };
+                sup.stop(&name).map(|_| Vec::new())
+            }
+            Action::RestartService(i) => {
+                let name = app.services[*i].name.clone();
+                let sup = fine_ill_do_it_myself::supervisor::Supervisor {
+                    env: env.clone(),
+                    ports: ports.clone(),
+                    runner: runner.clone(),
+                };
+                sup.stop(&name).and_then(|_| {
+                    fine_ill_do_it_myself::orchestrator::start_service(
+                        &env, &ports, &runner, &php, &name,
+                    )
+                    .map(|s| vec![s])
+                })
+            }
         };
         match r {
-            Ok(_) => app.message = format!("{action} ok"),
-            Err(e) => app.message = format!("{action}: {e}"),
+            Ok(_) => app.message = format!("{action:?} ok").to_lowercase(),
+            Err(e) => app.message = format!("{action:?}: {e}").to_lowercase(),
         }
     }
 }
@@ -432,9 +521,9 @@ mod tests {
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Down);
-        assert_eq!(a.cursor, 1);
+        assert_eq!(a.cursor, 2, "cursor walks past services into projects");
         a.on_key(KeyCode::Up);
-        assert_eq!(a.cursor, 0);
+        assert_eq!(a.cursor, 1);
         a.on_key(KeyCode::Char('k'));
         assert_eq!(a.cursor, 0);
     }
@@ -444,8 +533,8 @@ mod tests {
         let mut a = App::new(vec![], vec![]);
         a.on_key(KeyCode::Char('r'));
         assert!(!a.quit);
-        assert!(a.message.contains("restart"));
-        assert_eq!(a.actions, vec!["restart"]);
+        assert!(a.message.contains("requested"));
+        assert_eq!(a.actions[0], Action::RestartAll);
     }
 
     #[test]
@@ -475,6 +564,37 @@ mod tests {
         std::fs::write(&f, "1\n2\n3\n4\n").unwrap();
         assert_eq!(tail(&f, 2), vec!["3".to_string(), "4".to_string()]);
         assert!(tail(&t.path().join("missing"), 2).is_empty());
+    }
+
+    #[test]
+    fn keys_config_per_service_overrides() {
+        let k = load_keybinds("quit = z\nstart = b\nstop = n\nrestart = t\nrestart_all = g\n");
+        assert_eq!(k.start, KeyCode::Char('b'));
+        assert_eq!(k.stop, KeyCode::Char('n'));
+        assert_eq!(k.restart, KeyCode::Char('t'));
+        assert_eq!(k.restart_all, KeyCode::Char('g'));
+    }
+
+    #[test]
+    fn service_row_keys_queue_actions() {
+        let mut a = App::new(
+            vec![svc("caddy", false), svc("php-8.4", true)],
+            vec!["blog".into()],
+        );
+        a.on_key(KeyCode::Char('s'));
+        assert_eq!(a.actions[0], Action::StartService(0));
+        a.actions.clear();
+        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Char('x'));
+        assert_eq!(a.actions[0], Action::StopService(1));
+        a.actions.clear();
+        a.on_key(KeyCode::Char('r'));
+        assert_eq!(a.actions[0], Action::RestartService(1));
+        // on the projects panel `r` restarts everything
+        a.actions.clear();
+        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Char('r'));
+        assert_eq!(a.actions[0], Action::RestartAll);
     }
 
     #[test]
