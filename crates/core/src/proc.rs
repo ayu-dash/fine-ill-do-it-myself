@@ -3,16 +3,16 @@ use std::path::Path;
 /// Process control abstraction so management logic can be tested without
 /// spawning real processes (real impl = std::process).
 pub trait Runner: Send + Sync {
-    fn spawn(&self, cmd: &[String]) -> Result<(), std::io::Error>;
+    fn spawn(&self, cmd: &[String]) -> Result<u32, std::io::Error>;
     fn is_running(&self, pid: u32) -> bool;
-    fn kill(&self, pid: u32) -> Result<(), std::io::Error>;
+    fn kill(&self, pid: u32) -> std::result::Result<(), std::io::Error>;
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RealRunner;
 
 impl Runner for RealRunner {
-    fn spawn(&self, cmd: &[String]) -> Result<(), std::io::Error> {
+    fn spawn(&self, cmd: &[String]) -> std::result::Result<u32, std::io::Error> {
         if cmd.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -24,12 +24,12 @@ impl Runner for RealRunner {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map(|_| ())
+            .map(|c| c.id())
     }
     fn is_running(&self, pid: u32) -> bool {
         std::path::Path::new(format!("/proc/{pid}").as_str()).exists()
     }
-    fn kill(&self, pid: u32) -> Result<(), std::io::Error> {
+    fn kill(&self, pid: u32) -> std::result::Result<(), std::io::Error> {
         std::process::Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())

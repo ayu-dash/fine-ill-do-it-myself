@@ -5,7 +5,7 @@ use std::path::PathBuf;
 /// inject a temp dir so we never touch the real home directory.
 #[derive(Debug, Clone)]
 pub struct Paths {
-    root: PathBuf,
+    pub root: PathBuf,
     sites: PathBuf,
 }
 
