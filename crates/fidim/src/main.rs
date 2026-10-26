@@ -38,8 +38,17 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PhpCommands {
-    Install { version: String },
+    Install {
+        version: String,
+    },
     List,
+    #[clap(name = "use")]
+    Use {
+        version: String,
+    },
+    Remove {
+        version: String,
+    },
 }
 
 fn resolve(cli: &Cli) -> cli::CliEnv {
@@ -101,6 +110,14 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 for v in cli::php_list(&env)? {
                     println!("{v}");
                 }
+            }
+            PhpCommands::Use { version } => {
+                cli::php_use(&env, &version)?;
+                println!("default php {version}");
+            }
+            PhpCommands::Remove { version } => {
+                cli::php_remove(&env, &version)?;
+                println!("php {version} removed");
             }
         },
         Some(Commands::Tui) | None => {

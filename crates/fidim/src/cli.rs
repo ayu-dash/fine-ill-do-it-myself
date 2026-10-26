@@ -110,5 +110,37 @@ pub fn php_list(cli: &CliEnv) -> Result<Vec<String>> {
     Ok(PhpManager.installed(&lock, &cli.env.paths.bin()))
 }
 
+/// Set the default PHP version used by `fidim start`.
+pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
+    if !cli
+        .env
+        .paths
+        .bin()
+        .join(format!("php-fpm-{version}"))
+        .exists()
+    {
+        return Err(fine_ill_do_it_myself::Error::PhpNotInstalled(
+            version.into(),
+        ));
+    }
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    lock.php_default = Some(version.into());
+    lock.save(&cli.env.lock_path())?;
+    Ok(())
+}
+
+/// Uninstall a php version.
+pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    lock.php.retain(|v| v != version);
+    if lock.php_default.as_deref() == Some(version) {
+        lock.php_default = lock.php.first().cloned();
+    }
+    lock.save(&cli.env.lock_path())?;
+    let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-fpm-{version}")));
+    let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-{version}")));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {}
