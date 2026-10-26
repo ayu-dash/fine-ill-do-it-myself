@@ -1,0 +1,11 @@
+[package]
+name = "fidim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fine_ill_do_it_myself = { path = "../core" }
+
+[[bin]]
+name = "fidim"
+path = "src/main.rs"

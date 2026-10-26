@@ -1,0 +1,7 @@
+[package]
+name = "fine_ill_do_it_myself"
+description = "Core logic for fidim, a local web dev environment manager"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

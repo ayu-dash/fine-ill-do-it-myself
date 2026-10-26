@@ -1,0 +1,6 @@
+/target
+*.pid
+.env
+*.log
+/data
+/.fidim-test
