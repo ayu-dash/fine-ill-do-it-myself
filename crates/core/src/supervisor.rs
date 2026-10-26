@@ -156,8 +156,11 @@ pub fn with_log_append(cmd: &[String], log: &Path) -> Result<Vec<String>> {
     if cmd.is_empty() {
         return Err(Error::Other("empty command".into()));
     }
-    let joined = cmd.join(" ");
-    let quoted = shlex_quote(&joined);
+    let quoted = cmd
+        .iter()
+        .map(|a| shlex_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     Ok(vec![
         "/bin/sh".into(),
         "-c".into(),

@@ -140,12 +140,14 @@ pub fn install<F: Fetcher>(
     entry.sha256 = hex.clone();
     let _ = entry;
     lock.save(&env.lock_path())?;
-    // php entries: expose a short alias php-fpm-<version>
-    if let Some(v) = name.strip_prefix("php-cli-") {
-        let alias = dest.join(format!("php-{v}"));
-        let _ = std::os::unix::fs::symlink(dest.join(name), &alias);
+    // expose the binary under its manifest name (e.g. php-fpm-8.4)
+    if let Some(first) = targets.first() {
+        let want = dest.join(name);
+        if *first != want && !want.exists() {
+            fs::hard_link(first, &want).or_else(|_| fs::copy(first, &want).map(|_| ()))?;
+        }
     }
-    Ok(targets.first().cloned().unwrap_or_default())
+    Ok(dest.join(name))
 }
 
 #[cfg(test)]

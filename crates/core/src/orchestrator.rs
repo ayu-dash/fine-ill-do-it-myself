@@ -10,7 +10,7 @@ use crate::manifest::{Lock, Manifest};
 use crate::php::fpm::{fpm_port_for, generate_fpm_conf};
 use crate::proc::Runner;
 use crate::supervisor::{with_log_append, Env, PortPlan, Supervisor};
-use crate::web::caddyfile::generate_caddyfile;
+use crate::web::caddyfile::generate_caddyfile_for_projects;
 
 pub const CADDY: &str = "caddy";
 
@@ -58,7 +58,11 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
     env.ensure_dirs()?;
     let sites = env.paths.sites().display().to_string();
     let fpm_port = fpm_port_for(php_version, 9000, ports);
-    std::fs::write(env.caddyfile_path(), generate_caddyfile(&sites, fpm_port)?)?;
+    let projects = list_projects(env);
+    std::fs::write(
+        env.caddyfile_path(),
+        generate_caddyfile_for_projects(&sites, fpm_port, &projects, ports.http, ports.https)?,
+    )?;
     std::fs::write(
         env.fpm_conf_path(php_version),
         generate_fpm_conf(
@@ -252,6 +256,8 @@ mod tests {
         env.ensure_dirs().unwrap();
         std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
         let php_version = "8.4";
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        std::fs::write(env.paths.sites().join("blog/index.php"), "<?php echo 1;").unwrap();
         std::fs::write(
             env.paths.bin().join(format!("php-fpm-{php_version}")),
             "#!/bin/sh\n",
@@ -265,7 +271,8 @@ mod tests {
             .all(|s| s.state == crate::service::ServiceState::Running));
         // caddyfile references the sites root and label placeholder
         let caddyfile = std::fs::read_to_string(env.caddyfile_path()).unwrap();
-        assert!(caddyfile.contains("{http.request.host_labels.0}"));
+        assert!(caddyfile.contains("http://blog.test"), "{caddyfile}");
+        assert!(caddyfile.contains("root * "), "{caddyfile}");
         assert!(std::fs::read_to_string(env.fpm_conf_path(php_version))
             .unwrap()
             .contains("listen = 127.0.0.1:9004"));

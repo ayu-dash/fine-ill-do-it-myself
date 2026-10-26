@@ -29,12 +29,21 @@ impl CliEnv {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .map_err(|_| fine_ill_do_it_myself::Error::Other("set $HOME".into()))?;
+        let rp = |k: &str, d: u16| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         Ok(CliEnv {
             env: Env::new(
                 home.join(".local/share/fine-ill-do-it-myself"),
                 home.join("Sites"),
             ),
-            ports: PortPlan::default(),
+            ports: PortPlan {
+                http: rp("FIDIM_HTTP_PORT", 80),
+                https: rp("FIDIM_HTTPS_PORT", 443),
+            },
             php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
         })
     }
