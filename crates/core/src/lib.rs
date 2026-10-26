@@ -1,14 +1,15 @@
-/// Placeholder module until the real core logic lands in stage 1.
+pub mod error;
+pub mod manifest;
+pub mod paths;
+pub mod proc;
+pub mod service;
+
+pub use error::{Error, Result};
+pub use manifest::{Manifest, PhpManager};
+pub use paths::Paths;
+pub use service::{Service, ServiceRegistry, ServiceState, ServiceStatus};
+
+/// Human display name, used in the TUI header and release artefacts.
 pub fn app_display_name() -> &'static str {
     "fine ill do it myself"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exposes_display_name() {
-        assert_eq!(app_display_name(), "fine ill do it myself");
-    }
 }
