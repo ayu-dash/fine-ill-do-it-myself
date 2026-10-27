@@ -424,6 +424,28 @@ pub fn ports_label(name: &str, php_row: &str, ports: &fine_ill_do_it_myself::Por
     }
 }
 
+/// Management lines for ONE web server row: its default-selection action,
+/// probed version, and its OWN http/https pair — never a shared list.
+pub fn web_mgmt_lines(
+    name: &str,
+    cur_web: &str,
+    ver: Option<&str>,
+    ports: &fine_ill_do_it_myself::PortPlan,
+) -> Vec<String> {
+    let (http, https) = ports.web_ports(name);
+    let ver_txt = ver.unwrap_or("not installed");
+    let mut out = Vec::new();
+    if name == cur_web {
+        out.push("  default web (this one)".to_string());
+    } else {
+        out.push(format!("web.use {name}"));
+    }
+    out.push(format!("  version {ver_txt}"));
+    out.push(format!("  port http = {http}"));
+    out.push(format!("  port https = {https}"));
+    out
+}
+
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
 pub fn run_tui(
     env: &fine_ill_do_it_myself::Env,
@@ -610,23 +632,24 @@ pub fn run_tui(
                         } else if ["caddy", "httpd", "nginx", "lighttpd"]
                             .contains(&svc_name.as_str())
                         {
-                            // Show web server management
+                            // Per-server management: this server's action,
+                            // version and ITS OWN ports — not a shared list.
                             let ver =
                                 fine_ill_do_it_myself::orchestrator::web_version(env, svc_name);
-                            let v = ver.as_deref().unwrap_or("not installed");
-                            mgmt_title = format!(" web server [{v}] ");
-                            for w in [
-                                fine_ill_do_it_myself::orchestrator::CADDY,
-                                fine_ill_do_it_myself::orchestrator::APACHE,
-                                fine_ill_do_it_myself::orchestrator::NGINX,
-                                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
-                            ] {
-                                let mark = if w == cur_web { "▶ " } else { "  " };
-                                let wv = fine_ill_do_it_myself::orchestrator::web_version(env, w);
-                                let wv_txt = wv.as_deref().unwrap_or("not installed");
+                            mgmt_title = format!(" {svc_name} management ");
+                            let ports =
+                                fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
+                                    std::env::var(k).ok()
+                                });
+                            for line in web_mgmt_lines(svc_name, &cur_web, ver.as_deref(), &ports) {
+                                let color = if line.starts_with("web.use") {
+                                    Color::Cyan
+                                } else {
+                                    Color::Yellow
+                                };
                                 mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                    format!("{mark}web.use {w}  [{wv_txt}]"),
-                                    Style::default().fg(Color::Cyan),
+                                    line,
+                                    Style::default().fg(color),
                                 ))));
                             }
                         } else if svc_name == "mariadb" {
@@ -1141,6 +1164,44 @@ mod tests {
         assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
         assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
         assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");
+    }
+
+    #[test]
+    fn web_mgmt_is_per_server_not_one_shared_list() {
+        let ports = fine_ill_do_it_myself::PortPlan::default();
+        let nginx = web_mgmt_lines("nginx", "caddy", Some("1.29.1"), &ports);
+        let caddy = web_mgmt_lines("caddy", "caddy", Some("2.10.0"), &ports);
+        // nginx panel: its own action, version and ITS OWN ports
+        assert!(
+            nginx.iter().any(|l| l.contains("web.use nginx")),
+            "{nginx:?}"
+        );
+        assert!(
+            nginx.iter().any(|l| l.contains("version 1.29.1")),
+            "{nginx:?}"
+        );
+        assert!(
+            nginx.iter().any(|l| l.contains("port http = 8082")),
+            "{nginx:?}"
+        );
+        assert!(
+            nginx.iter().any(|l| l.contains("port https = 8445")),
+            "{nginx:?}"
+        );
+        assert!(
+            !nginx.iter().any(|l| l.contains("port http = 8080")),
+            "{nginx:?}"
+        );
+        assert!(!nginx.iter().any(|l| l.contains("caddy")), "{nginx:?}");
+        // caddy panel: marked as default, caddy's own ports
+        assert!(caddy.iter().any(|l| l.contains("default web")), "{caddy:?}");
+        assert!(
+            caddy.iter().any(|l| l.contains("port http = 8080")),
+            "{caddy:?}"
+        );
+        assert!(!caddy.iter().any(|l| l.contains("web.use")), "{caddy:?}");
+        // panels differ per server, not one shared list
+        assert_ne!(nginx, caddy);
     }
 
     #[test]
