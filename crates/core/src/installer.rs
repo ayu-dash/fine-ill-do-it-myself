@@ -31,6 +31,29 @@ impl Fetcher for HttpFetcher {
 /// Downloaded tarball contents may contain either a single binary or several
 /// files (caddy ships just the binary plus licenses). When `files` is given
 /// explicitly, copy those names verbatim into `dest_dir`.
+fn find_file_in_dir(root: &Path, rel: &str) -> Option<PathBuf> {
+    let direct = root.join(rel);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.is_file()
+                    && (p.ends_with(rel) || p.file_name().map(|n| n == rel).unwrap_or(false))
+                {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn unpack_binary(
     bytes: &[u8],
     tar_gz: bool,
@@ -46,11 +69,14 @@ pub fn unpack_binary(
         archive.unpack(staging)?;
         if !files.is_empty() {
             for f in files {
-                let src = staging.join(f);
-                if !src.exists() {
-                    return Err(Error::Other(format!("missing {f} inside tarball")));
-                }
-                let out = dest_dir.join(f.trim_start_matches("./"));
+                let (src_rel, dest_rel) = if let Some((s, d)) = f.split_once(':') {
+                    (s.trim(), d.trim())
+                } else {
+                    (f.as_str(), f.trim_start_matches("./"))
+                };
+                let src = find_file_in_dir(staging, src_rel)
+                    .ok_or_else(|| Error::Other(format!("missing {src_rel} inside tarball")))?;
+                let out = dest_dir.join(dest_rel);
                 fs::create_dir_all(out.parent().unwrap_or(dest_dir))?;
                 fs::rename(&src, &out)?;
                 moved.push(out);

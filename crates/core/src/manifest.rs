@@ -64,6 +64,10 @@ pub struct Lock {
     pub php_default: Option<String>,
     #[serde(default)]
     pub web_default: Option<String>,
+    #[serde(default)]
+    pub languages: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub language_defaults: std::collections::BTreeMap<String, String>,
 }
 
 impl Lock {

@@ -41,3 +41,35 @@ url = "https://dl.static-php.dev/static-php-cli/common/php-8.4.23-fpm-linux-x86_
 sha256 = ""
 tar_gz = true
 files = []
+
+[[binaries]]
+name = "node-22"
+version = "22.11.0"
+url = "https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["bin/node:node/node-22", "bin/npm:node/npm-22", "bin/npx:node/npx-22"]
+
+[[binaries]]
+name = "node-20"
+version = "20.18.0"
+url = "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-x64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["bin/node:node/node-20", "bin/npm:node/npm-20", "bin/npx:node/npx-20"]
+
+[[binaries]]
+name = "go-1.23"
+version = "1.23.2"
+url = "https://go.dev/dl/go1.23.2.linux-amd64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["bin/go:go/go-1.23", "bin/gofmt:go/gofmt-1.23"]
+
+[[binaries]]
+name = "go-1.22"
+version = "1.22.8"
+url = "https://go.dev/dl/go1.22.8.linux-amd64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["bin/go:go/go-1.22", "bin/gofmt:go/gofmt-1.22"]

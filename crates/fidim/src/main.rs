@@ -46,6 +46,26 @@ enum Commands {
         #[command(subcommand)]
         cmd: PhpCommands,
     },
+    /// Manage Node.js versions
+    Node {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
+    /// Manage Python versions
+    Python {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
+    /// Manage Go versions
+    Go {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
+    /// Manage Java versions
+    Java {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
     /// Show or change port assignments (etc/ports.toml)
     Ports {
         #[command(subcommand)]
@@ -91,6 +111,21 @@ enum PhpCommands {
     /// Show the path to the php.ini configuration file
     Ini {
         version: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LangCommands {
+    Install {
+        version: String,
+    },
+    List,
+    #[clap(name = "use")]
+    Use {
+        version: String,
+    },
+    Remove {
+        version: String,
     },
 }
 
@@ -201,6 +236,10 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{}", path.display());
             }
         },
+        Some(Commands::Node { cmd }) => handle_lang_cmd(&env, "node", cmd)?,
+        Some(Commands::Python { cmd }) => handle_lang_cmd(&env, "python", cmd)?,
+        Some(Commands::Go { cmd }) => handle_lang_cmd(&env, "go", cmd)?,
+        Some(Commands::Java { cmd }) => handle_lang_cmd(&env, "java", cmd)?,
         Some(Commands::Ports { cmd }) => match cmd {
             PortCommands::Show => {
                 let p = &env.ports;
@@ -249,6 +288,33 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
         }
         Some(Commands::Tui) | None => {
             tui::run_tui(&env.env, env.ports)?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_lang_cmd(
+    env: &cli::CliEnv,
+    lang: &str,
+    cmd: LangCommands,
+) -> Result<(), fine_ill_do_it_myself::Error> {
+    match cmd {
+        LangCommands::Install { version } => {
+            cli::lang_install(env, lang, &version)?;
+            println!("{lang} {version} installed");
+        }
+        LangCommands::List => {
+            for v in cli::lang_list(env, lang)? {
+                println!("{v}");
+            }
+        }
+        LangCommands::Use { version } => {
+            cli::lang_use(env, lang, &version)?;
+            println!("default {lang} {version}");
+        }
+        LangCommands::Remove { version } => {
+            cli::lang_remove(env, lang, &version)?;
+            println!("{lang} {version} removed");
         }
     }
     Ok(())

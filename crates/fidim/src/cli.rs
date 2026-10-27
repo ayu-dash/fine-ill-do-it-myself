@@ -129,6 +129,33 @@ pub fn php_list(cli: &CliEnv) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Install a language version from the manifest.
+pub fn lang_install(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
+    if lang == "php" {
+        return php_install(cli, version);
+    }
+    let name = format!("{lang}-{version}");
+    install(cli, &name)?;
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    let list = lock.languages.entry(lang.to_string()).or_default();
+    if !list.contains(&version.to_string()) {
+        list.push(version.to_string());
+        list.sort();
+    }
+    lock.save(&cli.env.lock_path())?;
+    Ok(())
+}
+
+/// List installed versions for a language.
+pub fn lang_list(cli: &CliEnv, lang: &str) -> Result<Vec<String>> {
+    if lang == "php" {
+        return php_list(cli);
+    }
+    Ok(fine_ill_do_it_myself::lang::installed_lang_versions(
+        &cli.env, lang,
+    ))
+}
+
 #[allow(dead_code)]
 fn php_list_old(cli: &CliEnv) -> Result<Vec<String>> {
     let lock = Lock::load(&cli.env.lock_path())?;
@@ -220,6 +247,98 @@ pub fn php_ini(cli: &CliEnv, version: Option<&str>) -> Result<std::path::PathBuf
         let _ = std::fs::write(&ini, fine_ill_do_it_myself::php::fpm::generate_php_ini(&[]));
     }
     Ok(ini)
+}
+
+/// Switch active version for a programming language and update symlinks in ~/.local/bin.
+pub fn lang_use(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
+    if lang == "php" {
+        return php_use(cli, version);
+    }
+    let clean_version = if version.starts_with("system") {
+        "system"
+    } else {
+        version
+    };
+    let src =
+        fine_ill_do_it_myself::lang::lang_binary_for(&cli.env, lang, version).ok_or_else(|| {
+            fine_ill_do_it_myself::Error::Other(format!("{lang} {version} not installed"))
+        })?;
+
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    lock.language_defaults
+        .insert(lang.to_string(), clean_version.to_string());
+    lock.save(&cli.env.lock_path())?;
+
+    let lang_dir = cli.env.paths.bin().join(lang);
+    let _ = std::fs::create_dir_all(&lang_dir);
+
+    #[cfg(unix)]
+    {
+        relink(&src, &lang_dir.join(lang));
+
+        let companions: &[&str] = match lang {
+            "node" => &["npm", "npx", "corepack"],
+            "python" => &["python3", "pip", "pip3"],
+            "go" => &["gofmt"],
+            "java" => &["javac", "jar"],
+            _ => &[],
+        };
+
+        for &comp in companions {
+            let mut comp_src = None;
+            if clean_version != "system" {
+                let managed_comp = lang_dir.join(format!("{comp}-{clean_version}"));
+                if managed_comp.exists() {
+                    comp_src = Some(managed_comp);
+                }
+            }
+            if comp_src.is_none() {
+                if let Some(parent) = src.parent() {
+                    let beside = parent.join(comp);
+                    if beside.exists() {
+                        comp_src = Some(beside);
+                    }
+                }
+            }
+            if let Some(comp_path) = comp_src {
+                relink(&comp_path, &lang_dir.join(comp));
+            }
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            let local_bin = std::path::PathBuf::from(home).join(".local/bin");
+            if local_bin.is_dir() {
+                relink(&src, &local_bin.join(lang));
+                for &comp in companions {
+                    let linked = lang_dir.join(comp);
+                    if linked.exists() {
+                        relink(&linked, &local_bin.join(comp));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove an installed language version.
+pub fn lang_remove(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
+    if lang == "php" {
+        return php_remove(cli, version);
+    }
+    let mut lock = Lock::load(&cli.env.lock_path())?;
+    if let Some(list) = lock.languages.get_mut(lang) {
+        list.retain(|v| v != version);
+    }
+    if lock.language_defaults.get(lang).map(|s| s.as_str()) == Some(version) {
+        lock.language_defaults.remove(lang);
+    }
+    lock.save(&cli.env.lock_path())?;
+
+    let lang_dir = cli.env.paths.bin().join(lang);
+    let _ = std::fs::remove_file(lang_dir.join(format!("{lang}-{version}")));
+    let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("{lang}-{version}")));
+    Ok(())
 }
 
 /// Set one port key in `etc/ports.toml`. Common keys (http, https, fpm_base,

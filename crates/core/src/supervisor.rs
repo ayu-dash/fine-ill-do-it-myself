@@ -278,7 +278,19 @@ impl<R: Runner> Supervisor<R> {
             // we launched it at some point but the process is gone
             ServiceState::Error("process exited; see logs".into())
         } else {
-            ServiceState::Stopped
+            let is_lang = crate::lang::SUPPORTED_LANGUAGES
+                .iter()
+                .any(|&l| name == l || name.starts_with(&format!("{l}-")));
+            if is_lang && !name.starts_with("php") {
+                let base = name.split('-').next().unwrap_or(name);
+                if crate::lang::active_lang_version(&self.env, base).is_some() {
+                    ServiceState::Running
+                } else {
+                    ServiceState::Stopped
+                }
+            } else {
+                ServiceState::Stopped
+            }
         };
         ServiceStatus {
             name: name.into(),

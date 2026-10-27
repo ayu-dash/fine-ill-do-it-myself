@@ -570,6 +570,26 @@ pub fn status_all<R: Runner + Clone>(
             names.push(n.to_string());
         }
     }
+    for &l in crate::lang::SUPPORTED_LANGUAGES {
+        if l == "php" {
+            continue;
+        }
+        let installed = crate::lang::installed_lang_versions(env, l);
+        if !installed.is_empty() {
+            for v in installed {
+                let n = format!("{l}-{v}");
+                if !names.iter().any(|e| e == &n) {
+                    names.push(n);
+                }
+            }
+        }
+        if !names
+            .iter()
+            .any(|e| e == l || e.starts_with(&format!("{l}-")))
+        {
+            names.push(l.to_string());
+        }
+    }
     names.iter().map(|n| sup.status(n)).collect()
 }
 

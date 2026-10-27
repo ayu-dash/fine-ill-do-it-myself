@@ -20,6 +20,8 @@ pub enum Action {
     ShowDetail(String),
     /// Switch a web server's active binary version (e.g. caddy -> caddy-2.9.1).
     UseServerVersion { server: String, version: String },
+    /// Switch a programming language version (e.g. node -> node-22).
+    UseLang { lang: String, version: String },
 }
 
 /// One row of the config panel.
@@ -132,6 +134,10 @@ pub fn is_language(name: &str) -> bool {
         || name == "python"
         || name.starts_with("ruby-")
         || name == "ruby"
+        || name.starts_with("go-")
+        || name == "go"
+        || name.starts_with("java-")
+        || name == "java"
 }
 
 pub struct App {
@@ -338,9 +344,20 @@ impl App {
         } else if let Some(n) = text.strip_prefix("web.use ") {
             self.message = format!("web.use {n} requested");
             self.actions.push(Action::UseWeb(n.to_string()));
-        } else if let Some((server, ver)) = text.split_once(".use ") {
-            let s = server.trim_start_matches("▶ ").trim();
-            if [
+        } else if let Some((lang_or_srv, ver)) = text.split_once(".use ") {
+            let s = lang_or_srv.trim_start_matches("▶ ").trim();
+            if ["node", "python", "go", "java"].contains(&s) {
+                let target_ver = if ver.starts_with("system") {
+                    "system"
+                } else {
+                    ver
+                };
+                self.message = format!("{s}.use {target_ver} requested");
+                self.actions.push(Action::UseLang {
+                    lang: s.to_string(),
+                    version: target_ver.to_string(),
+                });
+            } else if [
                 fine_ill_do_it_myself::orchestrator::CADDY,
                 fine_ill_do_it_myself::orchestrator::APACHE,
                 fine_ill_do_it_myself::orchestrator::NGINX,
@@ -700,7 +717,7 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
         fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
 
     if let Some(svc) = app.services.get(app.cursor_left) {
-        if svc.name.starts_with("php-") {
+        if svc.name.starts_with("php-") || svc.name == "php" {
             return (
                 format!(" php versions (current: {cur_php}) "),
                 fine_ill_do_it_myself::orchestrator::installed_php_versions(env)
@@ -711,6 +728,42 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
                     })
                     .collect(),
             );
+        }
+        for lang in ["node", "python", "go", "java"] {
+            if svc.name == lang || svc.name.starts_with(&format!("{lang}-")) {
+                let cur = fine_ill_do_it_myself::lang::active_lang_version(env, lang)
+                    .unwrap_or_else(|| "none".into());
+                let versions = fine_ill_do_it_myself::lang::installed_lang_versions(env, lang);
+                let mut lines = Vec::new();
+                if versions.is_empty() {
+                    lines.push("  no versions installed:".to_string());
+                    lines.push(format!("  install with: fidim {lang} install <v>:"));
+                } else {
+                    for v in &versions {
+                        let is_active = v == &cur
+                            || (v == "system" && (cur == "system" || cur.starts_with("system")));
+                        let mark = if is_active { "▶ " } else { "  " };
+                        let label = if v == "system" {
+                            if let Some(sys) = fine_ill_do_it_myself::lang::which_system_lang(lang)
+                            {
+                                if let Some(sys_ver) =
+                                    fine_ill_do_it_myself::lang::probe_version(&sys)
+                                {
+                                    format!("system ({sys_ver})")
+                                } else {
+                                    "system".to_string()
+                                }
+                            } else {
+                                "system".to_string()
+                            }
+                        } else {
+                            v.clone()
+                        };
+                        lines.push(format!("{mark}{lang}.use {label}"));
+                    }
+                }
+                return (format!(" {lang} versions (current: {cur}) "), lines);
+            }
         }
         if [
             fine_ill_do_it_myself::orchestrator::CADDY,
@@ -844,27 +897,31 @@ pub fn run_tui(
                     .map(|(i, _)| i)
                     .collect();
 
-                // Collapse PHP versions: show only one "php" row per
-                // language family.  The default version is displayed;
-                // the user switches versions via the right mgmt panel.
+                // Collapse language versions: show only one row per language
+                // family (php, node, python, go, java). The active version is
+                // displayed; the user switches versions via the right mgmt panel.
                 let mut collapsed_lang: Vec<(usize, String)> = Vec::new();
-                let mut seen_php = false;
+                let mut seen_langs = std::collections::HashSet::new();
                 for &idx in &lang_indices {
                     let s = &app.services[idx];
-                    if s.name.starts_with("php") {
-                        if !seen_php {
-                            seen_php = true;
-                            // Pick the service matching the current default.
-                            let default_idx = lang_indices
-                                .iter()
-                                .find(|&&i| app.services[i].name == format!("php-{php_row}"))
-                                .copied()
-                                .unwrap_or(idx);
-                            collapsed_lang.push((default_idx, "php".to_string()));
-                        }
-                    } else {
-                        // Future: node, python, ruby — keep as-is.
-                        collapsed_lang.push((idx, s.name.clone()));
+                    let base = s.name.split('-').next().unwrap_or(&s.name);
+                    if !seen_langs.contains(base) {
+                        seen_langs.insert(base.to_string());
+                        let target = if base == "php" {
+                            format!("php-{php_row}")
+                        } else if let Some(v) =
+                            fine_ill_do_it_myself::lang::active_lang_version(env, base)
+                        {
+                            format!("{base}-{v}")
+                        } else {
+                            base.to_string()
+                        };
+                        let default_idx = lang_indices
+                            .iter()
+                            .find(|&&i| app.services[i].name == target)
+                            .copied()
+                            .unwrap_or(idx);
+                        collapsed_lang.push((default_idx, base.to_string()));
                     }
                 }
 
@@ -974,7 +1031,12 @@ pub fn run_tui(
                                 }
                                 _ => ("○ ".to_string(), Color::DarkGray),
                             };
-                            let p = ports_label(&s.name, &php_row, &ports);
+                            let p = if display_name == "php" {
+                                ports_label(&s.name, &php_row, &ports)
+                            } else {
+                                fine_ill_do_it_myself::lang::active_lang_version(env, display_name)
+                                    .unwrap_or_else(|| "not installed".to_string())
+                            };
                             let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
@@ -1299,6 +1361,14 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 php_default: v.clone(),
             };
             crate::cli::php_use(&cli_env, v).map(|_| vec![])
+        }
+        Action::UseLang { lang, version } => {
+            let cli_env = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: version.clone(),
+            };
+            crate::cli::lang_use(&cli_env, lang, version).map(|_| vec![])
         }
         Action::UseWeb(name) => {
             if fine_ill_do_it_myself::orchestrator::resolve_web_bin(env, name).is_err() {

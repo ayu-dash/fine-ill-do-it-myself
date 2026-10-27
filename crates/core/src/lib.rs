@@ -26,3 +26,4 @@ pub fn installer_defaults() -> &'static str {
     include_str!("default_manifest.toml")
 }
 pub mod database;
+pub mod lang;
