@@ -733,7 +733,7 @@ pub fn run_tui(
                         .iter()
                         .map(|&idx| {
                             let s = &app.services[idx];
-                            let (name, mark, color) = match &s.state {
+                            let (mark, name, color) = match &s.state {
                                 ServiceState::Running => {
                                     ("● ".to_string(), s.name.clone(), Color::Green)
                                 }
@@ -753,7 +753,7 @@ pub fn run_tui(
                             let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
-                                    format!("{:<13}", name),
+                                    format!("{:<11}", name),
                                     Style::default()
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
@@ -761,7 +761,7 @@ pub fn run_tui(
                             ];
                             if !p1.is_empty() {
                                 spans.push(Span::styled(
-                                    format!("{:<15}", p1),
+                                    format!("{:<12}", p1),
                                     Style::default().fg(Color::DarkGray),
                                 ));
                             }
@@ -776,7 +776,7 @@ pub fn run_tui(
                     if let Some(pos) = non_lang_indices.iter().position(|&i| i == left_cursor) {
                         lst.select(Some(pos));
                     }
-                    let svc_marker = if svc_focus { "▶ " } else { " " };
+                    let svc_marker = if svc_focus { "▶ " } else { "  " };
                     let svc_list = List::new(items)
                         .highlight_symbol(svc_marker.to_owned())
                         .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
@@ -803,7 +803,7 @@ pub fn run_tui(
                         .iter()
                         .map(|&idx| {
                             let s = &app.services[idx];
-                            let (name, mark, color) = match &s.state {
+                            let (mark, name, color) = match &s.state {
                                 ServiceState::Running => {
                                     ("● ".to_string(), s.name.clone(), Color::Green)
                                 }
@@ -818,7 +818,7 @@ pub fn run_tui(
                             let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
-                                    format!("{:<13}", name),
+                                    format!("{:<11}", name),
                                     Style::default()
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
@@ -826,11 +826,9 @@ pub fn run_tui(
                             ];
                             if !p.is_empty() {
                                 spans.push(Span::styled(
-                                    format!("{:<15}", p),
+                                    format!("{:<12}", p),
                                     Style::default().fg(Color::DarkGray),
                                 ));
-                            } else {
-                                spans.push(Span::raw("               "));
                             }
                             if is_default {
                                 spans.push(Span::styled(
@@ -846,7 +844,7 @@ pub fn run_tui(
                     if let Some(pos) = lang_indices.iter().position(|&i| i == left_cursor) {
                         lang_lst.select(Some(pos));
                     }
-                    let lang_marker = if lang_focus { "▶ " } else { " " };
+                    let lang_marker = if lang_focus { "▶ " } else { "  " };
                     let lang_list = List::new(lang_items)
                         .highlight_symbol(lang_marker.to_owned())
                         .highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
@@ -888,7 +886,7 @@ pub fn run_tui(
                     ));
                 }
                 let proj_list = List::new(proj_items)
-                    .highlight_symbol(if proj_focus { "▶ " } else { " " }.to_owned())
+                    .highlight_symbol(if proj_focus { "▶ " } else { "  " }.to_owned())
                     .highlight_style(Style::default().bg(Color::Blue))
                     .block(
                         Block::default()
