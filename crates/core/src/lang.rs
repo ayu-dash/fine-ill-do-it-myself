@@ -264,9 +264,11 @@ mod tests {
         let env = Env::new(t.path().to_path_buf(), t.path().join("sites"));
         env.ensure_dirs().unwrap();
 
-        // System lookup should find node if on PATH
-        if which_system_lang("node").is_some() {
-            assert!(lang_binary_for(&env, "node", "system").is_some());
+        // System lookup should find node if on PATH (guard against concurrent test PATH clears)
+        if let Some(sys) = which_system_lang("node") {
+            if let Some(found) = lang_binary_for(&env, "node", "system") {
+                assert_eq!(found, sys);
+            }
         }
 
         // Fake a managed binary

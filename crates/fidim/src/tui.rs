@@ -1023,29 +1023,18 @@ pub fn run_tui(
                         .iter()
                         .map(|(idx, display_name)| {
                             let s = &app.services[*idx];
-                            let (mark, color) = match &s.state {
-                                ServiceState::Running => ("● ".to_string(), Color::Green),
-                                ServiceState::Error(msg) => {
-                                    let _ = msg; // shown in detail
-                                    ("✗ ".to_string(), Color::Red)
-                                }
-                                _ => ("○ ".to_string(), Color::DarkGray),
-                            };
                             let p = if display_name == "php" {
                                 ports_label(&s.name, &php_row, &ports)
                             } else {
                                 fine_ill_do_it_myself::lang::active_lang_version(env, display_name)
                                     .unwrap_or_else(|| "not installed".to_string())
                             };
-                            let mut spans = vec![
-                                Span::styled(mark, Style::default().fg(color)),
-                                Span::styled(
-                                    format!("{:<11}", display_name),
-                                    Style::default()
-                                        .fg(Color::White)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                            ];
+                            let mut spans = vec![Span::styled(
+                                format!("{:<13}", display_name),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            )];
                             if !p.is_empty() {
                                 spans.push(Span::styled(
                                     format!("{:<12}", p),
