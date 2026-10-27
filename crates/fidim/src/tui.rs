@@ -814,10 +814,16 @@ pub fn run_tui(
             if let Ok(Event::Key(k)) = crossterm::event::read() {
                 if k.kind == KeyEventKind::Press {
                     // Enter on the right panel acts on the highlighted
-                    // management line (port editor, web.use, php.use)
+                    // management line (port editor, web.use, php.use) ONLY
+                    // when the editor is not already open.  If the editor is
+                    // active the keystroke must reach on_key so it can commit
+                    // the typed value via SetPort (the bug: without this guard
+                    // mgmt_enter would re-open the editor with the stale
+                    // prefill and silently discard the user's input).
                     if k.code == crossterm::event::KeyCode::Enter
                         && app.panel_right
                         && app.detail.is_some()
+                        && app.edit.is_none()
                     {
                         let (_, lines) = mgmt_panel(env, &app);
                         app.mgmt_enter(&lines);
