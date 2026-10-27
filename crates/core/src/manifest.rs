@@ -24,8 +24,20 @@ pub struct BinarySource {
     #[serde(default)]
     pub tar_gz: bool,
     /// File names inside the tarball to preserve relative to its root.
+    /// Format: `"src_rel:dest_rel"` or `"name"` (src = dest).
     #[serde(default)]
     pub files: Vec<String>,
+    /// When set, extract the entire tarball into `.fidim/runtimes/<install_dir>/`
+    /// instead of copying individual files. `files` then lists which binaries
+    /// to symlink from the runtime dir into `bin/<lang>/`.
+    /// Example: `install_dir = "node/22"` → extracts to `runtimes/node/22/`.
+    #[serde(default)]
+    pub install_dir: String,
+    /// Number of leading path components to strip when extracting with `install_dir`.
+    /// Node/Java tarballs have a wrapper dir (e.g. `node-v22-linux-x64/`), so use 1.
+    /// Go tarballs have a `go/` prefix, so also use 1.
+    #[serde(default)]
+    pub strip_components: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

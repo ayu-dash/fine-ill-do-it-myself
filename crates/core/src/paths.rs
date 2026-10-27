@@ -35,6 +35,9 @@ impl Paths {
     pub fn data(&self) -> PathBuf {
         self.root.join("data")
     }
+    pub fn runtimes(&self) -> PathBuf {
+        self.root.join("runtimes")
+    }
 
     pub fn create_all(&self) -> std::io::Result<()> {
         for d in [
@@ -43,6 +46,7 @@ impl Paths {
             self.logs(),
             self.pids(),
             self.data(),
+            self.runtimes(),
         ] {
             std::fs::create_dir_all(d)?;
         }
