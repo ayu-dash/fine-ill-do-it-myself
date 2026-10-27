@@ -17,10 +17,15 @@ pub struct CliEnv {
 impl CliEnv {
     /// Test helper: everything under the given temporary root.
     pub fn with_data_root(root: std::path::PathBuf) -> Self {
-        let sites = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join("Sites");
+        let sites = if root
+            .parent()
+            .map(|p| p.join("sites").is_dir())
+            .unwrap_or(false)
+        {
+            root.parent().unwrap().join("sites")
+        } else {
+            root.join("sites")
+        };
         let env = Env::new(root, sites);
         let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         CliEnv {
@@ -29,16 +34,10 @@ impl CliEnv {
             php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
         }
     }
-    /// Real layout: data under $HOME/.local/share/fine-ill-do-it-myself,
-    /// projects under $HOME/Sites.
+    /// Project layout: everything under <project_root>/.fidim,
+    /// keeping all binaries, configs, and sites strictly within the project.
     pub fn real() -> Result<Self> {
-        let home = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .map_err(|_| fine_ill_do_it_myself::Error::Other("set $HOME".into()))?;
-        let env = Env::new(
-            home.join(".local/share/fine-ill-do-it-myself"),
-            home.join("Sites"),
-        );
+        let env = Env::load_real()?;
         let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         Ok(CliEnv {
             env,
@@ -209,22 +208,6 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
                 relink(&ini_path, &php_dir.join("php.ini"));
             }
         }
-
-        // Also update ~/.local/bin/php and ~/.local/bin/php-fpm so that
-        // `php -v` in the user's shell reflects the chosen version immediately,
-        // without relying on shell hash caches or PATH ordering.
-        if let Ok(home) = std::env::var("HOME") {
-            let local_bin = std::path::PathBuf::from(home).join(".local/bin");
-            #[cfg(unix)]
-            {
-                if src_cli.exists() {
-                    relink(&src_cli, &local_bin.join("php"));
-                }
-                if src_fpm.exists() {
-                    relink(&src_fpm, &local_bin.join("php-fpm"));
-                }
-            }
-        }
     }
 
     let ports =
@@ -249,7 +232,7 @@ pub fn php_ini(cli: &CliEnv, version: Option<&str>) -> Result<std::path::PathBuf
     Ok(ini)
 }
 
-/// Switch active version for a programming language and update symlinks in ~/.local/bin.
+/// Switch active version for a programming language and update symlinks in bin/<lang>.
 pub fn lang_use(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
     if lang == "php" {
         return php_use(cli, version);
@@ -302,19 +285,6 @@ pub fn lang_use(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
             }
             if let Some(comp_path) = comp_src {
                 relink(&comp_path, &lang_dir.join(comp));
-            }
-        }
-
-        if let Ok(home) = std::env::var("HOME") {
-            let local_bin = std::path::PathBuf::from(home).join(".local/bin");
-            if local_bin.is_dir() {
-                relink(&src, &local_bin.join(lang));
-                for &comp in companions {
-                    let linked = lang_dir.join(comp);
-                    if linked.exists() {
-                        relink(&linked, &local_bin.join(comp));
-                    }
-                }
             }
         }
     }

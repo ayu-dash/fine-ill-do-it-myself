@@ -58,6 +58,27 @@ impl Paths {
     }
 }
 
+/// Find project root by traversing upwards from the current directory,
+/// looking for `.fidim`, `Cargo.toml`, or `.git`.
+pub fn find_project_root() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("FIDIM_PROJECT_ROOT") {
+        return Some(PathBuf::from(explicit));
+    }
+    let mut cur = std::env::current_dir().ok()?;
+    loop {
+        if cur.join(".fidim").is_dir()
+            || cur.join("Cargo.toml").is_file()
+            || cur.join(".git").is_dir()
+        {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    std::env::current_dir().ok()
+}
+
 /// Default root: `$XDG_DATA_HOME/fine-ill-do-it-myself` (falls back to
 /// `~/.local/share/...`). Does not consult HOME when a test passes a custom
 /// env probe, so unit tests can stay isolated.

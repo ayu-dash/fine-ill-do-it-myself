@@ -15,9 +15,31 @@ pub struct Env {
 }
 
 impl Env {
-    /// Load from the real system locations (`$XDG_DATA_HOME`, `$HOME`).
-    /// Used by the binary crate; tests construct [`Env::new`] with temp dirs.
+    /// Load the environment. Prefers a project-local `.fidim` root within the current
+    /// project directory so all configs, binaries, and logs stay strictly inside the project.
     pub fn load_real() -> Result<Self> {
+        if let Ok(dir) = std::env::var("FIDIM_DATA_ROOT") {
+            let root = PathBuf::from(dir);
+            let sites = if root
+                .parent()
+                .map(|p| p.join("sites").is_dir())
+                .unwrap_or(false)
+            {
+                root.parent().unwrap().join("sites")
+            } else {
+                root.join("sites")
+            };
+            return Ok(Env::new(root, sites));
+        }
+        if let Some(proj) = crate::paths::find_project_root() {
+            let root = proj.join(".fidim");
+            let sites = if proj.join("sites").is_dir() {
+                proj.join("sites")
+            } else {
+                root.join("sites")
+            };
+            return Ok(Env::new(root, sites));
+        }
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| Error::Other("cannot resolve home (set $HOME)".into()))?;
