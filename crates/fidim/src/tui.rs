@@ -10,6 +10,31 @@ pub enum Action {
     StopService(usize),
     /// Restart the service under the cursor.
     RestartService(usize),
+    /// Switch the default PHP version.
+    UsePhp(String),
+    /// Switch the chosen web server.
+    UseWeb(String),
+    /// Write one port value into etc/ports.toml.
+    SetPort { key: String, value: u16 },
+    /// Show detail view for a service.
+    ShowDetail(String),
+}
+
+/// One row of the config panel.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfigRow {
+    /// `php.use <version>`
+    UsePhp(String),
+    /// `web.use <server>` (with probed binary version when installed)
+    UseWeb { name: String, ver: Option<String> },
+    /// `port <key> = <value>`
+    Port { key: String, value: u16 },
+}
+
+/// Active bottom-bar editor when changing a port.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    Port(String),
 }
 
 #[derive(Clone)]
@@ -92,17 +117,23 @@ pub fn cursor_is_service_row(
     want: crossterm::event::KeyCode,
     recv: crossterm::event::KeyCode,
 ) -> bool {
-    app.cursor < app.services.len() && want == recv
+    !app.panel_right && app.cursor() < app.services.len() && want == recv
 }
 
 pub struct App {
     pub services: Vec<ServiceStatus>,
     pub projects: Vec<String>,
-    pub cursor: usize,
+    pub config_rows: Vec<ConfigRow>,
+    pub cursor_left: usize,
+    pub cursor_right: usize,
+    pub panel_right: bool,  // false = left panel, true = right panel
     pub message: String,
     pub quit: bool,
     pub keybinds: Keybinds,
     pub actions: Vec<Action>,
+    pub edit: Option<Edit>,
+    pub input: String,
+    pub detail: Option<String>,  // detail view content
     #[allow(dead_code)]
     pub progress: Option<(u64, u64)>,
 }
@@ -112,12 +143,34 @@ impl App {
         Self {
             services,
             projects,
-            cursor: 0,
+            config_rows: Vec::new(),
+            cursor_left: 0,
+            cursor_right: 0,
+            panel_right: false,
             message: String::new(),
             quit: false,
             keybinds: Keybinds::default(),
             actions: Vec::new(),
+            edit: None,
+            input: String::new(),
+            detail: None,
             progress: None,
+        }
+    }
+
+    fn cursor(&self) -> usize {
+        if self.panel_right {
+            self.cursor_right
+        } else {
+            self.cursor_left
+        }
+    }
+
+    fn cursor_mut(&mut self) -> &mut usize {
+        if self.panel_right {
+            &mut self.cursor_right
+        } else {
+            &mut self.cursor_left
         }
     }
 
@@ -132,7 +185,55 @@ impl App {
     /// Pure transition for a key event.
     pub fn on_key(&mut self, key: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
-        if key == self.keybinds.quit || key == KeyCode::Esc {
+        // bottom-bar editor captures digits/backspace/enter/esc while active
+        if self.edit.is_some() {
+            match key {
+                KeyCode::Enter => {
+                    if let Some(Edit::Port(k)) = self.edit.take() {
+                        match self.input.parse::<u16>() {
+                            Ok(v) => {
+                                self.message = format!("port {k} set to {v}");
+                                self.actions.push(Action::SetPort { key: k, value: v });
+                            }
+                            Err(_) => {
+                                self.message = format!("invalid port '{0}'", self.input);
+                                if self.input.parse::<u16>().is_ok() {
+                                    self.message.push_str(" (unreachable)");
+                                }
+                            }
+                        }
+                    }
+                    self.input.clear();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.edit = None;
+                    self.input.clear();
+                    self.message = "edit cancelled".into();
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                    return;
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && self.input.len() < 5 => {
+                    self.input.push(c);
+                    return;
+                }
+                _ => return,
+            }
+        }
+        if key == self.keybinds.quit {
+            self.quit = true;
+            return;
+        }
+        if key == KeyCode::Esc {
+            if self.detail.is_some() {
+                self.detail = None;
+                self.panel_right = false;
+                self.cursor_left = 0;
+                return;
+            }
             self.quit = true;
             return;
         }
@@ -140,21 +241,47 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.cursor_move(1),
             KeyCode::Up | KeyCode::Char('k') => self.cursor_move(-1),
             KeyCode::Tab => {
-                self.cursor = self.cursor.saturating_add(1);
+                self.panel_right = !self.panel_right;
                 self.clamp_cursor();
             }
+            KeyCode::Char('d') => {
+                if self.cursor() < self.services.len() && !self.panel_right {
+                    let name = self.services[self.cursor()].name.clone();
+                    self.detail = Some(format!("detail: {}", name));
+                    self.panel_right = true;
+                    self.cursor_right = 0;
+                    self.actions.push(Action::ShowDetail(name));
+                }
+            }
+            KeyCode::Enter => match focused_panel(self) {
+                // services: toggle under cursor (start when stopped, stop when running)
+                "services" => {
+                    let i = self.cursor();
+                    if self.services[i].state == ServiceState::Running {
+                        self.message = "stop requested".into();
+                        self.actions.push(Action::StopService(i));
+                    } else {
+                        self.message = "start requested".into();
+                        self.actions.push(Action::StartService(i));
+                    }
+                }
+                "config" => self.on_config_enter(),
+                _ => {
+                    self.message = "projects enter not implemented; use compose panel keys".into();
+                }
+            },
             _ if cursor_is_service_row(self, key, self.keybinds.start) => {
                 self.message = "start requested".into();
-                self.actions.push(Action::StartService(self.cursor));
+                self.actions.push(Action::StartService(self.cursor()));
             }
             _ if cursor_is_service_row(self, key, self.keybinds.stop) => {
                 self.message = "stop requested".into();
-                self.actions.push(Action::StopService(self.cursor));
+                self.actions.push(Action::StopService(self.cursor()));
             }
             _ if key == self.keybinds.restart => {
-                if self.cursor < self.services.len() {
+                if !self.panel_right && self.cursor() < self.services.len() {
                     self.message = "service restart requested".into();
-                    self.actions.push(Action::RestartService(self.cursor));
+                    self.actions.push(Action::RestartService(self.cursor()));
                 } else {
                     self.message = "stop+start all requested".into();
                     self.actions.push(Action::RestartAll);
@@ -168,9 +295,38 @@ impl App {
         }
     }
 
+    fn on_config_enter(&mut self) {
+        let ci = self
+            .cursor()
+            .saturating_sub(self.services.len())
+            .saturating_sub(self.projects.len());
+        match self.config_rows.get(ci).cloned() {
+            Some(c @ ConfigRow::UsePhp(_)) => {
+                let c = c.clone();
+                if let ConfigRow::UsePhp(v) = c {
+                    self.message = format!("php.use {v} requested");
+                    self.actions.push(Action::UsePhp(v));
+                }
+            }
+            Some(c @ ConfigRow::UseWeb { .. }) => {
+                if let ConfigRow::UseWeb { name, .. } = c {
+                    self.message = format!("web.use {name} requested");
+                    self.actions.push(Action::UseWeb(name));
+                }
+            }
+            Some(ConfigRow::Port { key, value }) => {
+                self.edit = Some(Edit::Port(key.clone()));
+                self.input = value.to_string();
+                self.message = "Enter terapkan, Esc batal".into();
+            }
+            None => self.message = "no config row under cursor".into(),
+        }
+    }
+
     fn cursor_move(&mut self, by: i32) {
-        let c = self.cursor as i32 + by;
-        self.cursor = c.max(0) as usize;
+        let cur = self.cursor_mut();
+        let c = *cur as i32 + by;
+        *cur = c.max(0) as usize;
         self.clamp_cursor();
     }
 
@@ -179,13 +335,18 @@ impl App {
     }
 
     fn clamp_cursor(&mut self) {
-        // cursor walks services first, then projects
-        let len = self.services.len() + self.projects.len();
+        // cursor walks only within current panel
+        let len = if self.panel_right {
+            self.config_rows.len().max(1)
+        } else {
+            self.services.len() + self.projects.len()
+        };
         if len == 0 {
-            self.cursor = 0;
+            *self.cursor_mut() = 0;
             return;
         }
-        self.cursor = self.cursor.min(len - 1);
+        let cur = self.cursor_mut();
+        *cur = (*cur).min(len - 1);
     }
 }
 
@@ -231,9 +392,11 @@ pub fn quick_create_plan(sites: &str, name: &str) -> Vec<String> {
 
 /// Which panel is focused given a cursor that walks services then projects.
 pub fn focused_panel(app: &App) -> &'static str {
-    if app.cursor < app.services.len() {
+    if app.panel_right {
+        "management"
+    } else if app.cursor() < app.services.len() {
         "services"
-    } else if app.cursor < app.services.len() + app.projects.len() {
+    } else if app.cursor() < app.services.len() + app.projects.len() {
         "projects"
     } else {
         "services"
@@ -298,12 +461,25 @@ pub fn run_tui(
                 };
 
                 let area = f.area();
+                
+                // Only show detail panel if app.detail is Some
+                let (main_area, detail_area) = if app.detail.is_some() {
+                    let [left, right] = Layout::horizontal([
+                        Constraint::Percentage(50),
+                        Constraint::Percentage(50),
+                    ])
+                    .areas(area);
+                    (left, Some(right))
+                } else {
+                    (area, None)
+                };
+                
                 let [services, projects, footer] = Layout::vertical([
                     Constraint::Length(app.services.len() as u16 + 2),
                     Constraint::Min(1),
                     Constraint::Length(1),
                 ])
-                .areas(area);
+                .areas(main_area);
 
                 // services panel
                 let items: Vec<ListItem> = app
@@ -336,10 +512,13 @@ pub fn run_tui(
                     })
                     .collect();
                 let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
-                let svc_focus = focused_panel(&app) == "projects";
+                let svc_focus = !app.panel_right && app.cursor() < app.services.len();
+                let proj_focus = !app.panel_right && app.cursor() >= app.services.len();
                 let mut lst = ListState::default();
-                lst.select(Some(app.cursor.min(app.services.len().saturating_sub(1))));
-                let svc_marker = if svc_focus { " " } else { "▶ " };
+                if svc_focus {
+                    lst.select(Some(app.cursor().min(app.services.len().saturating_sub(1))));
+                }
+                let svc_marker = if svc_focus { "▶ " } else { " " };
                 let svc_list = List::new(items)
                     .highlight_symbol(svc_marker.to_owned())
                     .highlight_style(Style::default().bg(Color::Cyan))
@@ -347,14 +526,14 @@ pub fn run_tui(
                         Block::default()
                             .title(format!(
                                 " services ({web_name}){} ",
-                                if svc_focus { "" } else { " ◀" }
+                                if svc_focus { " ◀" } else { "" }
                             ))
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
                             .border_style(Style::default().fg(if svc_focus {
-                                Color::DarkGray
-                            } else {
                                 Color::Cyan
+                            } else {
+                                Color::DarkGray
                             })),
                     );
                 f.render_stateful_widget(svc_list, services, &mut lst);
@@ -372,30 +551,139 @@ pub fn run_tui(
                     })
                     .collect();
                 let mut plst = ListState::default();
-                plst.select(Some(
-                    app.cursor
-                        .saturating_sub(app.services.len())
-                        .min(app.projects.len().saturating_sub(1)),
-                ));
+                if proj_focus {
+                    plst.select(Some(
+                        app.cursor()
+                            .saturating_sub(app.services.len())
+                            .min(app.projects.len().saturating_sub(1)),
+                    ));
+                }
                 let proj_list = List::new(proj_items)
-                    .highlight_symbol(if svc_focus { "▶ " } else { " " }.to_owned())
+                    .highlight_symbol(if proj_focus { "▶ " } else { " " }.to_owned())
                     .highlight_style(Style::default().bg(Color::Blue))
                     .block(
                         Block::default()
                             .title(format!(
                                 " projects ({}: ~/Sites){} ",
                                 app.projects.len(),
-                                if svc_focus { " ◀" } else { "" }
+                                if proj_focus { " ◀" } else { "" }
                             ))
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if svc_focus {
+                            .border_style(Style::default().fg(if proj_focus {
                                 Color::Blue
                             } else {
                                 Color::DarkGray
                             })),
                     );
                 f.render_stateful_widget(proj_list, projects, &mut plst);
+
+                // detail panel - only shown when 'd' is pressed
+                if let Some(detail_area) = detail_area {
+                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                let cur_php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                let cur_web = fine_ill_do_it_myself::orchestrator::web_server(env);
+                
+                let mut mgmt_items: Vec<ListItem> = Vec::new();
+                let mut mgmt_title = " management ".to_string();
+                let mgmt_focus = app.panel_right;
+                
+                // Determine what to show based on cursor position
+                if app.cursor_left < app.services.len() {
+                    let svc_name = &app.services[app.cursor_left].name;
+                    
+                    if svc_name.starts_with("php-") {
+                        // Show PHP version management
+                        mgmt_title = format!(" php versions (current: {cur_php}) ");
+                        for v in fine_ill_do_it_myself::orchestrator::installed_php_versions(env) {
+                            let mark = if v == cur_php { "▶ " } else { "  " };
+                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
+                                format!("{mark}php.use {v}"),
+                                Style::default().fg(Color::Yellow),
+                            ))));
+                        }
+                    } else if ["caddy", "httpd", "nginx", "lighttpd"].contains(&svc_name.as_str()) {
+                        // Show web server management
+                        let ver = fine_ill_do_it_myself::orchestrator::web_version(env, svc_name);
+                        let v = ver.as_deref().unwrap_or("not installed");
+                        mgmt_title = format!(" web server [{v}] ");
+                        for w in [
+                            fine_ill_do_it_myself::orchestrator::CADDY,
+                            fine_ill_do_it_myself::orchestrator::APACHE,
+                            fine_ill_do_it_myself::orchestrator::NGINX,
+                            fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+                        ] {
+                            let mark = if w == cur_web { "▶ " } else { "  " };
+                            let wv = fine_ill_do_it_myself::orchestrator::web_version(env, w);
+                            let wv_txt = wv.as_deref().unwrap_or("not installed");
+                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
+                                format!("{mark}web.use {w}  [{wv_txt}]"),
+                                Style::default().fg(Color::Cyan),
+                            ))));
+                        }
+                    } else if svc_name == "mariadb" {
+                        // Show port management
+                        mgmt_title = " ports ".to_string();
+                        let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+                        mgmt_items.push(ListItem::new(Line::from(Span::styled(
+                            format!("  port http = {}", ports.http),
+                            Style::default().fg(Color::Yellow),
+                        ))));
+                        mgmt_items.push(ListItem::new(Line::from(Span::styled(
+                            format!("  port https = {}", ports.https),
+                            Style::default().fg(Color::Yellow),
+                        ))));
+                        mgmt_items.push(ListItem::new(Line::from(Span::styled(
+                            format!("  port fpm_base = {}", ports.fpm_base),
+                            Style::default().fg(Color::Yellow),
+                        ))));
+                        mgmt_items.push(ListItem::new(Line::from(Span::styled(
+                            format!("  port mariadb = {}", ports.mariadb),
+                            Style::default().fg(Color::Yellow),
+                        ))));
+                    }
+                } else {
+                    // Default: show all config options
+                    mgmt_title = " config (select service) ".to_string();
+                    for r in &app.config_rows {
+                        let txt = match r {
+                            ConfigRow::UsePhp(v) => {
+                                let mark = if *v == cur_php { "▶ " } else { "  " };
+                                format!("{mark}php.use {v}")
+                            }
+                            ConfigRow::UseWeb { name, ver } => {
+                                let mark = if name == &cur_web { "▶ " } else { "  " };
+                                let v = ver.as_deref().unwrap_or("not installed");
+                                format!("{mark}web.use {name}  [{v}]")
+                            }
+                            ConfigRow::Port { key, value } => {
+                                format!("  port {key} = {value}")
+                            }
+                        };
+                        mgmt_items.push(ListItem::new(Line::from(Span::styled(txt, Style::default().fg(Color::Yellow)))));
+                    }
+                }
+                
+                let mut mlst = ListState::default();
+                if mgmt_focus {
+                    mlst.select(Some(app.cursor().min(mgmt_items.len().saturating_sub(1))));
+                }
+                let mgmt_list = List::new(mgmt_items)
+                    .highlight_symbol("▶ ")
+                    .highlight_style(Style::default().bg(Color::Magenta))
+                    .block(
+                        Block::default()
+                            .title(mgmt_title)
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(if mgmt_focus {
+                                Color::Magenta
+                            } else {
+                                Color::DarkGray
+                            })),
+                    );
+                    f.render_stateful_widget(mgmt_list, detail_area, &mut mlst);
+                }
 
                 // footer with key hints
                 let hints = vec![
@@ -442,6 +730,12 @@ pub fn run_tui(
                         }),
                     ));
                 }
+                if let Some(Edit::Port(key)) = &app.edit {
+                    spans.push(Span::styled(
+                        format!(" edit {key}: {}█ ", app.input),
+                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                    ));
+                }
                 f.render_widget(Paragraph::new(Line::from(spans)), footer);
             });
         }
@@ -468,12 +762,40 @@ pub fn run_tui(
 
 fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
     move |app: &mut App| {
+        let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         let statuses = fine_ill_do_it_myself::orchestrator::status_all(
             &env,
-            &fine_ill_do_it_myself::PortPlan::default(),
+            &ports,
             &fine_ill_do_it_myself::RealRunner,
         );
         app.services = statuses;
+        
+        // build config rows
+        let mut rows: Vec<ConfigRow> = Vec::new();
+        
+        // php versions
+        for v in fine_ill_do_it_myself::orchestrator::installed_php_versions(&env) {
+            rows.push(ConfigRow::UsePhp(v));
+        }
+        
+        // web servers
+        for w in [
+            fine_ill_do_it_myself::orchestrator::CADDY,
+            fine_ill_do_it_myself::orchestrator::APACHE,
+            fine_ill_do_it_myself::orchestrator::NGINX,
+            fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+        ] {
+            let ver = fine_ill_do_it_myself::orchestrator::web_version(&env, w);
+            rows.push(ConfigRow::UseWeb { name: w.to_string(), ver });
+        }
+        
+        // ports
+        rows.push(ConfigRow::Port { key: "http".into(), value: ports.http });
+        rows.push(ConfigRow::Port { key: "https".into(), value: ports.https });
+        rows.push(ConfigRow::Port { key: "fpm_base".into(), value: ports.fpm_base });
+        rows.push(ConfigRow::Port { key: "mariadb".into(), value: ports.mariadb });
+        
+        app.config_rows = rows;
         app.clamp_now();
     }
 }
@@ -523,6 +845,93 @@ fn make_actioner(
                     )
                     .map(|s| vec![s])
                 })
+            }
+            Action::UsePhp(v) => {
+                if fine_ill_do_it_myself::orchestrator::php_binary_for(&env, v).is_none() {
+                    Err(fine_ill_do_it_myself::Error::PhpNotInstalled(v.clone()))
+                } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+                    lock.php_default = Some(v.clone());
+                    let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
+                        .save(&env.lock_path())
+                        .map_err(|e| e.into())
+                        .and_then(|_| fine_ill_do_it_myself::orchestrator::generate_configs(&env, &ports, v))
+                        .map(|_| vec![]);
+                    res
+                } else {
+                    Err(fine_ill_do_it_myself::Error::Other("failed to load lock".into()))
+                }
+            }
+            Action::UseWeb(name) => {
+                if fine_ill_do_it_myself::orchestrator::resolve_web_bin(&env, name).is_err() {
+                    Err(fine_ill_do_it_myself::Error::Other(format!("web server {name} not installed")))
+                } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+                    lock.web_default = Some(name.clone());
+                    let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                    let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
+                        .save(&env.lock_path())
+                        .map_err(|e| e.into())
+                        .and_then(|_| fine_ill_do_it_myself::orchestrator::generate_configs(&env, &ports, &php))
+                        .map(|_| vec![]);
+                    res
+                } else {
+                    Err(fine_ill_do_it_myself::Error::Other("failed to load lock".into()))
+                }
+            }
+            Action::SetPort { key, value } => {
+                let allowed = ["http", "https", "fpm_base", "mariadb"];
+                if !allowed.contains(&key.as_str()) {
+                    Ok(vec![])
+                } else {
+                    let file = env.paths.etc().join("ports.toml");
+                    let mut lines: Vec<String> = std::fs::read_to_string(&file)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(String::from)
+                        .filter(|l| !l.trim_start().starts_with(&format!("{key} =")))
+                        .collect();
+                    lines.push(format!("{key} = {value}"));
+                    let _ = std::fs::create_dir_all(env.paths.etc());
+                    std::fs::write(&file, lines.join("\n") + "\n")
+                        .map(|_| vec![])
+                        .map_err(|e| fine_ill_do_it_myself::Error::Other(e.to_string()))
+                }
+            }
+            Action::ShowDetail(name) => {
+                // Build detail content based on service
+                let mut detail = format!("Service: {name}\n\n");
+                if name.starts_with("php-") {
+                    detail.push_str("PHP-FPM Service\n");
+                    if let Ok(lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+                        let cur = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                        detail.push_str(&format!("Current default: {cur}\n"));
+                    }
+                    if let Some(ver) = name.strip_prefix("php-") {
+                        if let Some(bin) = fine_ill_do_it_myself::orchestrator::php_binary_for(&env, ver) {
+                            detail.push_str(&format!("Binary: {}\n", bin.display()));
+                        }
+                    }
+                } else if ["caddy", "httpd", "nginx", "lighttpd"].contains(&name.as_str()) {
+                    detail.push_str("Web Server\n");
+                    if let Some(ver) = fine_ill_do_it_myself::orchestrator::web_version(&env, name) {
+                        detail.push_str(&format!("Version: {ver}\n"));
+                    }
+                    let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+                    let (http, https) = match name.as_str() {
+                        "caddy" => (ports.caddy_http, ports.caddy_https),
+                        "httpd" => (ports.httpd_http, ports.httpd_https),
+                        "nginx" => (ports.nginx_http, ports.nginx_https),
+                        "lighttpd" => (ports.lighttpd_http, ports.lighttpd_https),
+                        _ => (ports.http, ports.https),
+                    };
+                    detail.push_str(&format!("HTTP port: {http}\n"));
+                    detail.push_str(&format!("HTTPS port: {https}\n"));
+                } else if name == "mariadb" {
+                    detail.push_str("MariaDB Database\n");
+                    let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+                    detail.push_str(&format!("Port: {}\n", ports.mariadb));
+                }
+                app.detail = Some(detail);
+                Ok(vec![])
             }
         };
         match r {
@@ -589,11 +998,11 @@ mod tests {
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Down);
-        assert_eq!(a.cursor, 2, "cursor walks past services into projects");
+        assert_eq!(a.cursor(), 2, "cursor walks past services into projects");
         a.on_key(KeyCode::Up);
-        assert_eq!(a.cursor, 1);
+        assert_eq!(a.cursor(), 1);
         a.on_key(KeyCode::Char('k'));
-        assert_eq!(a.cursor, 0);
+        assert_eq!(a.cursor(), 0);
     }
 
     #[test]
@@ -677,14 +1086,9 @@ mod tests {
 
     #[test]
     fn ports_label_per_service() {
-        let ports = fine_ill_do_it_myself::PortPlan {
-            http: 8080,
-            https: 8443,
-            fpm_base: 9000,
-            mariadb: 3306,
-        };
-        assert_eq!(ports_label("caddy", "8.4", &ports), "http:8080 https:8443");
-        assert_eq!(ports_label("httpd", "8.4", &ports), "http:8080 https:8443");
+        let ports = fine_ill_do_it_myself::PortPlan::default();
+        assert_eq!(ports_label("caddy", "8.4", &ports), "http:80 https:443");
+        assert_eq!(ports_label("httpd", "8.4", &ports), "http:80 https:443");
         assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
         assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
         assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");

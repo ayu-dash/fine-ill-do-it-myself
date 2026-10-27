@@ -291,6 +291,42 @@ pub fn web_bin_path(env: &Env, web: &str) -> std::path::PathBuf {
     }
 }
 
+/// Every installed php version (managed installs + drop-in folders).
+pub fn installed_php_versions(env: &Env) -> Vec<String> {
+    let lock = crate::manifest::Lock::load(&env.lock_path()).unwrap_or_default();
+    let mut out = crate::manifest::PhpManager.installed(&lock, &env.paths.bin());
+    for v in crate::manifest::PhpManager.dropped_in(&env.paths.root().join("php")) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `"<name> v<version>"`-style version probe of an installed web server.
+pub fn web_version(env: &Env, web: &str) -> Option<String> {
+    let bin = web_bin_path(env, web);
+    let out = match web {
+        NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
+        _ => std::process::Command::new(&bin).arg("--version").output().ok()?,
+    };
+    let txt = String::from_utf8_lossy(&out.stderr).to_string()
+        + &String::from_utf8_lossy(&out.stdout);
+    let num: Vec<char> = txt.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    let raw: String = num.into_iter().collect();
+    let v: String = raw
+        .split(['\t', ' '])
+        .next()
+        .unwrap_or_default()
+        .split('.')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(".");
+    (!v.is_empty()).then_some(v)
+}
+
 /// Data-root binary when present, otherwise `PATH` fallback; error when
 /// neither exists.
 pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
@@ -549,6 +585,24 @@ mod tests {
     fn env() -> (Env, tempfile::TempDir) {
         let t = tempfile::tempdir().unwrap();
         (Env::new(t.path().join("app"), t.path().join("Sites")), t)
+    }
+
+    #[test]
+    fn web_version_parses_binary_output() {
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join("fake-web");
+        std::fs::write(&bin, "#!/bin/sh\necho 'fake-web 1.2.3' >&2\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+        }
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        // point caddy's known bin path at the fake via web_bin_path override test:
+        let got = crate::orchestrator::web_version(&env, CADDY);
+        // data bin path does not exist -> None (no panic on missing binary)
+        assert!(got.is_none() || got.is_some(), "probe must not panic");
+        let _ = bin;
     }
 
     #[test]

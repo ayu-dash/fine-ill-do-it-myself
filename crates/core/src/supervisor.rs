@@ -73,9 +73,17 @@ impl Env {
 pub struct PortPlan {
     pub http: u16,
     pub https: u16,
-    /// base port for php-fpm listeners (stacks per minor version)
     pub fpm_base: u16,
     pub mariadb: u16,
+    /// per-web-server port overrides (caddy, httpd, nginx, lighttpd)
+    pub caddy_http: u16,
+    pub caddy_https: u16,
+    pub httpd_http: u16,
+    pub httpd_https: u16,
+    pub nginx_http: u16,
+    pub nginx_https: u16,
+    pub lighttpd_http: u16,
+    pub lighttpd_https: u16,
 }
 
 impl Default for PortPlan {
@@ -85,6 +93,14 @@ impl Default for PortPlan {
             https: 443,
             fpm_base: 9000,
             mariadb: 3306,
+            caddy_http: 8080,
+            caddy_https: 8443,
+            httpd_http: 8081,
+            httpd_https: 8444,
+            nginx_http: 8082,
+            nginx_https: 8445,
+            lighttpd_http: 8083,
+            lighttpd_https: 8446,
         }
     }
 }
@@ -124,6 +140,14 @@ impl PortPlan {
                         "https" => p.https = n,
                         "fpm_base" => p.fpm_base = n,
                         "mariadb" => p.mariadb = n,
+                        "caddy_http" => p.caddy_http = n,
+                        "caddy_https" => p.caddy_https = n,
+                        "httpd_http" => p.httpd_http = n,
+                        "httpd_https" => p.httpd_https = n,
+                        "nginx_http" => p.nginx_http = n,
+                        "nginx_https" => p.nginx_https = n,
+                        "lighttpd_http" => p.lighttpd_http = n,
+                        "lighttpd_https" => p.lighttpd_https = n,
                         _ => {}
                     }
                 }
@@ -281,12 +305,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         Supervisor {
             env: Env::new(t.path().join("app"), t.path().join("Sites")),
-            ports: PortPlan {
-                http: 80,
-                https: 443,
-                fpm_base: 9000,
-                mariadb: 3306,
-            },
+            ports: PortPlan::default(),
             runner: FakeRunner::default(),
         }
     }
