@@ -46,6 +46,12 @@ impl Paths {
         ] {
             std::fs::create_dir_all(d)?;
         }
+        for sub in ["caddy", "nginx", "httpd", "lighttpd", "php"] {
+            let d = self.bin().join(sub);
+            if !d.is_file() {
+                std::fs::create_dir_all(d)?;
+            }
+        }
         Ok(())
     }
 }

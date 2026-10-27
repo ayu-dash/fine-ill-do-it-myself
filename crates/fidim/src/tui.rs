@@ -152,6 +152,11 @@ pub struct App {
     pub detail: Option<String>, // detail view content
     #[allow(dead_code)]
     pub progress: Option<(u64, u64)>,
+    /// Cached line count of the right management panel (updated each render
+    /// cycle and before Enter dispatch so the cursor clamp is accurate).
+    pub mgmt_line_count: usize,
+    /// Cached management panel lines for cursor-skip logic.
+    pub mgmt_lines: Vec<String>,
 }
 
 impl App {
@@ -173,6 +178,8 @@ impl App {
             edit_dirty: false,
             detail: None,
             progress: None,
+            mgmt_line_count: 0,
+            mgmt_lines: Vec::new(),
         }
     }
 
@@ -377,6 +384,56 @@ impl App {
         let c = *cur as i32 + by;
         *cur = c.max(0) as usize;
         self.clamp_cursor();
+        // On the right panel, skip non-selectable lines (empty / header).
+        if self.panel_right && self.detail.is_some() {
+            self.skip_unselectable(by);
+        }
+    }
+
+    /// Check whether a management panel line is selectable (non-empty and not
+    /// a header like "  caddy versions:").
+    fn is_mgmt_selectable(line: &str) -> bool {
+        let t = line.trim();
+        !t.is_empty() && !t.ends_with(':')
+    }
+
+    /// After a cursor move on the right panel, skip over non-selectable lines
+    /// (empty lines and headers).  `direction` is the original move (+1 / -1).
+    fn skip_unselectable(&mut self, direction: i32) {
+        let len = self.right_panel_len();
+        if len == 0 {
+            return;
+        }
+        let forward = direction >= 0;
+        let mut pos = self.cursor_right;
+        // Check cached lines; if unavailable, bail.
+        if self.mgmt_lines.is_empty() {
+            return;
+        }
+        // Try to find the next selectable line in the given direction.
+        let mut attempts = 0;
+        while pos < len && attempts < len {
+            if let Some(line) = self.mgmt_lines.get(pos) {
+                if Self::is_mgmt_selectable(line) {
+                    break;
+                }
+            } else {
+                break;
+            }
+            if forward {
+                if pos + 1 < len {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            } else if pos > 0 {
+                pos -= 1;
+            } else {
+                break;
+            }
+            attempts += 1;
+        }
+        self.cursor_right = pos;
     }
 
     pub fn clamp_now(&mut self) {
@@ -398,7 +455,9 @@ impl App {
             ]
             .contains(&svc.name.as_str())
             {
-                return 4;
+                // Use the cached line count so the cursor can reach
+                // all rows including dynamically discovered versions.
+                return self.mgmt_line_count.max(4);
             }
             if svc.name == "mariadb" {
                 return 4;
@@ -576,15 +635,44 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
     out
 }
 
-/// Discovered alternate versions of a web server in `bin/` (e.g. caddy-2.9.1).
+/// Discovered alternate versions of a web server in `bin/` or `bin/<server>/` (e.g. caddy-2.9.1).
 pub fn installed_server_versions(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
     let mut vers = Vec::new();
     let prefix = format!("{server}-");
+    // 1. Check in server-specific subdirectory bin/<server>/
+    let server_dir = env.paths.bin().join(server);
+    if let Ok(rd) = std::fs::read_dir(&server_dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(v) = n.strip_prefix(&prefix) {
+                if !v.ends_with(".old")
+                    && !v.ends_with("-bin")
+                    && !v.starts_with('.')
+                    && !vers.contains(&v.to_string())
+                {
+                    vers.push(v.to_string());
+                }
+            } else if n != server
+                && !n.ends_with(".old")
+                && !n.ends_with("-bin")
+                && !n.starts_with('.')
+                && n.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && !vers.contains(&n)
+            {
+                vers.push(n);
+            }
+        }
+    }
+    // 2. Also check flat bin/ for backward compatibility
     if let Ok(rd) = std::fs::read_dir(env.paths.bin()) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
             if let Some(v) = n.strip_prefix(&prefix) {
-                if !v.ends_with(".old") && !v.ends_with("-bin") && !v.starts_with('.') {
+                if !v.ends_with(".old")
+                    && !v.ends_with("-bin")
+                    && !v.starts_with('.')
+                    && !vers.contains(&v.to_string())
+                {
                     vers.push(v.to_string());
                 }
             }
@@ -739,7 +827,6 @@ pub fn run_tui(
 
                 let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
                 let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
 
                 let non_lang_indices: Vec<usize> = app
                     .services
@@ -757,16 +844,40 @@ pub fn run_tui(
                     .map(|(i, _)| i)
                     .collect();
 
+                // Collapse PHP versions: show only one "php" row per
+                // language family.  The default version is displayed;
+                // the user switches versions via the right mgmt panel.
+                let mut collapsed_lang: Vec<(usize, String)> = Vec::new();
+                let mut seen_php = false;
+                for &idx in &lang_indices {
+                    let s = &app.services[idx];
+                    if s.name.starts_with("php") {
+                        if !seen_php {
+                            seen_php = true;
+                            // Pick the service matching the current default.
+                            let default_idx = lang_indices
+                                .iter()
+                                .find(|&&i| app.services[i].name == format!("php-{php_row}"))
+                                .copied()
+                                .unwrap_or(idx);
+                            collapsed_lang.push((default_idx, "php".to_string()));
+                        }
+                    } else {
+                        // Future: node, python, ruby — keep as-is.
+                        collapsed_lang.push((idx, s.name.clone()));
+                    }
+                }
+
                 let svc_height = if non_lang_indices.is_empty() {
                     0
                 } else {
                     non_lang_indices.len() as u16 + 2
                 };
 
-                let lang_height = if lang_indices.is_empty() {
+                let lang_height = if collapsed_lang.is_empty() {
                     0
                 } else {
-                    lang_indices.len() as u16 + 2
+                    collapsed_lang.len() as u16 + 2
                 };
 
                 let [services, languages, projects, footer] = Layout::vertical([
@@ -837,10 +948,7 @@ pub fn run_tui(
                         .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
                         .block(
                             Block::default()
-                                .title(format!(
-                                    " services ({web_name}){} ",
-                                    if svc_focus { " ◀" } else { "" }
-                                ))
+                                .title(format!(" services{} ", if svc_focus { " ◀" } else { "" }))
                                 .borders(Borders::ALL)
                                 .border_type(BorderType::Rounded)
                                 .border_style(Style::default().fg(if svc_focus {
@@ -854,24 +962,23 @@ pub fn run_tui(
 
                 // 2. Programming languages panel (PHP runtimes, etc.)
                 if lang_height > 0 {
-                    let lang_items: Vec<ListItem> = lang_indices
+                    let lang_items: Vec<ListItem> = collapsed_lang
                         .iter()
-                        .map(|&idx| {
-                            let s = &app.services[idx];
-                            let (mark, name, color) = match &s.state {
-                                ServiceState::Running => {
-                                    ("● ".to_string(), s.name.clone(), Color::Green)
-                                }
+                        .map(|(idx, display_name)| {
+                            let s = &app.services[*idx];
+                            let (mark, color) = match &s.state {
+                                ServiceState::Running => ("● ".to_string(), Color::Green),
                                 ServiceState::Error(msg) => {
-                                    ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                                    let _ = msg; // shown in detail
+                                    ("✗ ".to_string(), Color::Red)
                                 }
-                                _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
+                                _ => ("○ ".to_string(), Color::DarkGray),
                             };
                             let p = ports_label(&s.name, &php_row, &ports);
                             let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
-                                    format!("{:<11}", name),
+                                    format!("{:<11}", display_name),
                                     Style::default()
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
@@ -888,8 +995,12 @@ pub fn run_tui(
                         .collect();
 
                     let mut lang_lst = ListState::default();
-                    if let Some(pos) = lang_indices.iter().position(|&i| i == left_cursor) {
+                    if let Some(pos) = collapsed_lang.iter().position(|(i, _)| *i == left_cursor) {
                         lang_lst.select(Some(pos));
+                    } else if lang_focus {
+                        // Cursor is on a non-default PHP version; map to the
+                        // collapsed row so it still highlights.
+                        lang_lst.select(Some(0));
                     }
                     let lang_marker = if lang_focus { "▶ " } else { "  " };
                     let lang_list = List::new(lang_items)
@@ -954,11 +1065,16 @@ pub fn run_tui(
                                                                           // mgmt_panel so Enter (mgmt_enter) acts on exactly these lines
                 if let Some(detail_area) = detail_area {
                     let (mgmt_title, lines) = mgmt_panel(env, &app);
+                    app.mgmt_line_count = lines.len();
+                    app.mgmt_lines = lines.clone();
                     let mgmt_focus = app.panel_right;
                     let mgmt_items: Vec<ListItem> = lines
                         .iter()
                         .map(|line| {
-                            let color = if line.starts_with("web.use") {
+                            let selectable = App::is_mgmt_selectable(line);
+                            let color = if !selectable {
+                                Color::DarkGray
+                            } else if line.starts_with("web.use") {
                                 Color::Cyan
                             } else {
                                 Color::Yellow
@@ -1049,6 +1165,8 @@ pub fn run_tui(
                         && app.edit.is_none()
                     {
                         let (_, lines) = mgmt_panel(env, &app);
+                        app.mgmt_line_count = lines.len();
+                        app.mgmt_lines = lines.clone();
                         app.mgmt_enter(&lines);
                     } else {
                         app.on_key(k.code);
@@ -1179,6 +1297,29 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 Err(fine_ill_do_it_myself::Error::PhpNotInstalled(v.clone()))
             } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
                 lock.php_default = Some(v.clone());
+                let php_dir = env.paths.bin().join("php");
+                if php_dir.is_dir() {
+                    let src = php_dir.join(format!("php-fpm-{v}"));
+                    let dest = php_dir.join("php-fpm");
+                    if src.exists() {
+                        let _ = std::fs::remove_file(&dest);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::symlink;
+                            let _ = symlink(&src, &dest);
+                        }
+                    }
+                    let src_cli = php_dir.join(format!("php-{v}"));
+                    let dest_cli = php_dir.join("php");
+                    if src_cli.exists() {
+                        let _ = std::fs::remove_file(&dest_cli);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::symlink;
+                            let _ = symlink(&src_cli, &dest_cli);
+                        }
+                    }
+                }
                 let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
                     .save(&env.lock_path())
                     .map_err(|e| e.into())
@@ -1221,8 +1362,24 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
         }
         Action::UseServerVersion { server, version } => {
-            let src = env.paths.bin().join(format!("{server}-{version}"));
-            let dest = env.paths.bin().join(server);
+            let server_dir = env.paths.bin().join(server);
+            let (src, dest) = if server_dir.is_dir() {
+                let candidate1 = server_dir.join(format!("{server}-{version}"));
+                let candidate2 = server_dir.join(version);
+                let src = if candidate1.exists() {
+                    candidate1
+                } else if candidate2.exists() {
+                    candidate2
+                } else {
+                    candidate1
+                };
+                let dest = server_dir.join(server);
+                (src, dest)
+            } else {
+                let src = env.paths.bin().join(format!("{server}-{version}"));
+                let dest = env.paths.bin().join(server);
+                (src, dest)
+            };
             if !src.exists() {
                 Err(fine_ill_do_it_myself::Error::Other(format!(
                     "version {version} for {server} not found"
@@ -1931,6 +2088,30 @@ mod tests {
 
         std::fs::write(env.paths.bin().join("caddy-2.10.2"), "").unwrap();
         std::fs::write(env.paths.bin().join("caddy-2.9.1"), "").unwrap();
+
+        let vers = installed_server_versions(&env, "caddy");
+        assert_eq!(vers, vec!["2.10.2", "2.9.1"]);
+
+        let mut a = App::new(vec![svc("caddy", true)], vec![]);
+        a.mgmt_enter(&["  caddy.use 2.9.1".to_string()]);
+        assert_eq!(
+            a.actions,
+            vec![Action::UseServerVersion {
+                server: "caddy".into(),
+                version: "2.9.1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_server_versions_discovery_and_mgmt_enter() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        let caddy_dir = env.paths.bin().join("caddy");
+        std::fs::create_dir_all(&caddy_dir).unwrap();
+
+        std::fs::write(caddy_dir.join("caddy-2.10.2"), "").unwrap();
+        std::fs::write(caddy_dir.join("caddy-2.9.1"), "").unwrap();
 
         let vers = installed_server_versions(&env, "caddy");
         assert_eq!(vers, vec!["2.10.2", "2.9.1"]);

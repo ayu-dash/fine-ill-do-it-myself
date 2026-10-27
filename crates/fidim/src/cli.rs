@@ -211,6 +211,20 @@ pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
         lock.php_default = lock.php.first().cloned();
     }
     lock.save(&cli.env.lock_path())?;
+    let _ = std::fs::remove_file(
+        cli.env
+            .paths
+            .bin()
+            .join("php")
+            .join(format!("php-fpm-{version}")),
+    );
+    let _ = std::fs::remove_file(
+        cli.env
+            .paths
+            .bin()
+            .join("php")
+            .join(format!("php-{version}")),
+    );
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-fpm-{version}")));
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-{version}")));
     Ok(())

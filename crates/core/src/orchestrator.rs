@@ -65,14 +65,50 @@ pub fn ensure_installed(env: &Env, manifest: &Manifest, lock: &mut Lock, name: &
     Ok(())
 }
 
+pub fn binary_subdir_for(name: &str) -> &'static str {
+    if name.starts_with("php") {
+        "php"
+    } else if name.starts_with("caddy") {
+        "caddy"
+    } else if name.starts_with("nginx") {
+        "nginx"
+    } else if name.starts_with("httpd") || name.starts_with("apache") {
+        "httpd"
+    } else if name.starts_with("lighttpd") {
+        "lighttpd"
+    } else {
+        ""
+    }
+}
+
 fn dest_dir(env: &Env, name: &str) -> std::path::PathBuf {
-    let p = env.paths.bin().join(format!(".{name}-staging"));
+    let sub = binary_subdir_for(name);
+    let p = if !sub.is_empty() && env.paths.bin().join(sub).is_dir() {
+        env.paths.bin().join(sub).join(format!(".{name}-staging"))
+    } else {
+        env.paths.bin().join(format!(".{name}-staging"))
+    };
     std::fs::create_dir_all(&p).ok();
     p
 }
 
 fn target_path_for(env: &Env, name: &str) -> std::path::PathBuf {
-    env.paths.bin().join(name)
+    let sub = binary_subdir_for(name);
+    if !sub.is_empty() {
+        let nested = env.paths.bin().join(sub).join(name);
+        if nested.exists() || env.paths.bin().join(sub).is_dir() {
+            return nested;
+        }
+    }
+    let flat = env.paths.bin().join(name);
+    if flat.is_file() {
+        return flat;
+    }
+    if !sub.is_empty() {
+        env.paths.bin().join(sub).join(name)
+    } else {
+        flat
+    }
 }
 
 /// Generate Caddyfile + php-fpm pool configs for the default PHP version.
@@ -294,12 +330,27 @@ fn regenerate_ghosts(env: &Env, ports: &PortPlan, php_version: &str) -> Result<(
     Ok(())
 }
 
+pub fn server_bin_path(env: &Env, server: &str) -> std::path::PathBuf {
+    let nested = env.paths.bin().join(server).join(server);
+    if nested.exists() {
+        return nested;
+    }
+    let flat = env.paths.bin().join(server);
+    if flat.is_file() {
+        return flat;
+    }
+    if env.paths.bin().join(server).is_dir() {
+        return nested;
+    }
+    flat
+}
+
 /// Binary path and CLI args per web server choice.
 pub fn web_bin_path(env: &Env, web: &str) -> std::path::PathBuf {
     match web {
-        NGINX => env.paths.bin().join("nginx"),
-        APACHE => env.paths.bin().join("httpd"),
-        LIGHTTPD => env.paths.bin().join("lighttpd"),
+        NGINX => server_bin_path(env, "nginx"),
+        APACHE => server_bin_path(env, "httpd"),
+        LIGHTTPD => server_bin_path(env, "lighttpd"),
         _ => env.caddy_bin(),
     }
 }
@@ -321,6 +372,16 @@ pub fn installed_php_versions(env: &Env) -> Vec<String> {
 /// `"<name> v<version>"`-style version probe of an installed web server.
 pub fn web_version(env: &Env, web: &str) -> Option<String> {
     let bin = web_bin_path(env, web);
+    let bin = if bin.exists() {
+        bin
+    } else {
+        let flat = env.paths.bin().join(web);
+        if flat.exists() {
+            flat
+        } else {
+            bin
+        }
+    };
     let out = match web {
         NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
         _ => std::process::Command::new(&bin)
@@ -353,6 +414,10 @@ pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
     if local.exists() {
         return Ok(local);
     }
+    let flat = env.paths.bin().join(web);
+    if flat.exists() {
+        return Ok(flat);
+    }
     if let Some(sys) = which_system(web) {
         return Ok(sys);
     }
@@ -363,15 +428,17 @@ pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
 
 /// Absolute `PATH`-resolved binary name (httpd/nginx/caddy); None when absent
 /// from PATH or data/bin.
-/// php-fpm binary for `version`: `bin/php-fpm-<v>` first, then a drop-in
-/// folder under `data/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
+/// php-fpm binary for `version`: `bin/php/php-fpm-<v>` or `bin/php-fpm-<v>` first,
+/// then a drop-in folder under `data/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
 pub fn php_binary_for(env: &Env, version: &str) -> Option<std::path::PathBuf> {
-    if let Ok(rd) = std::fs::read_dir(env.paths.bin()) {
-        for e in rd.flatten() {
-            let n = e.file_name().to_string_lossy().to_string();
-            if let Some(v) = n.strip_prefix("php-fpm-") {
-                if crate::manifest::short_version(v) == version {
-                    return Some(e.path());
+    for dir in [env.paths.bin().join("php"), env.paths.bin()] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if let Some(v) = n.strip_prefix("php-fpm-") {
+                    if crate::manifest::short_version(v) == version {
+                        return Some(e.path());
+                    }
                 }
             }
         }

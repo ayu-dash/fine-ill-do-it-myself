@@ -47,7 +47,18 @@ impl Env {
         self.paths.etc().join("Caddyfile")
     }
     pub fn caddy_bin(&self) -> PathBuf {
-        self.paths.bin().join("caddy")
+        let nested = self.paths.bin().join("caddy").join("caddy");
+        if nested.exists() {
+            return nested;
+        }
+        let flat = self.paths.bin().join("caddy");
+        if flat.is_file() {
+            return flat;
+        }
+        if self.paths.bin().join("caddy").is_dir() {
+            return nested;
+        }
+        flat
     }
     pub fn caddy_pid(&self) -> PathBuf {
         self.paths.pids().join("caddy.pid")
@@ -59,7 +70,22 @@ impl Env {
         self.paths.etc().join(format!("php-{version}-fpm.conf"))
     }
     pub fn fpm_bin(&self, version: &str) -> PathBuf {
-        self.paths.bin().join(format!("php-fpm-{version}"))
+        let nested = self
+            .paths
+            .bin()
+            .join("php")
+            .join(format!("php-fpm-{version}"));
+        if nested.exists() {
+            return nested;
+        }
+        let flat = self.paths.bin().join(format!("php-fpm-{version}"));
+        if flat.is_file() {
+            return flat;
+        }
+        if self.paths.bin().join("php").is_dir() {
+            return nested;
+        }
+        flat
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {

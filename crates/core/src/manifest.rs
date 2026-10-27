@@ -126,13 +126,15 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), super::error::Error> 
 pub struct PhpManager;
 
 impl PhpManager {
-    pub fn installed(&self, lock: &Lock, bin_dir: &PathBuf) -> Vec<String> {
+    pub fn installed(&self, lock: &Lock, bin_dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = lock.php.clone();
-        if let Ok(rd) = std::fs::read_dir(bin_dir) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("php-fpm-") {
-                    push_version(&mut v, n.trim_start_matches("php-fpm-"));
+        for dir in [bin_dir.join("php"), bin_dir.to_path_buf()] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if n.starts_with("php-fpm-") {
+                        push_version(&mut v, n.trim_start_matches("php-fpm-"));
+                    }
                 }
             }
         }
