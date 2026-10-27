@@ -1299,24 +1299,31 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 lock.php_default = Some(v.clone());
                 let php_dir = env.paths.bin().join("php");
                 if php_dir.is_dir() {
-                    let src = php_dir.join(format!("php-fpm-{v}"));
-                    let dest = php_dir.join("php-fpm");
-                    if src.exists() {
-                        let _ = std::fs::remove_file(&dest);
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::symlink;
-                            let _ = symlink(&src, &dest);
-                        }
-                    }
                     let src_cli = php_dir.join(format!("php-{v}"));
-                    let dest_cli = php_dir.join("php");
-                    if src_cli.exists() {
-                        let _ = std::fs::remove_file(&dest_cli);
-                        #[cfg(unix)]
-                        {
+                    let src_fpm = php_dir.join(format!("php-fpm-{v}"));
+                    #[cfg(unix)]
+                    {
+                        fn relink(src: &std::path::Path, dest: &std::path::Path) {
                             use std::os::unix::fs::symlink;
-                            let _ = symlink(&src_cli, &dest_cli);
+                            let _ = std::fs::remove_file(dest);
+                            let _ = symlink(src, dest);
+                        }
+                        if src_cli.exists() {
+                            relink(&src_cli, &php_dir.join("php"));
+                        }
+                        if src_fpm.exists() {
+                            relink(&src_fpm, &php_dir.join("php-fpm"));
+                        }
+                        // Also update ~/.local/bin/php so `php -v` reflects
+                        // the chosen version immediately in the user's shell.
+                        if let Ok(home) = std::env::var("HOME") {
+                            let local_bin = std::path::PathBuf::from(home).join(".local/bin");
+                            if src_cli.exists() {
+                                relink(&src_cli, &local_bin.join("php"));
+                            }
+                            if src_fpm.exists() {
+                                relink(&src_fpm, &local_bin.join("php-fpm"));
+                            }
                         }
                     }
                 }

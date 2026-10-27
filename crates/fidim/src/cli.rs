@@ -135,6 +135,14 @@ fn php_list_old(cli: &CliEnv) -> Result<Vec<String>> {
     Ok(PhpManager.installed(&lock, &cli.env.paths.bin()))
 }
 
+/// Update a symlink at `dest` to point at `src` (removes old link first).
+#[cfg(unix)]
+fn relink(src: &std::path::Path, dest: &std::path::Path) {
+    use std::os::unix::fs::symlink;
+    let _ = std::fs::remove_file(dest);
+    let _ = symlink(src, dest);
+}
+
 /// Set the default PHP version used by `fidim start`.
 pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     if fine_ill_do_it_myself::orchestrator::php_binary_for(&cli.env, version).is_none() {
@@ -145,29 +153,39 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     let mut lock = Lock::load(&cli.env.lock_path())?;
     lock.php_default = Some(version.into());
     lock.save(&cli.env.lock_path())?;
+
     let php_dir = cli.env.paths.bin().join("php");
     if php_dir.is_dir() {
-        let src = php_dir.join(format!("php-fpm-{version}"));
-        let dest = php_dir.join("php-fpm");
-        if src.exists() {
-            let _ = std::fs::remove_file(&dest);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::symlink;
-                let _ = symlink(&src, &dest);
+        // Update bin/php/php and bin/php/php-fpm symlinks (used by services)
+        let src_cli = php_dir.join(format!("php-{version}"));
+        let src_fpm = php_dir.join(format!("php-fpm-{version}"));
+        #[cfg(unix)]
+        {
+            if src_cli.exists() {
+                relink(&src_cli, &php_dir.join("php"));
+            }
+            if src_fpm.exists() {
+                relink(&src_fpm, &php_dir.join("php-fpm"));
             }
         }
-        let src_cli = php_dir.join(format!("php-{version}"));
-        let dest_cli = php_dir.join("php");
-        if src_cli.exists() {
-            let _ = std::fs::remove_file(&dest_cli);
+
+        // Also update ~/.local/bin/php and ~/.local/bin/php-fpm so that
+        // `php -v` in the user's shell reflects the chosen version immediately,
+        // without relying on shell hash caches or PATH ordering.
+        if let Ok(home) = std::env::var("HOME") {
+            let local_bin = std::path::PathBuf::from(home).join(".local/bin");
             #[cfg(unix)]
             {
-                use std::os::unix::fs::symlink;
-                let _ = symlink(&src_cli, &dest_cli);
+                if src_cli.exists() {
+                    relink(&src_cli, &local_bin.join("php"));
+                }
+                if src_fpm.exists() {
+                    relink(&src_fpm, &local_bin.join("php-fpm"));
+                }
             }
         }
     }
+
     let ports =
         fine_ill_do_it_myself::PortPlan::resolve(&cli.env.paths.etc(), |k| std::env::var(k).ok());
     let _ = fine_ill_do_it_myself::orchestrator::generate_configs(&cli.env, &ports, version);
