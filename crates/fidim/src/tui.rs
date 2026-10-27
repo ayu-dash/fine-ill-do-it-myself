@@ -352,10 +352,41 @@ impl App {
         self.clamp_cursor()
     }
 
+    /// Dynamic number of rows currently in the right management panel based on
+    /// the currently selected service and detail state.
+    pub fn right_panel_len(&self) -> usize {
+        if self.detail.is_none() {
+            return self.config_rows.len().max(1);
+        }
+        if let Some(svc) = self.services.get(self.cursor_left) {
+            if [
+                fine_ill_do_it_myself::orchestrator::CADDY,
+                fine_ill_do_it_myself::orchestrator::APACHE,
+                fine_ill_do_it_myself::orchestrator::NGINX,
+                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+            ]
+            .contains(&svc.name.as_str())
+            {
+                return 4;
+            }
+            if svc.name == "mariadb" {
+                return 4;
+            }
+            if svc.name.starts_with("php-") {
+                let n = self
+                    .config_rows
+                    .iter()
+                    .filter(|r| matches!(r, ConfigRow::UsePhp(_)))
+                    .count();
+                return n.max(1);
+            }
+        }
+        self.config_rows.len().max(1)
+    }
+
     fn clamp_cursor(&mut self) {
-        // cursor walks only within current panel
         let len = if self.panel_right {
-            self.config_rows.len().max(1)
+            self.right_panel_len()
         } else {
             self.services.len() + self.projects.len()
         };
@@ -424,7 +455,7 @@ pub fn focused_panel(app: &App) -> &'static str {
 /// Port label per service row, shown beside its name.
 pub fn ports_label(name: &str, php_row: &str, ports: &fine_ill_do_it_myself::PortPlan) -> String {
     if name == "mariadb" {
-        "3306".to_string()
+        ports.mariadb.to_string()
     } else if let Some(ver) = name.strip_prefix("php-") {
         if php_row != ver {
             return String::new();
@@ -576,7 +607,7 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
 pub fn run_tui(
     env: &fine_ill_do_it_myself::Env,
-    ports: fine_ill_do_it_myself::PortPlan,
+    _ports: fine_ill_do_it_myself::PortPlan,
 ) -> Result<(), fine_ill_do_it_myself::Error> {
     use crossterm::event::{Event, KeyEventKind};
     use crossterm::terminal;
@@ -602,6 +633,8 @@ pub fn run_tui(
     let mut term = Terminal::new(backend).ok();
     refresh(&mut app);
     loop {
+        let ports =
+            fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         if let Some(t) = term.as_mut() {
             let _ = t.draw(|f| {
                 use ratatui::layout::{Constraint, Layout};
@@ -1521,5 +1554,132 @@ mod tests {
             }),
             "stale default value must not survive the edit"
         );
+    }
+
+    /// End-to-end: mirrors the exact key sequence a user performs in the TUI
+    /// to change caddy's HTTP port from 8080 → 9090, including the perform_action
+    /// call that writes the value to etc/ports.toml.
+    ///
+    /// Flow:
+    ///   cursor on caddy → 'd' → right panel opens at line 0
+    ///   → Down × 2 → line 2 = "  port http = 8080"
+    ///   → Enter (edit.is_none()) → mgmt_enter → editor opens, input = "8080"
+    ///   → '9','0','9','0' → input = "9090"
+    ///   → Enter (edit.is_some()) → on_key → SetPort queued
+    ///   → perform_action writes etc/ports.toml
+    ///   → PortPlan::resolve reads the new file → caddy_http = 9090
+    #[test]
+    fn end_to_end_port_edit_writes_to_disk_and_survives_resolve() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let mut a = App::new(
+            vec![
+                svc("caddy", false),
+                svc("mariadb", false),
+                svc("php-8.4", false),
+            ],
+            vec![],
+        );
+        a.config_rows = vec![
+            ConfigRow::UsePhp("8.4".into()),
+            ConfigRow::UseWeb {
+                name: "caddy".into(),
+                ver: None,
+            },
+            ConfigRow::Port {
+                key: "http".into(),
+                value: 8080,
+            },
+            ConfigRow::Port {
+                key: "https".into(),
+                value: 8443,
+            },
+            ConfigRow::Port {
+                key: "fpm_base".into(),
+                value: 9000,
+            },
+            ConfigRow::Port {
+                key: "mariadb".into(),
+                value: 3306,
+            },
+        ];
+
+        // 'd' on caddy → detail panel, cursor_right resets to 0
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.panel_right);
+        assert!(a.detail.is_some());
+        assert_eq!(a.cursor_right, 0);
+
+        // mgmt lines as caddy web_mgmt_lines returns (default ports)
+        let caddy_lines = vec![
+            "  default web (this one)".to_string(), // 0
+            "  version not installed".to_string(),  // 1
+            "  port http = 8080".to_string(),       // 2
+            "  port https = 8443".to_string(),      // 3
+        ];
+
+        // dispatch_enter mirrors the fixed run_tui logic
+        fn dispatch_enter(app: &mut App, lines: &[String]) {
+            if app.panel_right && app.detail.is_some() && app.edit.is_none() {
+                app.mgmt_enter(lines);
+            } else {
+                app.on_key(KeyCode::Enter);
+            }
+        }
+
+        // Down × 2 → "  port http = 8080" (index 2)
+        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Down);
+        assert_eq!(a.cursor_right, 2);
+
+        // Enter 1 → editor opens
+        dispatch_enter(&mut a, &caddy_lines);
+        assert!(a.edit.is_some(), "editor must open; edit={:?}", a.edit);
+        assert_eq!(a.input, "8080");
+        match &a.edit {
+            Some(Edit::Port(k)) => assert_eq!(k, "caddy_http", "key must be caddy_http"),
+            other => panic!("expected Edit::Port, got {other:?}"),
+        }
+
+        // type new port
+        for c in ['9', '0', '9', '0'] {
+            a.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.input, "9090");
+
+        // Enter 2 → commit
+        dispatch_enter(&mut a, &caddy_lines);
+        assert!(a.edit.is_none(), "editor must close after commit");
+        assert!(
+            a.actions.contains(&Action::SetPort {
+                key: "caddy_http".into(),
+                value: 9090
+            }),
+            "SetPort must be queued; got {:?}",
+            a.actions
+        );
+
+        // perform_action writes to disk
+        let act = make_actioner(env.clone());
+        while let Some(action) = a.actions.pop() {
+            act(&mut a, &action);
+        }
+
+        // verify file
+        let text = std::fs::read_to_string(env.paths.etc().join("ports.toml")).unwrap_or_default();
+        assert!(
+            text.contains("caddy_http = 9090"),
+            "ports.toml must have new value\n{text}"
+        );
+        assert!(
+            !text.contains("caddy_http = 8080"),
+            "old value must not remain\n{text}"
+        );
+
+        // verify PortPlan::resolve reads it back
+        let resolved = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |_| None);
+        assert_eq!(resolved.caddy_http, 9090, "resolve must return saved value");
     }
 }
