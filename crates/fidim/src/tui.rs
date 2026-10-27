@@ -133,6 +133,8 @@ pub struct App {
     pub actions: Vec<Action>,
     pub edit: Option<Edit>,
     pub input: String,
+    /// false while `input` still holds the untouched prefill of the editor
+    pub edit_dirty: bool,
     pub detail: Option<String>, // detail view content
     #[allow(dead_code)]
     pub progress: Option<(u64, u64)>,
@@ -153,6 +155,7 @@ impl App {
             actions: Vec::new(),
             edit: None,
             input: String::new(),
+            edit_dirty: false,
             detail: None,
             progress: None,
         }
@@ -206,14 +209,22 @@ impl App {
                 KeyCode::Esc => {
                     self.edit = None;
                     self.input.clear();
+                    self.edit_dirty = false;
                     self.message = "edit cancelled".into();
                     return;
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
+                    self.edit_dirty = true;
                     return;
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() && self.input.len() < 5 => {
+                    // first keystroke replaces the prefilled value instead of
+                    // being appended to it (e.g. "8082" + "9090" -> "9090")
+                    if !self.edit_dirty {
+                        self.input.clear();
+                        self.edit_dirty = true;
+                    }
                     self.input.push(c);
                     return;
                 }
@@ -324,6 +335,7 @@ impl App {
                 };
                 self.edit = Some(Edit::Port(key));
                 self.input = value.to_string();
+                self.edit_dirty = false;
                 self.message = "Enter terapkan, Esc batal".into();
             }
         }
@@ -576,7 +588,7 @@ pub fn run_tui(
         return Ok(());
     }
     let refresh = make_refresh(env.clone());
-    let act = make_actioner(env.clone(), ports.clone());
+    let act = make_actioner(env.clone());
     let _ = terminal::enable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
 
@@ -885,143 +897,146 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
     }
 }
 
-/// Execute one queued action against the real system; sets the status-bar
-/// message with the outcome.
-fn make_actioner(
-    env: fine_ill_do_it_myself::Env,
-    ports: fine_ill_do_it_myself::PortPlan,
-) -> impl Fn(&mut App, &Action) {
-    move |app: &mut App, action: &Action| {
-        let runner = fine_ill_do_it_myself::RealRunner;
-        let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-        let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-        let r: Result<Vec<_>, _> = match action {
-            Action::RestartAll => {
-                fine_ill_do_it_myself::orchestrator::stop_all(&env, &ports, &runner).and_then(
-                    |_| fine_ill_do_it_myself::orchestrator::start_all(&env, &ports, &runner, &php),
-                )
-            }
-            Action::StartService(i) => {
-                let name = app.services[*i].name.clone();
+/// Execute one queued action against the system; sets the status-bar
+/// message with the outcome. Ports are re-resolved from `etc/ports.toml` on
+/// every execution so a SetPort followed by any start/restart picks up the
+/// saved values instead of a snapshot from TUI startup.
+fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
+    env: &fine_ill_do_it_myself::Env,
+    runner: R,
+    app: &mut App,
+    action: &Action,
+) {
+    let ports =
+        fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+    let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+    let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+    let r: Result<Vec<_>, _> = match action {
+        Action::RestartAll => fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, &runner)
+            .and_then(|_| {
+                fine_ill_do_it_myself::orchestrator::start_all(env, &ports, &runner, &php)
+            }),
+        Action::StartService(i) => {
+            let name = app.services[*i].name.clone();
+            fine_ill_do_it_myself::orchestrator::start_service(env, &ports, &runner, &php, &name)
+                .map(|s| vec![s])
+        }
+        Action::StopService(i) => {
+            let name = app.services[*i].name.clone();
+            let sup = fine_ill_do_it_myself::supervisor::Supervisor {
+                env: env.clone(),
+                ports: ports.clone(),
+                runner: runner.clone(),
+            };
+            sup.stop(&name).map(|_| Vec::new())
+        }
+        Action::RestartService(i) => {
+            let name = app.services[*i].name.clone();
+            let sup = fine_ill_do_it_myself::supervisor::Supervisor {
+                env: env.clone(),
+                ports: ports.clone(),
+                runner: runner.clone(),
+            };
+            sup.stop(&name).and_then(|_| {
                 fine_ill_do_it_myself::orchestrator::start_service(
-                    &env, &ports, &runner, &php, &name,
+                    env, &ports, &runner, &php, &name,
                 )
                 .map(|s| vec![s])
-            }
-            Action::StopService(i) => {
-                let name = app.services[*i].name.clone();
-                let sup = fine_ill_do_it_myself::supervisor::Supervisor {
-                    env: env.clone(),
-                    ports: ports.clone(),
-                    runner: runner.clone(),
-                };
-                sup.stop(&name).map(|_| Vec::new())
-            }
-            Action::RestartService(i) => {
-                let name = app.services[*i].name.clone();
-                let sup = fine_ill_do_it_myself::supervisor::Supervisor {
-                    env: env.clone(),
-                    ports: ports.clone(),
-                    runner: runner.clone(),
-                };
-                sup.stop(&name).and_then(|_| {
-                    fine_ill_do_it_myself::orchestrator::start_service(
-                        &env, &ports, &runner, &php, &name,
-                    )
-                    .map(|s| vec![s])
-                })
-            }
-            Action::UsePhp(v) => {
-                if fine_ill_do_it_myself::orchestrator::php_binary_for(&env, v).is_none() {
-                    Err(fine_ill_do_it_myself::Error::PhpNotInstalled(v.clone()))
-                } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
-                    lock.php_default = Some(v.clone());
-                    let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
-                        .save(&env.lock_path())
-                        .map_err(|e| e.into())
-                        .and_then(|_| {
-                            fine_ill_do_it_myself::orchestrator::generate_configs(&env, &ports, v)
-                        })
-                        .map(|_| vec![]);
-                    res
-                } else {
-                    Err(fine_ill_do_it_myself::Error::Other(
-                        "failed to load lock".into(),
-                    ))
-                }
-            }
-            Action::UseWeb(name) => {
-                if fine_ill_do_it_myself::orchestrator::resolve_web_bin(&env, name).is_err() {
-                    Err(fine_ill_do_it_myself::Error::Other(format!(
-                        "web server {name} not installed"
-                    )))
-                } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
-                    lock.web_default = Some(name.clone());
-                    let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                    let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
-                        .save(&env.lock_path())
-                        .map_err(|e| e.into())
-                        .and_then(|_| {
-                            fine_ill_do_it_myself::orchestrator::generate_configs(
-                                &env, &ports, &php,
-                            )
-                        })
-                        .map(|_| vec![]);
-                    res
-                } else {
-                    Err(fine_ill_do_it_myself::Error::Other(
-                        "failed to load lock".into(),
-                    ))
-                }
-            }
-            Action::SetPort { key, value } => {
-                // shared with the CLI: accepts the per-server pairs too
-                // (nginx_http, ...) and rejects unknown keys with an error
-                crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
-            }
-            Action::ShowDetail(name) => {
-                // Build detail content based on service
-                let mut detail = format!("Service: {name}\n\n");
-                if name.starts_with("php-") {
-                    detail.push_str("PHP-FPM Service\n");
-                    if let Ok(lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
-                        let cur = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                        detail.push_str(&format!("Current default: {cur}\n"));
-                    }
-                    if let Some(ver) = name.strip_prefix("php-") {
-                        if let Some(bin) =
-                            fine_ill_do_it_myself::orchestrator::php_binary_for(&env, ver)
-                        {
-                            detail.push_str(&format!("Binary: {}\n", bin.display()));
-                        }
-                    }
-                } else if ["caddy", "httpd", "nginx", "lighttpd"].contains(&name.as_str()) {
-                    detail.push_str("Web Server\n");
-                    if let Some(ver) = fine_ill_do_it_myself::orchestrator::web_version(&env, name)
-                    {
-                        detail.push_str(&format!("Version: {ver}\n"));
-                    }
-                    let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
-                        std::env::var(k).ok()
-                    });
-                    let (http, https) = ports.web_ports(name.as_str());
-                    detail.push_str(&format!("HTTP port: {http}\n"));
-                    detail.push_str(&format!("HTTPS port: {https}\n"));
-                } else if name == "mariadb" {
-                    detail.push_str("MariaDB Database\n");
-                    let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
-                        std::env::var(k).ok()
-                    });
-                    detail.push_str(&format!("Port: {}\n", ports.mariadb));
-                }
-                app.detail = Some(detail);
-                Ok(vec![])
-            }
-        };
-        match r {
-            Ok(_) => app.message = format!("{action:?} ok").to_lowercase(),
-            Err(e) => app.message = format!("{action:?}: {e}").to_lowercase(),
+            })
         }
+        Action::UsePhp(v) => {
+            if fine_ill_do_it_myself::orchestrator::php_binary_for(env, v).is_none() {
+                Err(fine_ill_do_it_myself::Error::PhpNotInstalled(v.clone()))
+            } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+                lock.php_default = Some(v.clone());
+                let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
+                    .save(&env.lock_path())
+                    .map_err(|e| e.into())
+                    .and_then(|_| {
+                        fine_ill_do_it_myself::orchestrator::generate_configs(env, &ports, v)
+                    })
+                    .map(|_| vec![]);
+                res
+            } else {
+                Err(fine_ill_do_it_myself::Error::Other(
+                    "failed to load lock".into(),
+                ))
+            }
+        }
+        Action::UseWeb(name) => {
+            if fine_ill_do_it_myself::orchestrator::resolve_web_bin(env, name).is_err() {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "web server {name} not installed"
+                )))
+            } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+                lock.web_default = Some(name.clone());
+                let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
+                    .save(&env.lock_path())
+                    .map_err(|e| e.into())
+                    .and_then(|_| {
+                        fine_ill_do_it_myself::orchestrator::generate_configs(env, &ports, &php)
+                    })
+                    .map(|_| vec![]);
+                res
+            } else {
+                Err(fine_ill_do_it_myself::Error::Other(
+                    "failed to load lock".into(),
+                ))
+            }
+        }
+        Action::SetPort { key, value } => {
+            // shared with the CLI: accepts the per-server pairs too
+            // (nginx_http, ...) and rejects unknown keys with an error
+            crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
+        }
+        Action::ShowDetail(name) => {
+            // Build detail content based on service
+            let mut detail = format!("Service: {name}\n\n");
+            if name.starts_with("php-") {
+                detail.push_str("PHP-FPM Service\n");
+                if let Ok(lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+                    let cur = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                    detail.push_str(&format!("Current default: {cur}\n"));
+                }
+                if let Some(ver) = name.strip_prefix("php-") {
+                    if let Some(bin) = fine_ill_do_it_myself::orchestrator::php_binary_for(env, ver)
+                    {
+                        detail.push_str(&format!("Binary: {}\n", bin.display()));
+                    }
+                }
+            } else if ["caddy", "httpd", "nginx", "lighttpd"].contains(&name.as_str()) {
+                detail.push_str("Web Server\n");
+                if let Some(ver) = fine_ill_do_it_myself::orchestrator::web_version(env, name) {
+                    detail.push_str(&format!("Version: {ver}\n"));
+                }
+                let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
+                    std::env::var(k).ok()
+                });
+                let (http, https) = ports.web_ports(name.as_str());
+                detail.push_str(&format!("HTTP port: {http}\n"));
+                detail.push_str(&format!("HTTPS port: {https}\n"));
+            } else if name == "mariadb" {
+                detail.push_str("MariaDB Database\n");
+                let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
+                    std::env::var(k).ok()
+                });
+                detail.push_str(&format!("Port: {}\n", ports.mariadb));
+            }
+            app.detail = Some(detail);
+            Ok(vec![])
+        }
+    };
+    match r {
+        Ok(_) => app.message = format!("{action:?} ok").to_lowercase(),
+        Err(e) => app.message = format!("{action:?}: {e}").to_lowercase(),
+    }
+}
+
+/// Build the real-system action handler for the TUI event loop.
+fn make_actioner(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App, &Action) {
+    move |app: &mut App, action: &Action| {
+        perform_action(&env.clone(), fine_ill_do_it_myself::RealRunner, app, action);
     }
 }
 #[cfg(test)]
@@ -1188,7 +1203,7 @@ mod tests {
     fn set_port_action_persists_per_web_server_keys() {
         let t = tempfile::tempdir().unwrap();
         let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
-        let act = make_actioner(env.clone(), fine_ill_do_it_myself::PortPlan::default());
+        let act = make_actioner(env.clone());
         let mut app = App::new(vec![], vec![]);
         act(
             &mut app,
@@ -1205,7 +1220,7 @@ mod tests {
     fn set_port_action_rejects_unknown_keys() {
         let t = tempfile::tempdir().unwrap();
         let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
-        let act = make_actioner(env.clone(), fine_ill_do_it_myself::PortPlan::default());
+        let act = make_actioner(env.clone());
         let mut app = App::new(vec![], vec![]);
         act(
             &mut app,
@@ -1217,6 +1232,66 @@ mod tests {
         assert!(
             !std::fs::exists(env.paths.etc().join("ports.toml")).unwrap(),
             "unknown key must not create ports.toml"
+        );
+    }
+
+    #[test]
+    fn restart_after_set_port_picks_up_the_new_saved_ports() {
+        // aka `main` of the bug: SetPort saves 8290 into ports.toml, then the
+        // user restarts nginx from the TUI — the regenerated site must listen
+        // on 8290, not the startup snapshot's default
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        std::fs::create_dir_all(env.paths.bin()).unwrap();
+        // scripts that exit immediately so RealRunner spawns are harmless
+        for bin in ["caddy", "nginx", "php-fpm-8.4"] {
+            let p = env.paths.bin().join(bin);
+            std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let act = make_actioner(env.clone());
+        let mut app = App::new(vec![svc("nginx", false)], vec![]);
+        act(
+            &mut app,
+            &Action::SetPort {
+                key: "nginx_http".into(),
+                value: 8290,
+            },
+        );
+        act(&mut app, &Action::RestartService(0));
+        let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/blog.conf")).unwrap();
+        assert!(
+            site.contains("listen 8290;"),
+            "restart after SetPort must use the saved port\n{site}"
+        );
+    }
+
+    #[test]
+    fn editor_typing_replaces_the_prefill() {
+        let mut a = App::new(vec![svc("nginx", false)], vec![]);
+        a.detail = Some("detail".into());
+        a.panel_right = true;
+        a.clamp_now();
+        a.mgmt_enter(&["port http = 8082".to_string()]);
+        assert_eq!(a.input, "8082", "prefilled with current value");
+        // user types the replacement port; the prefill must not be appended to
+        for c in ['9', '0', '9', '0'] {
+            a.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.input, "9090", "typing replaces the prefilled value");
+        a.on_key(KeyCode::Enter);
+        assert!(
+            a.actions.contains(&Action::SetPort {
+                key: "nginx_http".into(),
+                value: 9090,
+            }),
+            "applied action must carry the typed port, got {:?}",
+            a.actions
         );
     }
 
