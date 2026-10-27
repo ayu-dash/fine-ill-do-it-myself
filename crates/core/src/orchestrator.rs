@@ -483,9 +483,13 @@ pub fn status_all<R: Runner + Clone>(
             names.push(w.to_string());
         }
     }
+    for v in installed_php_versions(env) {
+        let n = format!("php-{v}");
+        if !names.iter().any(|e| e == &n) {
+            names.push(n);
+        }
+    }
     let web = web_server(env);
-    let phps: Vec<String> = (0..90).map(|i| format!("php-{i}")).collect();
-    let _ = phps;
     let lock = Lock::load(&env.lock_path()).unwrap_or_default();
     let php = format!("php-{}", default_php(&lock));
     for n in [web.as_str(), php.as_str(), MARIADB] {
