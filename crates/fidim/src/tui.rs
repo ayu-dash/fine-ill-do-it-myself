@@ -111,13 +111,25 @@ pub fn progress_bar(done: u64, total: u64, width: usize) -> String {
     s
 }
 
-/// True when the cursor sits on a service row and the key matches the binding.
+/// True when the cursor sits on a service or language row and the key matches the binding.
 pub fn cursor_is_service_row(
     app: &App,
     want: crossterm::event::KeyCode,
     recv: crossterm::event::KeyCode,
 ) -> bool {
     !app.panel_right && app.cursor() < app.services.len() && want == recv
+}
+
+/// True if a service is a programming language runtime (e.g. php-8.4).
+pub fn is_language(name: &str) -> bool {
+    name.starts_with("php-")
+        || name == "php"
+        || name.starts_with("node-")
+        || name == "node"
+        || name.starts_with("python-")
+        || name == "python"
+        || name.starts_with("ruby-")
+        || name == "ruby"
 }
 
 pub struct App {
@@ -141,7 +153,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(services: Vec<ServiceStatus>, projects: Vec<String>) -> Self {
+    pub fn new(mut services: Vec<ServiceStatus>, projects: Vec<String>) -> Self {
+        services.sort_by_key(|s| is_language(&s.name));
         Self {
             services,
             projects,
@@ -262,8 +275,8 @@ impl App {
                 }
             }
             KeyCode::Enter => match focused_panel(self) {
-                // services: toggle under cursor (start when stopped, stop when running)
-                "services" => {
+                // services or languages: toggle under cursor (start when stopped, stop when running)
+                "services" | "languages" => {
                     let i = self.cursor();
                     if self.services[i].state == ServiceState::Running {
                         self.message = "stop requested".into();
@@ -439,16 +452,27 @@ pub fn quick_create_plan(sites: &str, name: &str) -> Vec<String> {
     plan
 }
 
-/// Which panel is focused given a cursor that walks services then projects.
+/// Which panel is focused given a cursor that walks services, languages, then projects.
 pub fn focused_panel(app: &App) -> &'static str {
     if app.panel_right {
         "management"
-    } else if app.cursor() < app.services.len() {
-        "services"
-    } else if app.cursor() < app.services.len() + app.projects.len() {
-        "projects"
     } else {
-        "services"
+        let non_lang_count = app
+            .services
+            .iter()
+            .filter(|s| !is_language(&s.name))
+            .count();
+        let lang_count = app.services.iter().filter(|s| is_language(&s.name)).count();
+        let cur = app.cursor();
+        if cur < non_lang_count {
+            "services"
+        } else if cur < non_lang_count + lang_count {
+            "languages"
+        } else if cur < non_lang_count + lang_count + app.projects.len() {
+            "projects"
+        } else {
+            "services"
+        }
     }
 }
 
@@ -658,71 +682,170 @@ pub fn run_tui(
                     (area, None)
                 };
 
-                let [services, projects, footer] = Layout::vertical([
-                    Constraint::Length(app.services.len() as u16 + 2),
+                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
+
+                let non_lang_indices: Vec<usize> = app
+                    .services
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !is_language(&s.name))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let lang_indices: Vec<usize> = app
+                    .services
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| is_language(&s.name))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let svc_height = if non_lang_indices.is_empty() {
+                    0
+                } else {
+                    non_lang_indices.len() as u16 + 2
+                };
+
+                let lang_height = if lang_indices.is_empty() {
+                    0
+                } else {
+                    lang_indices.len() as u16 + 2
+                };
+
+                let [services, languages, projects, footer] = Layout::vertical([
+                    Constraint::Length(svc_height),
+                    Constraint::Length(lang_height),
                     Constraint::Min(1),
                     Constraint::Length(1),
                 ])
                 .areas(main_area);
 
-                // services panel
-                let items: Vec<ListItem> = app
-                    .services
-                    .iter()
-                    .map(|s| {
-                        let (name, mark, color) = match &s.state {
-                            ServiceState::Running => {
-                                ("● ".to_string(), s.name.clone(), Color::Green)
-                            }
-                            ServiceState::Error(msg) => {
-                                ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
-                            }
-                            _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
-                        };
-                        let lock =
-                            fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-                        let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                        let p = ports_label(&s.name, &php_row, &ports);
-                        ListItem::new(Line::from(vec![
-                            Span::styled(mark, Style::default().fg(color)),
-                            Span::styled(
-                                name.to_string(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(format!("  {p}"), Style::default().fg(Color::DarkGray)),
-                        ]))
-                    })
-                    .collect();
-                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
-                let svc_focus = !app.panel_right && app.cursor() < app.services.len();
-                let proj_focus = !app.panel_right && app.cursor() >= app.services.len();
-                let mut lst = ListState::default();
-                if svc_focus {
-                    lst.select(Some(app.cursor().min(app.services.len().saturating_sub(1))));
-                }
-                let svc_marker = if svc_focus { "▶ " } else { " " };
-                let svc_list = List::new(items)
-                    .highlight_symbol(svc_marker.to_owned())
-                    .highlight_style(Style::default().bg(Color::Cyan))
-                    .block(
-                        Block::default()
-                            .title(format!(
-                                " services ({web_name}){} ",
-                                if svc_focus { " ◀" } else { "" }
-                            ))
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if svc_focus {
-                                Color::Cyan
-                            } else {
-                                Color::DarkGray
-                            })),
-                    );
-                f.render_stateful_widget(svc_list, services, &mut lst);
+                let left_cursor = app.cursor_left;
+                let svc_focus = !app.panel_right && non_lang_indices.contains(&left_cursor);
+                let lang_focus = !app.panel_right && lang_indices.contains(&left_cursor);
+                let proj_focus = !app.panel_right && left_cursor >= app.services.len();
 
-                // projects panel
+                // 1. Services panel (web servers, databases, etc.)
+                if svc_height > 0 {
+                    let items: Vec<ListItem> = non_lang_indices
+                        .iter()
+                        .map(|&idx| {
+                            let s = &app.services[idx];
+                            let (name, mark, color) = match &s.state {
+                                ServiceState::Running => {
+                                    ("● ".to_string(), s.name.clone(), Color::Green)
+                                }
+                                ServiceState::Error(msg) => {
+                                    ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                                }
+                                _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
+                            };
+                            let p = ports_label(&s.name, &php_row, &ports);
+                            ListItem::new(Line::from(vec![
+                                Span::styled(mark, Style::default().fg(color)),
+                                Span::styled(
+                                    name,
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    format!("  {p}"),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                            ]))
+                        })
+                        .collect();
+
+                    let mut lst = ListState::default();
+                    if let Some(pos) = non_lang_indices.iter().position(|&i| i == left_cursor) {
+                        lst.select(Some(pos));
+                    }
+                    let svc_marker = if svc_focus { "▶ " } else { " " };
+                    let svc_list = List::new(items)
+                        .highlight_symbol(svc_marker.to_owned())
+                        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+                        .block(
+                            Block::default()
+                                .title(format!(
+                                    " services ({web_name}){} ",
+                                    if svc_focus { " ◀" } else { "" }
+                                ))
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(if svc_focus {
+                                    Color::Cyan
+                                } else {
+                                    Color::DarkGray
+                                })),
+                        );
+                    f.render_stateful_widget(svc_list, services, &mut lst);
+                }
+
+                // 2. Programming languages panel (PHP runtimes, etc.)
+                if lang_height > 0 {
+                    let lang_items: Vec<ListItem> = lang_indices
+                        .iter()
+                        .map(|&idx| {
+                            let s = &app.services[idx];
+                            let (name, mark, color) = match &s.state {
+                                ServiceState::Running => {
+                                    ("● ".to_string(), s.name.clone(), Color::Green)
+                                }
+                                ServiceState::Error(msg) => {
+                                    ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                                }
+                                _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
+                            };
+                            let p = ports_label(&s.name, &php_row, &ports);
+                            let is_default =
+                                s.name.strip_prefix("php-").is_some_and(|v| v == php_row);
+                            let default_tag = if is_default { " (default)" } else { "" };
+                            ListItem::new(Line::from(vec![
+                                Span::styled(mark, Style::default().fg(color)),
+                                Span::styled(
+                                    name,
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(default_tag, Style::default().fg(Color::Yellow)),
+                                Span::styled(
+                                    format!("  {p}"),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                            ]))
+                        })
+                        .collect();
+
+                    let mut lang_lst = ListState::default();
+                    if let Some(pos) = lang_indices.iter().position(|&i| i == left_cursor) {
+                        lang_lst.select(Some(pos));
+                    }
+                    let lang_marker = if lang_focus { "▶ " } else { " " };
+                    let lang_list = List::new(lang_items)
+                        .highlight_symbol(lang_marker.to_owned())
+                        .highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
+                        .block(
+                            Block::default()
+                                .title(format!(
+                                    " programming languages (php: {php_row}){} ",
+                                    if lang_focus { " ◀" } else { "" }
+                                ))
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(if lang_focus {
+                                    Color::Green
+                                } else {
+                                    Color::DarkGray
+                                })),
+                        );
+                    f.render_stateful_widget(lang_list, languages, &mut lang_lst);
+                }
+
+                // 3. Projects panel
                 let proj_items: Vec<ListItem> = app
                     .projects
                     .iter()
@@ -737,7 +860,7 @@ pub fn run_tui(
                 let mut plst = ListState::default();
                 if proj_focus {
                     plst.select(Some(
-                        app.cursor()
+                        left_cursor
                             .saturating_sub(app.services.len())
                             .min(app.projects.len().saturating_sub(1)),
                     ));
@@ -884,11 +1007,12 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
     move |app: &mut App| {
         let ports =
             fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
-        let statuses = fine_ill_do_it_myself::orchestrator::status_all(
+        let mut statuses = fine_ill_do_it_myself::orchestrator::status_all(
             &env,
             &ports,
             &fine_ill_do_it_myself::RealRunner,
         );
+        statuses.sort_by_key(|s| is_language(&s.name));
         app.services = statuses;
 
         // build config rows
@@ -1681,5 +1805,34 @@ mod tests {
         // verify PortPlan::resolve reads it back
         let resolved = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |_| None);
         assert_eq!(resolved.caddy_http, 9090, "resolve must return saved value");
+    }
+
+    #[test]
+    fn focused_panel_and_separation_for_languages() {
+        let mut a = App::new(
+            vec![
+                svc("caddy", true),
+                svc("php-8.4", false),
+                svc("mariadb", true),
+            ],
+            vec!["blog".into()],
+        );
+        // Non-languages (caddy, mariadb) first:
+        assert_eq!(a.services[0].name, "caddy");
+        assert_eq!(a.services[1].name, "mariadb");
+        // Programming languages (php-8.4) second:
+        assert_eq!(a.services[2].name, "php-8.4");
+
+        // Cursor at 0: services container
+        assert_eq!(focused_panel(&a), "services");
+        // Cursor at 1: services container
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "services");
+        // Cursor at 2: languages container
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "languages");
+        // Cursor at 3: projects container
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "projects");
     }
 }
