@@ -649,8 +649,8 @@ pub fn run_tui(
                 // Only show detail panel if app.detail is Some
                 let (main_area, detail_area) = if app.detail.is_some() {
                     let [left, right] = Layout::horizontal([
-                        Constraint::Percentage(50),
-                        Constraint::Percentage(50),
+                        Constraint::Percentage(65),
+                        Constraint::Percentage(35),
                     ])
                     .areas(area);
                     (left, Some(right))
