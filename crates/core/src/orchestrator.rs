@@ -77,6 +77,18 @@ fn target_path_for(env: &Env, name: &str) -> std::path::PathBuf {
 
 /// Generate Caddyfile + php-fpm pool configs for the default PHP version.
 pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Result<()> {
+    let lock = Lock::load(&env.lock_path()).unwrap_or_default();
+    generate_web_configs(env, ports, php_version, &default_web(&lock))
+}
+
+/// Generate the vhost/config set of ONE web server (its own http/https pair),
+/// the local CA + leaf certs, and the php-fpm pool.
+pub fn generate_web_configs(
+    env: &Env,
+    ports: &PortPlan,
+    php_version: &str,
+    web: &str,
+) -> Result<()> {
     env.ensure_dirs()?;
     let sites = env.paths.sites().display().to_string();
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
@@ -87,15 +99,14 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
     }
     let certs_dir = env.paths.etc().join("certs");
     let certs_str = certs_dir.display().to_string();
-    let lock = Lock::load(&env.lock_path()).unwrap_or_default();
-    let web = default_web(&lock);
     // each web server binds its OWN http/https pair, never the shared global one
-    let (http_port, https_port) = ports.web_ports(&web);
+    let (http_port, https_port) = ports.web_ports(web);
     let certs_pair = |p: &str| {
         let crt = certs_dir.join(format!("{p}.crt"));
         let key = certs_dir.join(format!("{p}.key"));
         (crt.exists() && key.exists()).then_some((crt, key))
     };
+    let web = web.to_string();
     match web.as_str() {
         LIGHTTPD => {
             crate::web::lighttpd::regenerate(
@@ -240,10 +251,14 @@ pub fn start_service<R: Runner + Clone>(
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
     let spec = service_cmds(env, ports, php_version)?
         .into_iter()
-        .find(|(n, ..)| n == name)
-        .or_else(|| {
-            // a web server that is installed but not the chosen default
+        .find(|(n, ..)| n == name);
+    // a web server that is installed but not the chosen default: regenerate
+    // ITS OWN config set (its own ports) before spawning
+    let spec = match spec {
+        Some(s) => Some(s),
+        None => {
             if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name) {
+                generate_web_configs(env, ports, php_version, name)?;
                 resolve_web_bin(env, name).ok().map(|bin| {
                     (
                         name.to_string(),
@@ -255,9 +270,10 @@ pub fn start_service<R: Runner + Clone>(
             } else {
                 None
             }
-        })
-        .ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
-    let (name, bin, args, log) = spec;
+        }
+    };
+    let (name, bin, args, log) =
+        spec.ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
     check_port(fpm_port, &bin)?;
     let mut full = vec![bin];
     full.extend(args);
@@ -647,6 +663,40 @@ mod tests {
         let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
         assert!(cf.contains("blog.test:8180"), "http block missing\n{cf}");
         assert!(cf.contains("blog.test:8480"), "https block missing\n{cf}");
+    }
+
+    #[test]
+    fn start_service_for_non_chosen_web_binds_its_own_ports() {
+        let (env, _t) = env();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        // nginx installed locally while caddy stays the chosen default
+        std::fs::create_dir_all(env.paths.bin()).unwrap();
+        let bin = env.paths.bin().join("nginx");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 999\n").unwrap();
+        let caddy = env.paths.bin().join("caddy");
+        std::fs::write(&caddy, "#!/bin/sh\nexec sleep 999\n").unwrap();
+        let fpm = env.paths.bin().join("php-fpm-8.4");
+        std::fs::write(&fpm, "#!/bin/sh\nexec sleep 999\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for b in [&bin, &caddy, &fpm] {
+                let _ = std::fs::set_permissions(b, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let ports = PortPlan {
+            nginx_http: 8281,
+            nginx_https: 8446,
+            ..PortPlan::default()
+        };
+        let f = FakeRunner::default();
+        start_service(&env, &ports, &f, "8.4", NGINX).unwrap();
+        let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/blog.conf")).unwrap();
+        assert!(
+            site.contains("listen 8281;"),
+            "non-chosen web must bind its own port\n{site}"
+        );
+        assert!(site.contains("listen 8446 "), "{site}");
     }
 
     #[test]
