@@ -331,7 +331,7 @@ impl App {
     pub fn mgmt_enter(&mut self, lines: &[String]) {
         let sel = self.cursor().min(lines.len().saturating_sub(1));
         let line = lines.get(sel).cloned().unwrap_or_default();
-        let text = line.trim_start();
+        let text = line.trim().trim_start_matches("▶ ").trim();
         if let Some(v) = text.strip_prefix("php.use ") {
             self.message = format!("php.use {v} requested");
             self.actions.push(Action::UsePhp(v.to_string()));

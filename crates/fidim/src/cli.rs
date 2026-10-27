@@ -145,6 +145,32 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     let mut lock = Lock::load(&cli.env.lock_path())?;
     lock.php_default = Some(version.into());
     lock.save(&cli.env.lock_path())?;
+    let php_dir = cli.env.paths.bin().join("php");
+    if php_dir.is_dir() {
+        let src = php_dir.join(format!("php-fpm-{version}"));
+        let dest = php_dir.join("php-fpm");
+        if src.exists() {
+            let _ = std::fs::remove_file(&dest);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                let _ = symlink(&src, &dest);
+            }
+        }
+        let src_cli = php_dir.join(format!("php-{version}"));
+        let dest_cli = php_dir.join("php");
+        if src_cli.exists() {
+            let _ = std::fs::remove_file(&dest_cli);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                let _ = symlink(&src_cli, &dest_cli);
+            }
+        }
+    }
+    let ports =
+        fine_ill_do_it_myself::PortPlan::resolve(&cli.env.paths.etc(), |k| std::env::var(k).ok());
+    let _ = fine_ill_do_it_myself::orchestrator::generate_configs(&cli.env, &ports, version);
     Ok(())
 }
 
