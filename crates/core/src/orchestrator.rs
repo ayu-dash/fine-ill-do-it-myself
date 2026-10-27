@@ -475,17 +475,20 @@ pub fn web_config_path(env: &Env, web: &str) -> std::path::PathBuf {
     }
 }
 
-/// Directory that contains `modules/` next to an httpd binary:
-/// `<bin>/../..` when a `modules` dir sits there (XAMPP layout), else bin dir.
+/// Directory that contains `modules/` next to an httpd binary.
+/// Searches up to 3 levels above the binary so it works with multiple layouts:
+/// - XAMPP: `<prefix>/bin/httpd` → `<prefix>/modules/`  (2 levels up)
+/// - fidim project-local: `.fidim/bin/httpd/httpd` → `.fidim/modules/`  (3 levels up)
+/// - Simple flat install: `<prefix>/httpd` → `<prefix>/modules/`  (1 level up)
 pub fn apache_server_root(bin: &std::path::Path) -> std::path::PathBuf {
-    for cand in [
-        bin.parent().unwrap_or(Path::new(".")),
-        bin.parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(Path::new(".")),
-    ] {
-        if cand.join("modules").is_dir() {
-            return cand.to_path_buf();
+    let mut cur = bin.parent().unwrap_or(Path::new("."));
+    for _ in 0..3 {
+        if cur.join("modules").is_dir() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
         }
     }
     bin.parent().unwrap_or(Path::new(".")).to_path_buf()
@@ -663,6 +666,17 @@ mod webchoice_tests {
         std::fs::create_dir_all(t.path().join("opt/httpd/modules")).unwrap();
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         assert_eq!(apache_server_root(&bin), t.path().join("opt/httpd"));
+    }
+
+    #[test]
+    fn apache_server_root_finds_modules_three_levels_up() {
+        // fidim project-local layout: .fidim/bin/httpd/httpd → .fidim/modules/
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join(".fidim/bin/httpd/httpd");
+        std::fs::create_dir_all(t.path().join(".fidim/bin/httpd")).unwrap();
+        std::fs::create_dir_all(t.path().join(".fidim/modules")).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        assert_eq!(apache_server_root(&bin), t.path().join(".fidim"));
     }
 }
 #[cfg(test)]
