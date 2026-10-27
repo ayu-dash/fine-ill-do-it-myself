@@ -1445,4 +1445,75 @@ mod tests {
         let plan = quick_create_plan("~/Sites", "shop");
         assert_eq!(plan, vec!["mkdir -p ~/Sites/shop", "127.0.0.1 shop.test"]);
     }
+
+    /// Regression: when the port editor is open and the user presses Enter,
+    /// `run_tui`'s routing must hand Enter to `on_key` (which commits the
+    /// typed value) — NOT to `mgmt_enter` (which would re-open/reset the
+    /// editor with the stale value from the panel lines, causing every edit
+    /// to be silently discarded and the port to revert to the default).
+    ///
+    /// The helper `dispatch_enter` mirrors the exact `if`-branch in `run_tui`:
+    ///   • editor inactive + right panel + detail → mgmt_enter
+    ///   • everything else (including editor active) → on_key
+    #[test]
+    fn enter_while_editor_open_commits_value_not_resets_editor() {
+        // Simulates the run_tui dispatch logic:
+        //   if Enter && panel_right && detail.is_some() && edit.is_none() → mgmt_enter
+        //   else → on_key
+        fn dispatch_enter(app: &mut App, lines: &[String]) {
+            use crossterm::event::KeyCode;
+            if app.panel_right && app.detail.is_some() && app.edit.is_none() {
+                app.mgmt_enter(lines);
+            } else {
+                app.on_key(KeyCode::Enter);
+            }
+        }
+
+        let mut a = App::new(vec![svc("nginx", false)], vec![]);
+        a.detail = Some("detail".into());
+        a.panel_right = true;
+        a.cursor_right = 2; // "  port http = 8082"
+        let lines = vec![
+            "web.use nginx".to_string(),
+            "  version 1.2".to_string(),
+            "  port http = 8082".to_string(),
+            "  port https = 8445".to_string(),
+        ];
+
+        // Step 1: first Enter opens the editor (editor is not yet active)
+        dispatch_enter(&mut a, &lines);
+        assert!(a.edit.is_some(), "first Enter must open the port editor");
+        assert_eq!(a.input, "8082");
+
+        // Step 2: user types a new port
+        for c in ['9', '0', '9', '0'] {
+            a.on_key(crossterm::event::KeyCode::Char(c));
+        }
+        assert_eq!(a.input, "9090");
+
+        // Step 3: second Enter must COMMIT via on_key, NOT re-open via mgmt_enter.
+        // Without the `app.edit.is_none()` guard, mgmt_enter would run here,
+        // resetting `app.input` back to "8082" and discarding the SetPort action.
+        dispatch_enter(&mut a, &lines);
+        assert!(
+            a.edit.is_none(),
+            "editor must be closed after committing Enter"
+        );
+        assert!(
+            a.actions.contains(&Action::SetPort {
+                key: "nginx_http".into(),
+                value: 9090,
+            }),
+            "SetPort action with the typed value must be queued; got {:?}",
+            a.actions
+        );
+        // The old value must not appear in the action list
+        assert!(
+            !a.actions.contains(&Action::SetPort {
+                key: "nginx_http".into(),
+                value: 8082,
+            }),
+            "stale default value must not survive the edit"
+        );
+    }
 }
