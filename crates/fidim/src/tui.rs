@@ -18,6 +18,8 @@ pub enum Action {
     SetPort { key: String, value: u16 },
     /// Show detail view for a service.
     ShowDetail(String),
+    /// Switch a web server's active binary version (e.g. caddy -> caddy-2.9.1).
+    UseServerVersion { server: String, version: String },
 }
 
 /// One row of the config panel.
@@ -329,6 +331,22 @@ impl App {
         } else if let Some(n) = text.strip_prefix("web.use ") {
             self.message = format!("web.use {n} requested");
             self.actions.push(Action::UseWeb(n.to_string()));
+        } else if let Some((server, ver)) = text.split_once(".use ") {
+            let s = server.trim_start_matches("▶ ").trim();
+            if [
+                fine_ill_do_it_myself::orchestrator::CADDY,
+                fine_ill_do_it_myself::orchestrator::APACHE,
+                fine_ill_do_it_myself::orchestrator::NGINX,
+                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+            ]
+            .contains(&s)
+            {
+                self.message = format!("{s}.use {ver} requested");
+                self.actions.push(Action::UseServerVersion {
+                    server: s.to_string(),
+                    version: ver.to_string(),
+                });
+            }
         } else if let Some(rest) = text.strip_prefix("port ") {
             if let Some((label, value)) = rest.split_once(" = ") {
                 // a web-server row applies its own pair, others the global one
@@ -558,6 +576,31 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
     out
 }
 
+/// Discovered alternate versions of a web server in `bin/` (e.g. caddy-2.9.1).
+pub fn installed_server_versions(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
+    let mut vers = Vec::new();
+    let prefix = format!("{server}-");
+    if let Ok(rd) = std::fs::read_dir(env.paths.bin()) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(v) = n.strip_prefix(&prefix) {
+                if !v.ends_with(".old") && !v.ends_with("-bin") && !v.starts_with('.') {
+                    vers.push(v.to_string());
+                }
+            }
+        }
+    }
+    vers.sort_by(|a, b| {
+        let parse = |s: &str| {
+            s.split('.')
+                .map(|p| p.parse::<u32>().unwrap_or(0))
+                .collect::<Vec<_>>()
+        };
+        parse(b).cmp(&parse(a))
+    });
+    vers
+}
+
 /// Title + exact text of the management panel's items for `app`'s current
 /// state. Shared by the renderer and by `App::mgmt_enter` so Enter always
 /// acts on precisely the line that is displayed.
@@ -590,10 +633,22 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
         .contains(&svc.name.as_str())
         {
             let ver = fine_ill_do_it_myself::orchestrator::web_version(env, &svc.name);
-            return (
-                format!(" {} management ", svc.name),
-                web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports),
-            );
+            let mut lines = web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports);
+            let vers = installed_server_versions(env, &svc.name);
+            if !vers.is_empty() {
+                lines.push(String::new());
+                lines.push(format!("  {} versions:", svc.name));
+                let cur_v = ver.unwrap_or_default();
+                for v in vers {
+                    let mark = if cur_v.starts_with(&v) || v.starts_with(&cur_v) {
+                        "▶ "
+                    } else {
+                        "  "
+                    };
+                    lines.push(format!("{mark}{}.use {v}", svc.name));
+                }
+            }
+            return (format!(" {} management ", svc.name), lines);
         }
         if svc.name == "mariadb" {
             return (
@@ -1164,6 +1219,26 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             // shared with the CLI: accepts the per-server pairs too
             // (nginx_http, ...) and rejects unknown keys with an error
             crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
+        }
+        Action::UseServerVersion { server, version } => {
+            let src = env.paths.bin().join(format!("{server}-{version}"));
+            let dest = env.paths.bin().join(server);
+            if !src.exists() {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "version {version} for {server} not found"
+                )))
+            } else {
+                let _ = std::fs::remove_file(&dest);
+                #[cfg(unix)]
+                let res = {
+                    use std::os::unix::fs::symlink;
+                    symlink(&src, &dest).or_else(|_| std::fs::copy(&src, &dest).map(|_| ()))
+                };
+                #[cfg(not(unix))]
+                let res = std::fs::copy(&src, &dest).map(|_| ());
+                res.map(|_| vec![])
+                    .map_err(fine_ill_do_it_myself::Error::Io)
+            }
         }
         Action::ShowDetail(name) => {
             // Build detail content based on service
@@ -1846,5 +1921,28 @@ mod tests {
         // Cursor at 3: projects container
         a.on_key(KeyCode::Down);
         assert_eq!(focused_panel(&a), "projects");
+    }
+
+    #[test]
+    fn server_versions_discovery_and_mgmt_enter() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        std::fs::create_dir_all(env.paths.bin()).unwrap();
+
+        std::fs::write(env.paths.bin().join("caddy-2.10.2"), "").unwrap();
+        std::fs::write(env.paths.bin().join("caddy-2.9.1"), "").unwrap();
+
+        let vers = installed_server_versions(&env, "caddy");
+        assert_eq!(vers, vec!["2.10.2", "2.9.1"]);
+
+        let mut a = App::new(vec![svc("caddy", true)], vec![]);
+        a.mgmt_enter(&["  caddy.use 2.9.1".to_string()]);
+        assert_eq!(
+            a.actions,
+            vec![Action::UseServerVersion {
+                server: "caddy".into(),
+                version: "2.9.1".into()
+            }]
+        );
     }
 }
