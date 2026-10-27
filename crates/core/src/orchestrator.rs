@@ -89,6 +89,8 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
     let certs_str = certs_dir.display().to_string();
     let lock = Lock::load(&env.lock_path()).unwrap_or_default();
     let web = default_web(&lock);
+    // each web server binds its OWN http/https pair, never the shared global one
+    let (http_port, https_port) = ports.web_ports(&web);
     let certs_pair = |p: &str| {
         let crt = certs_dir.join(format!("{p}.crt"));
         let key = certs_dir.join(format!("{p}.key"));
@@ -108,8 +110,8 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
                 &sites,
                 &projects,
                 fpm_port,
-                ports.http,
-                ports.https,
+                http_port,
+                https_port,
                 Some(&certs_str),
             )?;
         }
@@ -123,8 +125,8 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
                 &sites,
                 &projects,
                 fpm_port,
-                ports.http,
-                ports.https,
+                http_port,
+                https_port,
                 Some(&certs_str),
             )?;
         }
@@ -136,8 +138,8 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
                 &sites,
                 &projects,
                 fpm_port,
-                ports.http,
-                ports.https,
+                http_port,
+                https_port,
                 Some(&certs_str),
             )?;
         }
@@ -157,12 +159,7 @@ pub fn generate_configs(env: &Env, ports: &PortPlan, php_version: &str) -> Resul
             std::fs::write(
                 env.caddyfile_path(),
                 generate_caddyfile_for_projects_tls(
-                    &sites,
-                    fpm_port,
-                    &projects,
-                    ports.http,
-                    ports.https,
-                    &tls_line,
+                    &sites, fpm_port, &projects, http_port, https_port, &tls_line,
                 )?,
             )?;
         }
@@ -310,11 +307,17 @@ pub fn web_version(env: &Env, web: &str) -> Option<String> {
     let bin = web_bin_path(env, web);
     let out = match web {
         NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
-        _ => std::process::Command::new(&bin).arg("--version").output().ok()?,
+        _ => std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .ok()?,
     };
-    let txt = String::from_utf8_lossy(&out.stderr).to_string()
-        + &String::from_utf8_lossy(&out.stdout);
-    let num: Vec<char> = txt.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    let txt =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    let num: Vec<char> = txt
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
     let raw: String = num.into_iter().collect();
     let v: String = raw
         .split(['\t', ' '])
@@ -603,6 +606,47 @@ mod tests {
         // data bin path does not exist -> None (no panic on missing binary)
         assert!(got.is_none() || got.is_some(), "probe must not panic");
         let _ = bin;
+    }
+
+    #[test]
+    fn generate_configs_binds_nginx_to_its_own_ports() {
+        let (env, _t) = env();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        let lock = Lock {
+            web_default: Some(NGINX.into()),
+            ..Lock::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+        let ports = PortPlan {
+            nginx_http: 8280,
+            nginx_https: 8445,
+            ..PortPlan::default()
+        };
+        generate_configs(&env, &ports, "8.4").unwrap();
+        let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/blog.conf")).unwrap();
+        assert!(
+            site.contains("listen 8280;"),
+            "nginx must bind its own http port, not the shared one\n{site}"
+        );
+        assert!(
+            site.contains("listen 8445 "),
+            "nginx https port missing\n{site}"
+        );
+    }
+
+    #[test]
+    fn generate_configs_binds_caddy_to_its_own_ports() {
+        let (env, _t) = env();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        let ports = PortPlan {
+            caddy_http: 8180,
+            caddy_https: 8480,
+            ..PortPlan::default()
+        };
+        generate_configs(&env, &ports, "8.4").unwrap();
+        let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
+        assert!(cf.contains("blog.test:8180"), "http block missing\n{cf}");
+        assert!(cf.contains("blog.test:8480"), "https block missing\n{cf}");
     }
 
     #[test]

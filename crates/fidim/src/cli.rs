@@ -148,12 +148,27 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set one port key in `etc/ports.toml`.
+/// Set one port key in `etc/ports.toml`. Common keys (http, https, fpm_base,
+/// mariadb) plus one pair per web server: caddy_http(s), httpd_http(s),
+/// nginx_http(s), lighttpd_http(s) — each server keeps its own ports.
 pub fn port_set(etc: &std::path::Path, key: &str, value: u16) -> Result<()> {
-    let allowed = ["http", "https", "fpm_base", "mariadb"];
+    let allowed = [
+        "http",
+        "https",
+        "fpm_base",
+        "mariadb",
+        "caddy_http",
+        "caddy_https",
+        "httpd_http",
+        "httpd_https",
+        "nginx_http",
+        "nginx_https",
+        "lighttpd_http",
+        "lighttpd_https",
+    ];
     if !allowed.contains(&key) {
         return Err(fine_ill_do_it_myself::Error::Other(format!(
-            "unknown port key {key}; use http, https, fpm_base or mariadb"
+            "unknown port key {key}; use http, https, fpm_base, mariadb, or a per-server pair like caddy_http / caddy_https / httpd_http / httpd_https / nginx_http / nginx_https / lighttpd_http / lighttpd_https"
         )));
     }
     std::fs::create_dir_all(etc)?;
@@ -235,4 +250,33 @@ pub fn trust(cli: &CliEnv) -> Result<Vec<String>> {
 /// Run the unix-socket daemon until terminated.
 pub fn daemon(env: &Env, sock: &std::path::Path) -> Result<()> {
     crate::daemon::run_daemon(env.clone(), sock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_set_accepts_per_web_server_keys() {
+        let t = tempfile::tempdir().unwrap();
+        port_set(t.path(), "caddy_http", 9090).unwrap();
+        port_set(t.path(), "nginx_https", 9443).unwrap();
+        port_set(t.path(), "lighttpd_http", 9080).unwrap();
+        let text = std::fs::read_to_string(t.path().join("ports.toml")).unwrap();
+        assert!(text.contains("caddy_http = 9090"), "{text}");
+        assert!(text.contains("nginx_https = 9443"), "{text}");
+        assert!(text.contains("lighttpd_http = 9080"), "{text}");
+        // setting twice replaces, not appends
+        port_set(t.path(), "caddy_http", 9091).unwrap();
+        let text = std::fs::read_to_string(t.path().join("ports.toml")).unwrap();
+        assert_eq!(text.matches("caddy_http = ").count(), 1, "{text}");
+        assert!(text.contains("caddy_http = 9091"), "{text}");
+    }
+
+    #[test]
+    fn port_set_rejects_unknown_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let err = port_set(t.path(), "banana", 1).unwrap_err();
+        assert!(format!("{err}").contains("unknown port key"), "{err}");
+    }
 }

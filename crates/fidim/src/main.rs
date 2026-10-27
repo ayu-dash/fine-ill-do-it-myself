@@ -60,9 +60,10 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PortCommands {
-    /// Show current ports
+    /// Show current ports (shared base + each web server's own pair)
     Show,
-    /// Set a port key: http, https, fpm_base or mariadb
+    /// Set a port key: http, https, fpm_base, mariadb, or a per-server
+    /// pair like caddy_http / caddy_https / httpd_http / nginx_https / ...
     Set { key: String, value: u16 },
 }
 
@@ -196,11 +197,23 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             PortCommands::Show => {
                 let p = &env.ports;
                 println!(
-                    "http = {p}\nhttps = {p2}\nfpm_base = {p3}\nmariadb = {p4}",
+                    "http = {p}\nhttps = {p2}\nfpm_base = {p3}\nmariadb = {p4}\
+                     \ncaddy    = http {p5} https {p6}\
+                     \nhttpd    = http {p7} https {p8}\
+                     \nnginx    = http {p9} https {p10}\
+                     \nlighttpd = http {p11} https {p12}",
                     p = p.http,
                     p2 = p.https,
                     p3 = p.fpm_base,
-                    p4 = p.mariadb
+                    p4 = p.mariadb,
+                    p5 = p.caddy_http,
+                    p6 = p.caddy_https,
+                    p7 = p.httpd_http,
+                    p8 = p.httpd_https,
+                    p9 = p.nginx_http,
+                    p10 = p.nginx_https,
+                    p11 = p.lighttpd_http,
+                    p12 = p.lighttpd_https
                 );
             }
             PortCommands::Set { key, value } => {
@@ -236,6 +249,43 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
 #[cfg(test)]
 mod tests {
     use assert_cmd::Command;
+
+    #[test]
+    fn ports_show_lists_every_web_servers_own_ports() {
+        let t = tempfile::tempdir().unwrap();
+        let mut cmd = Command::cargo_bin("fidim").unwrap();
+        let out = cmd
+            .arg("--data-root")
+            .arg(t.path())
+            .args(["ports", "show"])
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("caddy    = http 8080 https 8443"), "{s}");
+        assert!(s.contains("nginx    = http 8082 https 8445"), "{s}");
+    }
+
+    #[test]
+    fn ports_set_accepts_per_web_server_key_and_show_picks_it_up() {
+        let t = tempfile::tempdir().unwrap();
+        let mut cmd = Command::cargo_bin("fidim").unwrap();
+        let out = cmd
+            .arg("--data-root")
+            .arg(t.path())
+            .args(["ports", "set", "nginx_http", "9090"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "set failed");
+        let mut cmd = Command::cargo_bin("fidim").unwrap();
+        let out = cmd
+            .arg("--data-root")
+            .arg(t.path())
+            .args(["ports", "show"])
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("nginx    = http 9090"), "{s}");
+    }
 
     #[test]
     fn status_reports_stopped_with_alternate_data_root() {

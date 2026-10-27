@@ -106,6 +106,19 @@ impl Default for PortPlan {
 }
 
 impl PortPlan {
+    /// http/https pair belonging to one web server's own port config
+    /// (caddy_http for caddy, httpd_http for apache, ...); unknown names
+    /// fall back to the shared global pair.
+    pub fn web_ports(&self, web: &str) -> (u16, u16) {
+        match web {
+            crate::orchestrator::CADDY => (self.caddy_http, self.caddy_https),
+            crate::orchestrator::APACHE => (self.httpd_http, self.httpd_https),
+            crate::orchestrator::NGINX => (self.nginx_http, self.nginx_https),
+            crate::orchestrator::LIGHTTPD => (self.lighttpd_http, self.lighttpd_https),
+            _ => (self.http, self.https),
+        }
+    }
+
     /// Resolve ports: `<etc>/ports.toml < env vars > defaults`.
     /// `env` maps a variable name (FIDIM_HTTP_PORT, ...) to its numeric value.
     pub fn resolve(etc: &std::path::Path, env: impl Fn(&str) -> Option<String>) -> Self {
@@ -184,25 +197,34 @@ impl<R: Runner> Supervisor<R> {
         Ok(read_pid_file(&self.env.paths.pids(), name)?)
     }
 
+    /// Port whose listener should be scanned for orphan workers when a
+    /// service has no (or a stale) pid file. Web servers scan *their own*
+    /// http port, never the shared global one.
+    pub fn orphan_reaping_port(&self, name: &str) -> Option<u16> {
+        if name == "mariadb" {
+            Some(self.ports.mariadb)
+        } else if [
+            crate::orchestrator::CADDY,
+            crate::orchestrator::APACHE,
+            crate::orchestrator::NGINX,
+            crate::orchestrator::LIGHTTPD,
+        ]
+        .contains(&name)
+        {
+            Some(self.ports.web_ports(name).0)
+        } else {
+            name.strip_prefix("php-")
+                .map(|v| crate::php::fpm::fpm_port_for(v, 9000, &self.ports))
+        }
+    }
+
     pub fn stop(&self, name: &str) -> Result<()> {
         if let Some(pid) = read_pid_file(&self.env.paths.pids(), name)? {
             self.runner.kill(pid)?;
             remove_pid_file(&self.env.paths.pids(), name);
         }
         // reap any orphan still holding the service port (workers outlive the master)
-        let port = if name == "mariadb" {
-            Some(self.ports.mariadb)
-        } else if name == crate::orchestrator::CADDY
-            || name == crate::orchestrator::APACHE
-            || name == crate::orchestrator::NGINX
-            || name == crate::orchestrator::LIGHTTPD
-        {
-            Some(self.ports.http)
-        } else {
-            name.strip_prefix("php-")
-                .map(|v| crate::php::fpm::fpm_port_for(v, 9000, &self.ports))
-        };
-        if let Some(port) = port {
+        if let Some(port) = self.orphan_reaping_port(name) {
             if port != 0 {
                 if let Ok(pids) = crate::proc::listening_pids(port) {
                     for pid in pids {
@@ -332,6 +354,35 @@ mod tests {
         s.stop("x").unwrap();
         assert_eq!(s.status("x").state, ServiceState::Stopped);
         assert_eq!(s.read_pid("x").unwrap(), None);
+    }
+
+    #[test]
+    fn web_ports_differ_per_server_and_fall_back_for_unknown() {
+        let p = PortPlan::default();
+        let mut q = PortPlan {
+            nginx_http: 8181,
+            nginx_https: 8444,
+            ..PortPlan::default()
+        };
+        q.http = 80;
+        q.https = 443;
+        assert_eq!(q.web_ports("nginx"), (8181, 8444));
+        assert_eq!(q.web_ports("caddy"), (p.caddy_http, p.caddy_https));
+        assert_eq!(q.web_ports("httpd"), (p.httpd_http, p.httpd_https));
+        assert_eq!(q.web_ports("lighttpd"), (p.lighttpd_http, p.lighttpd_https));
+        assert_eq!(q.web_ports("nonsense"), (80, 443));
+    }
+
+    #[test]
+    fn orphan_reaping_port_is_per_server() {
+        let mut s = sup();
+        s.ports.nginx_http = 8181;
+        assert_eq!(s.orphan_reaping_port("nginx"), Some(8181));
+        assert_eq!(s.orphan_reaping_port("caddy"), Some(s.ports.caddy_http));
+        assert_eq!(s.orphan_reaping_port("httpd"), Some(s.ports.httpd_http));
+        assert_eq!(s.orphan_reaping_port("mariadb"), Some(s.ports.mariadb));
+        assert_eq!(s.orphan_reaping_port("php-8.4"), Some(9004));
+        assert_eq!(s.orphan_reaping_port("something"), None);
     }
 
     #[test]
