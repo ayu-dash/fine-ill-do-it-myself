@@ -975,23 +975,9 @@ fn make_actioner(
                 }
             }
             Action::SetPort { key, value } => {
-                let allowed = ["http", "https", "fpm_base", "mariadb"];
-                if !allowed.contains(&key.as_str()) {
-                    Ok(vec![])
-                } else {
-                    let file = env.paths.etc().join("ports.toml");
-                    let mut lines: Vec<String> = std::fs::read_to_string(&file)
-                        .unwrap_or_default()
-                        .lines()
-                        .map(String::from)
-                        .filter(|l| !l.trim_start().starts_with(&format!("{key} =")))
-                        .collect();
-                    lines.push(format!("{key} = {value}"));
-                    let _ = std::fs::create_dir_all(env.paths.etc());
-                    std::fs::write(&file, lines.join("\n") + "\n")
-                        .map(|_| vec![])
-                        .map_err(|e| fine_ill_do_it_myself::Error::Other(e.to_string()))
-                }
+                // shared with the CLI: accepts the per-server pairs too
+                // (nginx_http, ...) and rejects unknown keys with an error
+                crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
             }
             Action::ShowDetail(name) => {
                 // Build detail content based on service
@@ -1196,6 +1182,42 @@ mod tests {
         assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
         assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
         assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");
+    }
+
+    #[test]
+    fn set_port_action_persists_per_web_server_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        let act = make_actioner(env.clone(), fine_ill_do_it_myself::PortPlan::default());
+        let mut app = App::new(vec![], vec![]);
+        act(
+            &mut app,
+            &Action::SetPort {
+                key: "nginx_http".into(),
+                value: 9090,
+            },
+        );
+        let text = std::fs::read_to_string(env.paths.etc().join("ports.toml")).unwrap();
+        assert!(text.contains("nginx_http = 9090"), "{text}");
+    }
+
+    #[test]
+    fn set_port_action_rejects_unknown_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        let act = make_actioner(env.clone(), fine_ill_do_it_myself::PortPlan::default());
+        let mut app = App::new(vec![], vec![]);
+        act(
+            &mut app,
+            &Action::SetPort {
+                key: "banana".into(),
+                value: 1,
+            },
+        );
+        assert!(
+            !std::fs::exists(env.paths.etc().join("ports.toml")).unwrap(),
+            "unknown key must not create ports.toml"
+        );
     }
 
     #[test]
