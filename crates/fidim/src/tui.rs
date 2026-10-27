@@ -813,8 +813,6 @@ pub fn run_tui(
                                 _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
                             };
                             let p = ports_label(&s.name, &php_row, &ports);
-                            let is_default =
-                                s.name.strip_prefix("php-").is_some_and(|v| v == php_row);
                             let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
@@ -828,12 +826,6 @@ pub fn run_tui(
                                 spans.push(Span::styled(
                                     format!("{:<12}", p),
                                     Style::default().fg(Color::DarkGray),
-                                ));
-                            }
-                            if is_default {
-                                spans.push(Span::styled(
-                                    "(default)",
-                                    Style::default().fg(Color::Yellow),
                                 ));
                             }
                             ListItem::new(Line::from(spans))
