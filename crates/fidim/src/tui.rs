@@ -452,6 +452,45 @@ pub fn web_mgmt_lines(
     out
 }
 
+/// Footer hint list as (key text, description) pairs, context aware: while
+/// the port editor is open only its keys are shown. Duplicate key texts
+/// (e.g. a remapped keybind colliding with a fixed key) are dropped,
+/// keeping the first occurrence.
+pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
+    use crossterm::event::KeyCode;
+    let disp = |code: KeyCode| match code {
+        KeyCode::Char(c) => c.to_string(),
+        other => format!("{other:?}"),
+    };
+    if app.edit.is_some() {
+        return vec![
+            ("0-9".to_string(), "port digit"),
+            ("backspace".to_string(), "hapus"),
+            ("enter".to_string(), "terapkan"),
+            ("esc".to_string(), "batal"),
+        ];
+    }
+    let fixed = [
+        (disp(app.keybinds.quit), "quit"),
+        ("j".to_string(), "down"),
+        ("k".to_string(), "up"),
+        ("d".to_string(), "detail"),
+        ("enter".to_string(), "apply"),
+        ("tab".to_string(), "panel"),
+        (disp(app.keybinds.start), "start"),
+        (disp(app.keybinds.stop), "stop"),
+        (disp(app.keybinds.restart), "restart"),
+        (disp(app.keybinds.restart_all), "all"),
+    ];
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for (k, l) in fixed {
+        if !out.iter().any(|(seen, _)| seen == &k) {
+            out.push((k, l));
+        }
+    }
+    out
+}
+
 /// Title + exact text of the management panel's items for `app`'s current
 /// state. Shared by the renderer and by `App::mgmt_enter` so Enter always
 /// acts on precisely the line that is displayed.
@@ -717,22 +756,10 @@ pub fn run_tui(
                     f.render_stateful_widget(mgmt_list, detail_area, &mut mlst);
                 }
 
-                // footer with key hints
-                let hints = vec![
-                    (app.keybinds.quit, "quit"),
-                    (crossterm::event::KeyCode::Char('j'), "down"),
-                    (crossterm::event::KeyCode::Char('k'), "up"),
-                    (app.keybinds.start, "start"),
-                    (app.keybinds.stop, "stop"),
-                    (app.keybinds.restart, "restart"),
-                    (app.keybinds.restart_all, "all"),
-                ];
+                // footer with key hints (caller-owned list, context aware)
+                let hints = footer_hints(&app);
                 let mut spans: Vec<Span> = Vec::new();
-                for (code, label) in hints {
-                    let key = match code {
-                        crossterm::event::KeyCode::Char(c) => format!("{c}"),
-                        _ => format!("{code:?}"),
-                    };
+                for (key, label) in hints {
                     spans.push(Span::styled(
                         format!(" {key} "),
                         Style::default()
@@ -1169,6 +1196,43 @@ mod tests {
         assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
         assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
         assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");
+    }
+
+    #[test]
+    fn footer_hints_list_every_key_in_default_view() {
+        let a = App::new(vec![], vec![]);
+        let h = footer_hints(&a);
+        let keys: Vec<&str> = h.iter().map(|(k, _)| k.as_str()).collect();
+        // fixed navigation & selection keys
+        for want in ["d", "enter", "tab", "j", "k"] {
+            assert!(keys.contains(&want), "missing key {want}\n{keys:?}");
+        }
+        // remapable keybinds (defaults q/r/s/x/a)
+        for want in ["q", "s", "x", "r", "a"] {
+            assert!(keys.contains(&want), "missing keybind {want}\n{keys:?}");
+        }
+        // no duplicated key chips
+        let mut uniq = keys.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            keys.len(),
+            "duplicate key hints ({keys:?} vs {uniq:?})"
+        );
+    }
+
+    #[test]
+    fn footer_hints_switch_to_editor_keys_while_editing() {
+        let mut a = App::new(vec![], vec![]);
+        a.edit = Some(Edit::Port("nginx_http".into()));
+        let h = footer_hints(&a);
+        let keys: Vec<&str> = h.iter().map(|(k, _)| k.as_str()).collect();
+        for want in ["0-9", "backspace", "enter", "esc"] {
+            assert!(keys.contains(&want), "missing editor key {want}\n{keys:?}");
+        }
+        // the normal key set is hidden while typing a port
+        assert!(!keys.contains(&"q"), "{keys:?}");
     }
 
     #[test]
