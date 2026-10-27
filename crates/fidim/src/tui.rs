@@ -743,19 +743,32 @@ pub fn run_tui(
                                 _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
                             };
                             let p = ports_label(&s.name, &php_row, &ports);
-                            ListItem::new(Line::from(vec![
+                            let (p1, p2) = if let Some((http, https)) = p.split_once(' ') {
+                                (http.to_string(), https.to_string())
+                            } else if s.name == "mariadb" && !p.is_empty() {
+                                (format!("port:{p}"), String::new())
+                            } else {
+                                (p, String::new())
+                            };
+                            let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
-                                    name,
+                                    format!("{:<13}", name),
                                     Style::default()
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
                                 ),
-                                Span::styled(
-                                    format!("  {p}"),
+                            ];
+                            if !p1.is_empty() {
+                                spans.push(Span::styled(
+                                    format!("{:<15}", p1),
                                     Style::default().fg(Color::DarkGray),
-                                ),
-                            ]))
+                                ));
+                            }
+                            if !p2.is_empty() {
+                                spans.push(Span::styled(p2, Style::default().fg(Color::DarkGray)));
+                            }
+                            ListItem::new(Line::from(spans))
                         })
                         .collect();
 
@@ -802,21 +815,30 @@ pub fn run_tui(
                             let p = ports_label(&s.name, &php_row, &ports);
                             let is_default =
                                 s.name.strip_prefix("php-").is_some_and(|v| v == php_row);
-                            let default_tag = if is_default { " (default)" } else { "" };
-                            ListItem::new(Line::from(vec![
+                            let mut spans = vec![
                                 Span::styled(mark, Style::default().fg(color)),
                                 Span::styled(
-                                    name,
+                                    format!("{:<13}", name),
                                     Style::default()
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
                                 ),
-                                Span::styled(default_tag, Style::default().fg(Color::Yellow)),
-                                Span::styled(
-                                    format!("  {p}"),
+                            ];
+                            if !p.is_empty() {
+                                spans.push(Span::styled(
+                                    format!("{:<15}", p),
                                     Style::default().fg(Color::DarkGray),
-                                ),
-                            ]))
+                                ));
+                            } else {
+                                spans.push(Span::raw("               "));
+                            }
+                            if is_default {
+                                spans.push(Span::styled(
+                                    "(default)",
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                            ListItem::new(Line::from(spans))
                         })
                         .collect();
 
