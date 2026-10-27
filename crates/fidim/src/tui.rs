@@ -197,9 +197,6 @@ impl App {
                             }
                             Err(_) => {
                                 self.message = format!("invalid port '{0}'", self.input);
-                                if self.input.parse::<u16>().is_ok() {
-                                    self.message.push_str(" (unreachable)");
-                                }
                             }
                         }
                     }
@@ -265,7 +262,6 @@ impl App {
                         self.actions.push(Action::StartService(i));
                     }
                 }
-                "config" => self.on_config_enter(),
                 _ => {
                     self.message = "projects enter not implemented; use compose panel keys".into();
                 }
@@ -295,31 +291,41 @@ impl App {
         }
     }
 
-    fn on_config_enter(&mut self) {
-        let ci = self
-            .cursor()
-            .saturating_sub(self.services.len())
-            .saturating_sub(self.projects.len());
-        match self.config_rows.get(ci).cloned() {
-            Some(c @ ConfigRow::UsePhp(_)) => {
-                let c = c.clone();
-                if let ConfigRow::UsePhp(v) = c {
-                    self.message = format!("php.use {v} requested");
-                    self.actions.push(Action::UsePhp(v));
-                }
-            }
-            Some(c @ ConfigRow::UseWeb { .. }) => {
-                if let ConfigRow::UseWeb { name, .. } = c {
-                    self.message = format!("web.use {name} requested");
-                    self.actions.push(Action::UseWeb(name));
-                }
-            }
-            Some(ConfigRow::Port { key, value }) => {
-                self.edit = Some(Edit::Port(key.clone()));
+    /// Enter on the right panel: act on the highlighted management line.
+    /// `web.use X` switches the default server, `php.use X` the php default,
+    /// `port KEY = V` opens the port editor prefilled with V (web-server
+    /// rows map the generic `http`/`https` labels to their per-server keys).
+    pub fn mgmt_enter(&mut self, lines: &[String]) {
+        let sel = self.cursor().min(lines.len().saturating_sub(1));
+        let line = lines.get(sel).cloned().unwrap_or_default();
+        let text = line.trim_start();
+        if let Some(v) = text.strip_prefix("php.use ") {
+            self.message = format!("php.use {v} requested");
+            self.actions.push(Action::UsePhp(v.to_string()));
+        } else if let Some(n) = text.strip_prefix("web.use ") {
+            self.message = format!("web.use {n} requested");
+            self.actions.push(Action::UseWeb(n.to_string()));
+        } else if let Some(rest) = text.strip_prefix("port ") {
+            if let Some((label, value)) = rest.split_once(" = ") {
+                // a web-server row applies its own pair, others the global one
+                let key = match self.services.get(self.cursor_left).map(|s| s.name.as_str()) {
+                    Some(n)
+                        if [
+                            fine_ill_do_it_myself::orchestrator::CADDY,
+                            fine_ill_do_it_myself::orchestrator::APACHE,
+                            fine_ill_do_it_myself::orchestrator::NGINX,
+                            fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+                        ]
+                        .contains(&n) =>
+                    {
+                        format!("{n}_{label}")
+                    }
+                    _ => label.to_string(),
+                };
+                self.edit = Some(Edit::Port(key));
                 self.input = value.to_string();
                 self.message = "Enter terapkan, Esc batal".into();
             }
-            None => self.message = "no config row under cursor".into(),
         }
     }
 
@@ -444,6 +450,76 @@ pub fn web_mgmt_lines(
     out.push(format!("  port http = {http}"));
     out.push(format!("  port https = {https}"));
     out
+}
+
+/// Title + exact text of the management panel's items for `app`'s current
+/// state. Shared by the renderer and by `App::mgmt_enter` so Enter always
+/// acts on precisely the line that is displayed.
+pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<String>) {
+    let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+    let cur_php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+    let cur_web = fine_ill_do_it_myself::orchestrator::web_server(env);
+    let ports =
+        fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+
+    if let Some(svc) = app.services.get(app.cursor_left) {
+        if svc.name.starts_with("php-") {
+            return (
+                format!(" php versions (current: {cur_php}) "),
+                fine_ill_do_it_myself::orchestrator::installed_php_versions(env)
+                    .into_iter()
+                    .map(|v| {
+                        let mark = if v == cur_php { "▶ " } else { "  " };
+                        format!("{mark}php.use {v}")
+                    })
+                    .collect(),
+            );
+        }
+        if [
+            fine_ill_do_it_myself::orchestrator::CADDY,
+            fine_ill_do_it_myself::orchestrator::APACHE,
+            fine_ill_do_it_myself::orchestrator::NGINX,
+            fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+        ]
+        .contains(&svc.name.as_str())
+        {
+            let ver = fine_ill_do_it_myself::orchestrator::web_version(env, &svc.name);
+            return (
+                format!(" {} management ", svc.name),
+                web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports),
+            );
+        }
+        if svc.name == "mariadb" {
+            return (
+                " ports ".to_string(),
+                vec![
+                    format!("  port http = {}", ports.http),
+                    format!("  port https = {}", ports.https),
+                    format!("  port fpm_base = {}", ports.fpm_base),
+                    format!("  port mariadb = {}", ports.mariadb),
+                ],
+            );
+        }
+    }
+    // no service focused: the global config list
+    (
+        " config (select service) ".to_string(),
+        app.config_rows
+            .iter()
+            .map(|r| match r {
+                ConfigRow::UsePhp(v) => {
+                    let mark = if *v == cur_php { "▶ " } else { "  " };
+                    format!("{mark}php.use {v}")
+                }
+                ConfigRow::UseWeb { name, ver } => {
+                    let mark = if name == &cur_web { "▶ " } else { "  " };
+                    let v = ver.as_deref().unwrap_or("not installed");
+                    format!("{mark}web.use {name}  [{v}]")
+                }
+                ConfigRow::Port { key, value } => format!("  port {key} = {value}"),
+            })
+            .collect(),
+    )
 }
 
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
@@ -600,106 +676,25 @@ pub fn run_tui(
                                 Color::DarkGray
                             })),
                     );
-                f.render_stateful_widget(proj_list, projects, &mut plst);
-
-                // detail panel - only shown when 'd' is pressed
+                f.render_stateful_widget(proj_list, projects, &mut plst); // detail panel - shown when 'd' is pressed; items come from
+                                                                          // mgmt_panel so Enter (mgmt_enter) acts on exactly these lines
                 if let Some(detail_area) = detail_area {
-                    let lock =
-                        fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-                    let cur_php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                    let cur_web = fine_ill_do_it_myself::orchestrator::web_server(env);
-
-                    let mut mgmt_items: Vec<ListItem> = Vec::new();
-                    let mut mgmt_title = " management ".to_string();
+                    let (mgmt_title, lines) = mgmt_panel(env, &app);
                     let mgmt_focus = app.panel_right;
-
-                    // Determine what to show based on cursor position
-                    if app.cursor_left < app.services.len() {
-                        let svc_name = &app.services[app.cursor_left].name;
-
-                        if svc_name.starts_with("php-") {
-                            // Show PHP version management
-                            mgmt_title = format!(" php versions (current: {cur_php}) ");
-                            for v in
-                                fine_ill_do_it_myself::orchestrator::installed_php_versions(env)
-                            {
-                                let mark = if v == cur_php { "▶ " } else { "  " };
-                                mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                    format!("{mark}php.use {v}"),
-                                    Style::default().fg(Color::Yellow),
-                                ))));
-                            }
-                        } else if ["caddy", "httpd", "nginx", "lighttpd"]
-                            .contains(&svc_name.as_str())
-                        {
-                            // Per-server management: this server's action,
-                            // version and ITS OWN ports — not a shared list.
-                            let ver =
-                                fine_ill_do_it_myself::orchestrator::web_version(env, svc_name);
-                            mgmt_title = format!(" {svc_name} management ");
-                            let ports =
-                                fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
-                                    std::env::var(k).ok()
-                                });
-                            for line in web_mgmt_lines(svc_name, &cur_web, ver.as_deref(), &ports) {
-                                let color = if line.starts_with("web.use") {
-                                    Color::Cyan
-                                } else {
-                                    Color::Yellow
-                                };
-                                mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                    line,
-                                    Style::default().fg(color),
-                                ))));
-                            }
-                        } else if svc_name == "mariadb" {
-                            // Show port management
-                            mgmt_title = " ports ".to_string();
-                            let ports =
-                                fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
-                                    std::env::var(k).ok()
-                                });
-                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                format!("  port http = {}", ports.http),
-                                Style::default().fg(Color::Yellow),
-                            ))));
-                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                format!("  port https = {}", ports.https),
-                                Style::default().fg(Color::Yellow),
-                            ))));
-                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                format!("  port fpm_base = {}", ports.fpm_base),
-                                Style::default().fg(Color::Yellow),
-                            ))));
-                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                format!("  port mariadb = {}", ports.mariadb),
-                                Style::default().fg(Color::Yellow),
-                            ))));
-                        }
-                    } else {
-                        // Default: show all config options
-                        mgmt_title = " config (select service) ".to_string();
-                        for r in &app.config_rows {
-                            let txt = match r {
-                                ConfigRow::UsePhp(v) => {
-                                    let mark = if *v == cur_php { "▶ " } else { "  " };
-                                    format!("{mark}php.use {v}")
-                                }
-                                ConfigRow::UseWeb { name, ver } => {
-                                    let mark = if name == &cur_web { "▶ " } else { "  " };
-                                    let v = ver.as_deref().unwrap_or("not installed");
-                                    format!("{mark}web.use {name}  [{v}]")
-                                }
-                                ConfigRow::Port { key, value } => {
-                                    format!("  port {key} = {value}")
-                                }
+                    let mgmt_items: Vec<ListItem> = lines
+                        .iter()
+                        .map(|line| {
+                            let color = if line.starts_with("web.use") {
+                                Color::Cyan
+                            } else {
+                                Color::Yellow
                             };
-                            mgmt_items.push(ListItem::new(Line::from(Span::styled(
-                                txt,
-                                Style::default().fg(Color::Yellow),
-                            ))));
-                        }
-                    }
+                            ListItem::new(Line::from(Span::styled(
+                                line.clone(),
+                                Style::default().fg(color),
+                            )))
+                        })
+                        .collect();
 
                     let mut mlst = ListState::default();
                     if mgmt_focus {
@@ -779,7 +774,17 @@ pub fn run_tui(
         if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = crossterm::event::read() {
                 if k.kind == KeyEventKind::Press {
-                    app.on_key(k.code);
+                    // Enter on the right panel acts on the highlighted
+                    // management line (port editor, web.use, php.use)
+                    if k.code == crossterm::event::KeyCode::Enter
+                        && app.panel_right
+                        && app.detail.is_some()
+                    {
+                        let (_, lines) = mgmt_panel(env, &app);
+                        app.mgmt_enter(&lines);
+                    } else {
+                        app.on_key(k.code);
+                    }
                     while let Some(a) = app.actions.pop() {
                         act(&mut app, &a);
                         refresh(&mut app);
@@ -1164,6 +1169,66 @@ mod tests {
         assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
         assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
         assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");
+    }
+
+    #[test]
+    fn management_enter_opens_port_edit_with_server_specific_key() {
+        let mut a = App::new(vec![svc("nginx", false)], vec![]);
+        a.detail = Some("detail".into());
+        a.panel_right = true;
+        a.cursor_right = 2; // highlighted line: "port http = 8082"
+        let lines = vec![
+            "web.use nginx".to_string(),
+            "  version 1.2".to_string(),
+            "  port http = 8082".to_string(),
+            "  port https = 8445".to_string(),
+        ];
+        a.mgmt_enter(&lines);
+        assert_eq!(a.input, "8082", "edit input prefilled with current value");
+        match &a.edit {
+            Some(Edit::Port(k)) => {
+                assert_eq!(k, "nginx_http", "must use the server-specific toml key")
+            }
+            other => panic!("expected port edit, got {other:?}"),
+        }
+        // apply: editor Enter parses input and queues SetPort
+        a.on_key(KeyCode::Enter);
+        assert!(a.actions.contains(&Action::SetPort {
+            key: "nginx_http".into(),
+            value: 8082
+        }));
+    }
+
+    #[test]
+    fn management_enter_dispatches_web_use_and_php_use() {
+        let mut w = App::new(vec![svc("nginx", false)], vec![]);
+        w.detail = Some("d".into());
+        w.panel_right = true;
+        w.mgmt_enter(&["web.use nginx".to_string()]);
+        assert_eq!(w.actions.first(), Some(&Action::UseWeb("nginx".into())));
+
+        let mut p = App::new(vec![svc("php-8.4", false)], vec![]);
+        p.detail = Some("d".into());
+        p.panel_right = true;
+        p.cursor_right = 1;
+        p.mgmt_enter(&["▶ php.use 8.4".to_string(), "  php.use 8.3".to_string()]);
+        assert_eq!(p.actions.first(), Some(&Action::UsePhp("8.3".into())));
+    }
+
+    #[test]
+    fn management_enter_maps_global_ports_outside_web_rows() {
+        let mut a = App::new(vec![svc("mariadb", false)], vec![]);
+        a.detail = Some("d".into());
+        a.panel_right = true;
+        a.cursor_right = 0; // "port http = 80"
+        a.mgmt_enter(&[
+            "  port http = 80".to_string(),
+            "  port https = 443".to_string(),
+        ]);
+        match &a.edit {
+            Some(Edit::Port(k)) => assert_eq!(k, "http", "mariadb row shows the global pair"),
+            other => panic!("expected port edit, got {other:?}"),
+        }
     }
 
     #[test]
