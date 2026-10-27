@@ -91,7 +91,7 @@ pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
     cli.env.ensure_dirs()?;
     let manifest = load_or_default_manifest(cli)?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
-    let fetcher = fine_ill_do_it_myself::installer::HttpFetcher;
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
     let out =
         fine_ill_do_it_myself::installer::install(&cli.env, &manifest, &mut lock, name, &fetcher)?;
     Ok(out)

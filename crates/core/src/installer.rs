@@ -1,7 +1,8 @@
 //! Install binaries from the manifest: fetch, verify checksum, extract,
 //! chmod, record into lock.toml. The `Fetcher` trait keeps this testable
-//! offline (HTTP impl uses reqwest blocking).
+//! offline (default impl uses system curl).
 use std::path::Path;
+use std::process::Command;
 use std::{fs, io, path::PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -15,18 +16,23 @@ pub trait Fetcher: Send + Sync {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct HttpFetcher;
+pub struct CurlFetcher;
 
-impl Fetcher for HttpFetcher {
+impl Fetcher for CurlFetcher {
     fn fetch(&self, url: &str) -> Result<Vec<u8>> {
-        let bytes = reqwest::blocking::Client::new()
-            .get(url)
-            .send()?
-            .error_for_status()?
-            .bytes()?;
-        Ok(bytes.to_vec())
+        let out = Command::new("curl")
+            .args(["-fsSL", "--", url])
+            .output()
+            .map_err(|e| Error::Other(format!("curl exec failed: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::Other(format!("curl failed: {stderr}")));
+        }
+        Ok(out.stdout)
     }
 }
+
+pub type HttpFetcher = CurlFetcher;
 
 /// Downloaded tarball contents may contain either a single binary or several
 /// files (caddy ships just the binary plus licenses). When `files` is given
@@ -480,5 +486,23 @@ files = ["bin/node:node/node-20", "bin/npm:node/npm-20"]
         let bin_npm = env.paths.bin().join("node/npm-20");
         assert!(bin_node.exists(), "bin/node/node-20 symlink should exist");
         assert!(bin_npm.exists(), "bin/node/npm-20 symlink should exist");
+    }
+
+    #[test]
+    fn curl_fetcher_fetches_file_url() {
+        let t = tempfile::tempdir().unwrap();
+        let sample = t.path().join("sample.txt");
+        fs::write(&sample, b"hello from curl").unwrap();
+        let url = format!("file://{}", sample.to_str().unwrap());
+        let fetcher = CurlFetcher;
+        let data = fetcher.fetch(&url).unwrap();
+        assert_eq!(data, b"hello from curl");
+    }
+
+    #[test]
+    fn curl_fetcher_fails_on_nonexistent() {
+        let fetcher = CurlFetcher;
+        let res = fetcher.fetch("file:///nonexistent/path/that/does/not/exist");
+        assert!(res.is_err());
     }
 }

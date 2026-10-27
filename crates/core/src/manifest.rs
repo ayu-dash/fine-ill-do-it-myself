@@ -108,11 +108,15 @@ impl Downloader {
     /// Blocking repository download with (optional) checksum verification.
     pub fn download(&self, src: &BinarySource, dest: &Path) -> Result<(), super::error::Error> {
         use sha2::{Digest, Sha256};
-        let url = reqwest::blocking::Client::new()
-            .get(&src.url)
-            .send()?
-            .error_for_status()?;
-        let body = url.bytes()?;
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", "--", &src.url])
+            .output()
+            .map_err(|e| super::error::Error::Other(format!("curl exec failed: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(super::error::Error::Other(format!("curl failed: {stderr}")));
+        }
+        let body = out.stdout;
         let hash = Sha256::digest(&body);
         let hex = format!("{:x}", hash);
         if !src.sha256.is_empty() && src.sha256 != hex {
