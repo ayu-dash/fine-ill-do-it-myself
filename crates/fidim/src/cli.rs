@@ -154,9 +154,20 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     lock.php_default = Some(version.into());
     lock.save(&cli.env.lock_path())?;
 
+    let ini_path = cli.env.php_ini_path(version);
+    if let Some(parent) = ini_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !ini_path.exists() {
+        let _ = std::fs::write(
+            &ini_path,
+            fine_ill_do_it_myself::php::fpm::generate_php_ini(&[]),
+        );
+    }
+
     let php_dir = cli.env.paths.bin().join("php");
     if php_dir.is_dir() {
-        // Update bin/php/php and bin/php/php-fpm symlinks (used by services)
+        // Update bin/php/php, bin/php/php-fpm, and bin/php/php.ini symlinks (used by CLI and services)
         let src_cli = php_dir.join(format!("php-{version}"));
         let src_fpm = php_dir.join(format!("php-fpm-{version}"));
         #[cfg(unix)]
@@ -166,6 +177,9 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
             }
             if src_fpm.exists() {
                 relink(&src_fpm, &php_dir.join("php-fpm"));
+            }
+            if ini_path.exists() {
+                relink(&ini_path, &php_dir.join("php.ini"));
             }
         }
 
@@ -190,6 +204,22 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
         fine_ill_do_it_myself::PortPlan::resolve(&cli.env.paths.etc(), |k| std::env::var(k).ok());
     let _ = fine_ill_do_it_myself::orchestrator::generate_configs(&cli.env, &ports, version);
     Ok(())
+}
+
+/// Return the path to the php.ini configuration file for the given or default PHP version.
+pub fn php_ini(cli: &CliEnv, version: Option<&str>) -> Result<std::path::PathBuf> {
+    let ver = match version {
+        Some(v) => v.to_string(),
+        None => {
+            let lock = Lock::load(&cli.env.lock_path()).unwrap_or_default();
+            fine_ill_do_it_myself::orchestrator::default_php(&lock)
+        }
+    };
+    let ini = cli.env.php_ini_path(&ver);
+    if !ini.exists() {
+        let _ = std::fs::write(&ini, fine_ill_do_it_myself::php::fpm::generate_php_ini(&[]));
+    }
+    Ok(ini)
 }
 
 /// Set one port key in `etc/ports.toml`. Common keys (http, https, fpm_base,
@@ -271,6 +301,7 @@ pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
     );
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-fpm-{version}")));
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-{version}")));
+    let _ = std::fs::remove_dir_all(cli.env.php_etc_dir(version));
     Ok(())
 }
 

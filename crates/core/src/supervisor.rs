@@ -66,8 +66,14 @@ impl Env {
     pub fn caddy_log(&self) -> PathBuf {
         self.paths.logs().join("caddy.log")
     }
+    pub fn php_etc_dir(&self, version: &str) -> PathBuf {
+        self.paths.etc().join("php").join(version)
+    }
     pub fn fpm_conf_path(&self, version: &str) -> PathBuf {
-        self.paths.etc().join(format!("php-{version}-fpm.conf"))
+        self.php_etc_dir(version).join("fpm.conf")
+    }
+    pub fn php_ini_path(&self, version: &str) -> PathBuf {
+        self.php_etc_dir(version).join("php.ini")
     }
     pub fn fpm_bin(&self, version: &str) -> PathBuf {
         let nested = self

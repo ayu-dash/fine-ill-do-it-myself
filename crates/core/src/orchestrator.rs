@@ -212,6 +212,8 @@ pub fn generate_web_configs(
         }
     }
     let _ = certs_pair;
+    let php_etc = env.php_etc_dir(php_version);
+    std::fs::create_dir_all(&php_etc)?;
     std::fs::write(
         env.fpm_conf_path(php_version),
         generate_fpm_conf(
@@ -229,6 +231,10 @@ pub fn generate_web_configs(
             &env.paths.logs().join("php-slow.log").display().to_string(),
         )?,
     )?;
+    let ini_path = env.php_ini_path(php_version);
+    if !ini_path.exists() {
+        let _ = std::fs::write(&ini_path, crate::php::fpm::generate_php_ini(&[]));
+    }
     Ok(())
 }
 
@@ -829,6 +835,9 @@ mod tests {
         assert!(std::fs::read_to_string(env.fpm_conf_path(php_version))
             .unwrap()
             .contains("listen = 127.0.0.1:9004"));
+        assert!(env.php_ini_path(php_version).exists());
+        let ini = std::fs::read_to_string(env.php_ini_path(php_version)).unwrap();
+        assert!(ini.contains("memory_limit = 512M"));
     }
 
     #[test]
@@ -1100,14 +1109,20 @@ fn service_cmds(env: &Env, ports: &PortPlan, php_version: &str) -> Result<Vec<Cm
             "php {php_version} not installed (fidim install php-fpm-{php_version}              or drop an extracted build into data/php/{php_version})"
         ))
     })?;
+    let mut fpm_args = vec![
+        "-F".to_string(),
+        "-y".to_string(),
+        env.fpm_conf_path(php_version).display().to_string(),
+    ];
+    let ini_path = env.php_ini_path(php_version);
+    if ini_path.exists() {
+        fpm_args.push("-c".to_string());
+        fpm_args.push(ini_path.display().to_string());
+    }
     cmds.push((
         format!("php-{php_version}"),
         php_bin.display().to_string(),
-        vec![
-            "-F".to_string(),
-            "-y".to_string(),
-            env.fpm_conf_path(php_version).display().to_string(),
-        ],
+        fpm_args,
         env.paths.logs().join(format!("php-{php_version}.log")),
     ));
     // mariadb (system binary) when available

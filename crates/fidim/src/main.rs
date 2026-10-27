@@ -88,6 +88,10 @@ enum PhpCommands {
     Remove {
         version: String,
     },
+    /// Show the path to the php.ini configuration file
+    Ini {
+        version: Option<String>,
+    },
 }
 
 fn resolve(cli: &Cli) -> cli::CliEnv {
@@ -191,6 +195,10 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             PhpCommands::Remove { version } => {
                 cli::php_remove(&env, &version)?;
                 println!("php {version} removed");
+            }
+            PhpCommands::Ini { version } => {
+                let path = cli::php_ini(&env, version.as_deref())?;
+                println!("{}", path.display());
             }
         },
         Some(Commands::Ports { cmd }) => match cmd {

@@ -1293,53 +1293,12 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             })
         }
         Action::UsePhp(v) => {
-            if fine_ill_do_it_myself::orchestrator::php_binary_for(env, v).is_none() {
-                Err(fine_ill_do_it_myself::Error::PhpNotInstalled(v.clone()))
-            } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
-                lock.php_default = Some(v.clone());
-                let php_dir = env.paths.bin().join("php");
-                if php_dir.is_dir() {
-                    let src_cli = php_dir.join(format!("php-{v}"));
-                    let src_fpm = php_dir.join(format!("php-fpm-{v}"));
-                    #[cfg(unix)]
-                    {
-                        fn relink(src: &std::path::Path, dest: &std::path::Path) {
-                            use std::os::unix::fs::symlink;
-                            let _ = std::fs::remove_file(dest);
-                            let _ = symlink(src, dest);
-                        }
-                        if src_cli.exists() {
-                            relink(&src_cli, &php_dir.join("php"));
-                        }
-                        if src_fpm.exists() {
-                            relink(&src_fpm, &php_dir.join("php-fpm"));
-                        }
-                        // Also update ~/.local/bin/php so `php -v` reflects
-                        // the chosen version immediately in the user's shell.
-                        if let Ok(home) = std::env::var("HOME") {
-                            let local_bin = std::path::PathBuf::from(home).join(".local/bin");
-                            if src_cli.exists() {
-                                relink(&src_cli, &local_bin.join("php"));
-                            }
-                            if src_fpm.exists() {
-                                relink(&src_fpm, &local_bin.join("php-fpm"));
-                            }
-                        }
-                    }
-                }
-                let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
-                    .save(&env.lock_path())
-                    .map_err(|e| e.into())
-                    .and_then(|_| {
-                        fine_ill_do_it_myself::orchestrator::generate_configs(env, &ports, v)
-                    })
-                    .map(|_| vec![]);
-                res
-            } else {
-                Err(fine_ill_do_it_myself::Error::Other(
-                    "failed to load lock".into(),
-                ))
-            }
+            let cli_env = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: v.clone(),
+            };
+            crate::cli::php_use(&cli_env, v).map(|_| vec![])
         }
         Action::UseWeb(name) => {
             if fine_ill_do_it_myself::orchestrator::resolve_web_bin(env, name).is_err() {
