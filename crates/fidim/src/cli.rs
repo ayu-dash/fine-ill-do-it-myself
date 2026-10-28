@@ -390,11 +390,16 @@ pub fn lang_remove(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
     if lang == "php" {
         return php_remove(cli, version);
     }
+    let installed = fine_ill_do_it_myself::lang::installed_lang_versions(&cli.env, lang);
+    if !installed.iter().any(|v| v == version) {
+        return Err(Error::Other(format!("{lang} {version} is not installed")));
+    }
     let mut lock = Lock::load(&cli.env.lock_path())?;
     if let Some(list) = lock.languages.get_mut(lang) {
         list.retain(|v| v != version);
     }
-    if lock.language_defaults.get(lang).map(|s| s.as_str()) == Some(version) {
+    let was_default = lock.language_defaults.get(lang).map(|s| s.as_str()) == Some(version);
+    if was_default {
         lock.language_defaults.remove(lang);
     }
     lock.save(&cli.env.lock_path())?;
@@ -402,7 +407,50 @@ pub fn lang_remove(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
     let lang_dir = cli.env.paths.bin().join(lang);
     let _ = std::fs::remove_file(lang_dir.join(format!("{lang}-{version}")));
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("{lang}-{version}")));
+    // The extracted runtime tree (and a drop-in folder) would otherwise leak
+    // hundreds of megabytes and keep the version listed as installed.
+    let _ = std::fs::remove_dir_all(cli.env.paths.runtimes().join(lang).join(version));
+    let _ = std::fs::remove_dir_all(cli.env.paths.root().join(lang).join(version));
+
+    if was_default {
+        let next = fine_ill_do_it_myself::lang::installed_lang_versions(&cli.env, lang)
+            .into_iter()
+            .find(|v| v != "system");
+        match next {
+            Some(next) => lang_use(cli, lang, &next)?,
+            None => {
+                #[cfg(unix)]
+                remove_lang_links(&lang_dir, lang);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Drop the `bin/<lang>/` entry points so removing the last installed version
+/// never leaves a symlink pointing at a deleted runtime.
+#[cfg(unix)]
+fn remove_lang_links(lang_dir: &std::path::Path, lang: &str) {
+    let mains: &[&str] = match lang {
+        "python" => &["python", "python3"],
+        other => &[other],
+    };
+    let companions: &[&str] = match lang {
+        "node" => &["npm", "npx", "corepack"],
+        "python" => &["pip", "pip3"],
+        "go" => &["gofmt"],
+        "java" => &["javac", "jar"],
+        _ => &[],
+    };
+    for name in mains.iter().chain(companions.iter()) {
+        let path = lang_dir.join(name);
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Set one port key in `etc/ports.toml`. Common keys (http, https, fpm_base,
@@ -531,11 +579,18 @@ fn restart_web_if_running(cli: &CliEnv) -> Result<()> {
 
 /// Uninstall a php version.
 pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
+    if fine_ill_do_it_myself::orchestrator::php_binary_for(&cli.env, version).is_none() {
+        return Err(fine_ill_do_it_myself::Error::PhpNotInstalled(
+            version.into(),
+        ));
+    }
     let mut lock = Lock::load(&cli.env.lock_path())?;
     lock.php.retain(|v| v != version);
-    if lock.php_default.as_deref() == Some(version) {
+    let was_default = lock.php_default.as_deref() == Some(version);
+    if was_default {
         lock.php_default = lock.php.first().cloned();
     }
+    let next = lock.php_default.clone();
     lock.save(&cli.env.lock_path())?;
     let _ = std::fs::remove_file(
         cli.env
@@ -554,6 +609,26 @@ pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-fpm-{version}")));
     let _ = std::fs::remove_file(cli.env.paths.bin().join(format!("php-{version}")));
     let _ = std::fs::remove_dir_all(cli.env.php_etc_dir(version));
+    // Keep bin/php/{php,php-fpm,php.ini} pointing at a version that exists.
+    if was_default {
+        let php_dir = cli.env.paths.bin().join("php");
+        match next {
+            Some(next) => php_use(cli, &next)?,
+            None =>
+            {
+                #[cfg(unix)]
+                for link in ["php", "php-fpm", "php.ini"] {
+                    let path = php_dir.join(link);
+                    let is_link = std::fs::symlink_metadata(&path)
+                        .map(|meta| meta.file_type().is_symlink())
+                        .unwrap_or(false);
+                    if is_link {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -907,6 +982,52 @@ mod tests {
             let got = std::fs::read_link(lang_dir.join(comp)).unwrap();
             assert_eq!(got, rt.join(comp), "{lang} {comp}");
         }
+    }
+
+    #[test]
+    fn lang_remove_deletes_the_runtime_and_relinks_the_remaining_version() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        let lang_dir = cli.env.paths.bin().join("python");
+        std::fs::create_dir_all(&lang_dir).unwrap();
+        for v in ["3.11", "3.12"] {
+            std::fs::write(lang_dir.join(format!("python-{v}")), "").unwrap();
+            std::fs::create_dir_all(cli.env.paths.runtimes().join("python").join(v)).unwrap();
+        }
+        lang_use(&cli, "python", "3.11").unwrap();
+
+        lang_remove(&cli, "python", "3.11").unwrap();
+
+        assert!(
+            !cli.env.paths.runtimes().join("python/3.11").exists(),
+            "the extracted runtime must be removed with the version"
+        );
+        let link = std::fs::read_link(lang_dir.join("python3")).unwrap();
+        assert_eq!(
+            link.file_name().unwrap(),
+            "python-3.12",
+            "the active link must move to a version that still exists"
+        );
+    }
+
+    #[test]
+    fn lang_remove_rejects_a_version_that_is_not_installed() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+
+        let err = lang_remove(&cli, "node", "99").unwrap_err();
+
+        assert!(format!("{err}").contains("not installed"), "{err}");
+    }
+
+    #[test]
+    fn php_remove_rejects_a_version_that_is_not_installed() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+
+        let err = php_remove(&cli, "9.9").unwrap_err();
+
+        assert!(format!("{err}").contains("not installed"), "{err}");
     }
 
     #[test]
