@@ -30,8 +30,12 @@ enum Commands {
     },
     Restart,
     Status,
-    /// Print shell exports so managed clients (mysql, mariadb) work in this terminal
-    Env,
+    /// Print shell exports so managed clients (mysql, mariadb, php) work in this terminal
+    Env {
+        /// Install wrappers into ~/.local/bin (or $FIDIM_SHIM_DIR) instead
+        #[arg(long)]
+        install: bool,
+    },
     /// Manage /etc/hosts entries for .test projects (applies via sudo by default)
     Hosts {
         /// Only print missing entries without modifying /etc/hosts
@@ -191,7 +195,22 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{s}");
             }
         }
-        Some(Commands::Env) => print!("{}", cli::shell_env(&env)),
+        Some(Commands::Env { install }) => {
+            if install {
+                let written = cli::install_shims(&env)?;
+                if written.is_empty() {
+                    println!(
+                        "no managed clients found; run `fidim install mariadb` or `fidim php install <version>` first"
+                    );
+                } else {
+                    for p in written {
+                        println!("{}", p.display());
+                    }
+                }
+            } else {
+                print!("{}", cli::shell_env(&env));
+            }
+        }
         Some(Commands::Hosts { dry_run, sync: _ }) => {
             match cli::hosts_missing(&env) {
                 Ok(entries) => {
@@ -361,6 +380,39 @@ mod tests {
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("export MYSQL_UNIX_PORT='"), "{s}");
         assert!(s.contains("export MYSQL_TCP_PORT=3306"), "{s}");
+    }
+
+    #[test]
+    fn env_install_writes_client_shims() {
+        let data = tempfile::tempdir().unwrap();
+        let shims = tempfile::tempdir().unwrap();
+        let clients = data.path().join("bin/mariadb");
+        std::fs::create_dir_all(&clients).unwrap();
+        for tool in ["mysql", "mariadb"] {
+            std::fs::write(clients.join(tool), "").unwrap();
+        }
+        let php = data.path().join("bin/php");
+        std::fs::create_dir_all(&php).unwrap();
+        std::fs::write(php.join("php"), "").unwrap();
+
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .env("FIDIM_SHIM_DIR", shims.path())
+            .arg("--data-root")
+            .arg(data.path())
+            .args(["env", "--install"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for name in ["mysql", "mariadb", "php"] {
+            assert!(shims.path().join(name).exists(), "{name} shim missing");
+        }
+        let body = std::fs::read_to_string(shims.path().join("mysql")).unwrap();
+        assert!(body.contains("MYSQL_UNIX_PORT='"), "{body}");
     }
 
     #[test]

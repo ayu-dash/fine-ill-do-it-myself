@@ -47,20 +47,21 @@ fidim ports set http 8080   # override ports in etc/ports.toml
 fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim.sock
 ```
 
-**Use `mysql`/`mariadb` straight from your terminal**: add this once to your
-shell rc (`~/.zshrc` or `~/.bashrc`):
+**Use `mysql`/`mariadb`/`php` straight from your terminal** — two options:
 
 ```sh
-eval "$(fidim env)"
+eval "$(fidim env)"     # per shell, inside this data root
+fidim env --install     # everywhere: writes wrappers to ~/.local/bin
 ```
 
-It prepends the managed client dir to `PATH` and points `MYSQL_UNIX_PORT` /
-`MYSQL_TCP_PORT` at this data root, so `mariadb -u root` (or the `mysql` alias)
-talks to the fidim-managed server. One-shot alternative:
+`fidim env` prepends the managed client dirs to `PATH` and points
+`MYSQL_UNIX_PORT`/`MYSQL_TCP_PORT` at this data root, so `mariadb -u root` (or
+the `mysql` alias) talks to the fidim-managed server.
 
-```sh
-eval "$(fidim env)" && mysql -u root
-```
+`fidim env --install` writes tiny `mysql`, `mariadb`, `mysqladmin`, `php`, ...
+wrappers into `~/.local/bin` (override with `$FIDIM_SHIM_DIR`). They point at
+this data root, so they work from any directory; re-run it after moving the
+project. `~/.local/bin` must be on your `PATH`.
 
 **PHP drop-in**: drop an extracted PHP tree (containing `php-fpm`) under
 `~/.local/share/fine-ill-do-it-myself/php/<version>/` and `fidim php list`

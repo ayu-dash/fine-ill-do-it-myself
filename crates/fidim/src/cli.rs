@@ -104,6 +104,25 @@ pub fn shell_env(cli: &CliEnv) -> String {
     fine_ill_do_it_myself::shell::exports(&cli.env, &cli.ports)
 }
 
+/// Where shims go: `$FIDIM_SHIM_DIR`, else `~/.local/bin` (usually on PATH).
+pub fn shim_dir() -> Result<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("FIDIM_SHIM_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| Error::Other("cannot resolve $HOME".into()))?;
+    Ok(std::path::PathBuf::from(home).join(".local/bin"))
+}
+
+/// Write mysql/mariadb/php wrappers so they work from any directory.
+pub fn install_shims(cli: &CliEnv) -> Result<Vec<std::path::PathBuf>> {
+    let shims = fine_ill_do_it_myself::shell::shims(&cli.env, &cli.ports);
+    Ok(fine_ill_do_it_myself::shell::install_shims(
+        &shim_dir()?,
+        &shims,
+    )?)
+}
+
 pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
     cli.env.ensure_dirs()?;
     let manifest = load_or_default_manifest(cli)?;
