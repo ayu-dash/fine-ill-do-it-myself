@@ -152,6 +152,7 @@ pub fn generate_web_configs(
         LIGHTTPD => {
             crate::web::lighttpd::regenerate(
                 &env.paths.etc(),
+                &env.paths.root().join("lighttpd/default"),
                 &env.paths.pids().join("lighttpd.pid").display().to_string(),
                 &env.paths.logs().join("lighttpd.log").display().to_string(),
                 &env.paths
