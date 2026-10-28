@@ -57,8 +57,9 @@ Run `fidim env --install` after selecting a version so `node`, `python3`, `go`,
 fidim start     # caddy + php-fpm (+ mariadb if available)
 fidim status
 fidim projects
-fidim hosts     # prints the missing /etc/hosts lines (needs root to apply)
-fidim           # TUI
+fidim dns status    # is seamless *.test resolution installed?
+fidim dns install   # one-time setup; prints the plan and the sudo commands
+fidim               # TUI
 fidim trust     # prints the root steps to trust the local CA
 fidim web use apache   # pick the web server: caddy (default), apache, nginx, lighttpd
 fidim web show         # print the server currently selected
@@ -87,6 +88,48 @@ server.
 from any directory; re-run it after moving the project or installing a new
 language. `~/.local/bin` must be on your `PATH`.
 
+## Seamless `*.test` resolution
+
+No `/etc/hosts` editing per project. `fidim` ships a wildcard DNS responder: it
+answers every `A` query under `.test` with `127.0.0.1` and everything else with
+NXDOMAIN, so a new folder in `~/Sites` is reachable as `http://<folder>.test`
+the moment it exists.
+
+Install it once (root is used exactly once, and only if you pass `--yes`):
+
+```sh
+fidim dns install        # prints what will change and the exact sudo commands
+fidim dns install --yes  # applies it
+fidim dns status         # drop-in, user unit and service state
+```
+
+What gets written:
+
+- `/etc/systemd/resolved.conf.d/90-fidim.conf` — `DNS=127.0.0.1:15353` plus
+  `Domains=~test`, so **only** `.test` is sent to fidim; every other name keeps
+  using your normal resolver.
+- `~/.config/systemd/user/fidim-dns.service` — a **user** unit running
+  `fidim dns serve --port 15353`. It starts with your session; no system
+  service, no daemon running as root.
+
+Port `15353` is unprivileged and deliberately not mDNS `5353`. Check the
+resolver directly at any time:
+
+```sh
+fidim dns serve --port 15353   # foreground, for debugging
+dig @127.0.0.1 -p 15353 blog.test A +short   # -> 127.0.0.1
+```
+
+Undo everything with `fidim dns uninstall --yes`.
+
+If `systemd-resolved` is not available (or you prefer the old way), fall back to
+`/etc/hosts` entries generated from your projects:
+
+```sh
+fidim hosts            # appends the missing lines via sudo
+fidim hosts --dry-run  # print them, change nothing
+```
+
 **PHP drop-in**: drop an extracted PHP tree (containing `php-fpm`) under
 `~/.local/share/fine-ill-do-it-myself/php/<version>/` and `fidim php list`
 picks it up automatically (`fidim php use <version>` selects it).
@@ -96,9 +139,10 @@ picks it up automatically (`fidim php use <version>` selects it).
 vhost/certificate/hosts generation serves it at
 `https://phpmyadmin.test` (plus the HTTP variant). Its `config.inc.php` points
 at the fidim-managed MariaDB socket and uses the normal login form: user
-`root`, empty password. Run `fidim hosts` once to add the `phpmyadmin.test`
-entry. The symlink is only replaced when it is a fidim symlink, never when a
-real project folder has that name.
+`root`, empty password. With `fidim dns install` it is reachable with no extra
+setup; otherwise add the entry once via `fidim hosts`. The symlink is only
+replaced when it is a fidim symlink, never when a real project folder has that
+name.
 
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
 keys (defaults q/r/s/x/a):
