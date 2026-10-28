@@ -17,12 +17,25 @@ pub const SHIM_TOOLS: &[&str] = &[
     "mariadb-dump",
 ];
 
+/// Managed language binaries that get a shim when they exist under `bin/<lang>/`.
+/// The `<lang>` entry is the symlink updated by `fidim <lang> use <version>`.
+pub const LANGUAGE_SHIMS: &[(&str, &[&str])] = &[
+    ("node", &["node", "npm", "npx", "corepack"]),
+    ("python", &["python", "python3", "pip", "pip3"]),
+    ("go", &["go", "gofmt"]),
+    ("java", &["java", "javac", "jar"]),
+];
+
+/// Directories under `bin/` that are prepended to `PATH`.
+const PATH_DIRS: &[&str] = &["mariadb", "php", "node", "python", "go", "java"];
+
 /// Render `export ...` lines for this data root. Meant to be evaluated:
 /// `eval "$(fidim env)"`.
 pub fn exports(env: &Env, ports: &PortPlan) -> String {
     let mut out = String::new();
     let mut dirs = Vec::new();
-    for dir in [env.paths.bin().join("mariadb"), env.paths.bin().join("php")] {
+    for name in PATH_DIRS {
+        let dir = env.paths.bin().join(name);
         if dir.is_dir() {
             dirs.push(shlex_quote(&dir.display().to_string()));
         }
@@ -58,6 +71,15 @@ pub fn shims(env: &Env, ports: &PortPlan) -> Vec<(String, String)> {
     let php = env.paths.bin().join("php").join("php");
     if php.is_file() {
         out.push(("php".to_string(), shim_script(&php, None)));
+    }
+    for (lang, tools) in LANGUAGE_SHIMS {
+        let dir = env.paths.bin().join(lang);
+        for tool in *tools {
+            let target = dir.join(tool);
+            if target.is_file() {
+                out.push(((*tool).to_string(), shim_script(&target, None)));
+            }
+        }
     }
     out
 }
@@ -185,6 +207,57 @@ mod tests {
         assert!(mysql.contains("exec '"), "{mysql}");
         let php = &shims.iter().find(|(n, _)| n == "php").unwrap().1;
         assert!(!php.contains("MYSQL_UNIX_PORT"), "{php}");
+    }
+
+    #[test]
+    fn exports_include_installed_language_bin_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let env = env_with_root(t.path());
+        for lang in ["node", "python", "go", "java"] {
+            std::fs::create_dir_all(env.paths.bin().join(lang)).unwrap();
+        }
+        let out = exports(&env, &PortPlan::default());
+        for lang in ["node", "python", "go", "java"] {
+            let dir = env.paths.bin().join(lang).display().to_string();
+            assert!(
+                out.contains(&format!("'{dir}'")),
+                "{lang} missing from PATH: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn shims_cover_installed_language_binaries() {
+        let t = tempfile::tempdir().unwrap();
+        let env = env_with_root(t.path());
+        for tool in ["node", "npm", "npx"] {
+            touch(&env.paths.bin().join("node").join(tool));
+        }
+        for tool in ["python", "python3", "pip", "pip3"] {
+            touch(&env.paths.bin().join("python").join(tool));
+        }
+        for tool in ["go", "gofmt"] {
+            touch(&env.paths.bin().join("go").join(tool));
+        }
+        for tool in ["java", "javac", "jar"] {
+            touch(&env.paths.bin().join("java").join(tool));
+        }
+
+        let shims = shims(&env, &PortPlan::default());
+        let names: Vec<&str> = shims.iter().map(|(n, _)| n.as_str()).collect();
+        for tool in [
+            "node", "npm", "npx", "python3", "pip3", "go", "gofmt", "java", "javac", "jar",
+        ] {
+            assert!(names.contains(&tool), "{tool} missing from {names:?}");
+        }
+        assert!(
+            !names.contains(&"corepack"),
+            "missing tool must be skipped: {names:?}"
+        );
+
+        let node = &shims.iter().find(|(n, _)| n == "node").unwrap().1;
+        assert!(node.contains("exec '"), "{node}");
+        assert!(!node.contains("MYSQL_UNIX_PORT"), "{node}");
     }
 
     #[test]

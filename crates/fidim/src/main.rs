@@ -30,7 +30,7 @@ enum Commands {
     },
     Restart,
     Status,
-    /// Print shell exports so managed clients (mysql, mariadb, php) work in this terminal
+    /// Print shell exports so managed clients (mysql, php, node, python, go, java) work here
     Env {
         /// Install wrappers into ~/.local/bin (or $FIDIM_SHIM_DIR) instead
         #[arg(long)]
@@ -394,6 +394,11 @@ mod tests {
         let php = data.path().join("bin/php");
         std::fs::create_dir_all(&php).unwrap();
         std::fs::write(php.join("php"), "").unwrap();
+        let node = data.path().join("bin/node");
+        std::fs::create_dir_all(&node).unwrap();
+        for tool in ["node", "npm", "npx"] {
+            std::fs::write(node.join(tool), "").unwrap();
+        }
 
         let out = Command::cargo_bin("fidim")
             .unwrap()
@@ -408,11 +413,13 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        for name in ["mysql", "mariadb", "php"] {
+        for name in ["mysql", "mariadb", "php", "node", "npm", "npx"] {
             assert!(shims.path().join(name).exists(), "{name} shim missing");
         }
         let body = std::fs::read_to_string(shims.path().join("mysql")).unwrap();
         assert!(body.contains("MYSQL_UNIX_PORT='"), "{body}");
+        let node = std::fs::read_to_string(shims.path().join("node")).unwrap();
+        assert!(!node.contains("MYSQL_UNIX_PORT"), "{node}");
     }
 
     #[test]

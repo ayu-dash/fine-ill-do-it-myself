@@ -311,34 +311,56 @@ pub fn lang_use(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
 
     #[cfg(unix)]
     {
-        relink(&src, &lang_dir.join(lang));
+        // `python` installs expose `python-<version>` but users type `python3`;
+        // link both names to the selected binary.
+        let mains: &[&str] = match lang {
+            "python" => &["python", "python3"],
+            other => &[other],
+        };
+        for name in mains {
+            relink(&src, &lang_dir.join(name));
+        }
 
-        let companions: &[&str] = match lang {
-            "node" => &["npm", "npx", "corepack"],
-            "python" => &["python3", "pip", "pip3"],
-            "go" => &["gofmt"],
-            "java" => &["javac", "jar"],
+        // (link name, source stem). `pip3` shares the `pip-<version>` binary.
+        let companions: &[(&str, &str)] = match lang {
+            "node" => &[("npm", "npm"), ("npx", "npx"), ("corepack", "corepack")],
+            "python" => &[("pip", "pip"), ("pip3", "pip")],
+            "go" => &[("gofmt", "gofmt")],
+            "java" => &[("javac", "javac"), ("jar", "jar")],
             _ => &[],
         };
 
-        for &comp in companions {
+        // Resolve the real runtime bin dir. `src` is usually a symlink in
+        // bin/<lang>/ (e.g. node-24 -> runtimes/node/24/bin/node), so looking
+        // next to the symlink would find the wrong file (or itself).
+        let runtime_bin = src
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+        for &(link_name, source_stem) in companions {
+            let link_dest = lang_dir.join(link_name);
             let mut comp_src = None;
             if clean_version != "system" {
-                let managed_comp = lang_dir.join(format!("{comp}-{clean_version}"));
+                let managed_comp = lang_dir.join(format!("{source_stem}-{clean_version}"));
                 if managed_comp.exists() {
                     comp_src = Some(managed_comp);
                 }
             }
             if comp_src.is_none() {
-                if let Some(parent) = src.parent() {
-                    let beside = parent.join(comp);
-                    if beside.exists() {
-                        comp_src = Some(beside);
+                if let Some(dir) = &runtime_bin {
+                    for name in [source_stem, link_name] {
+                        let beside = dir.join(name);
+                        // never link a name to itself when `src` is not a symlink
+                        if beside.exists() && beside != link_dest {
+                            comp_src = Some(beside);
+                            break;
+                        }
                     }
                 }
             }
             if let Some(comp_path) = comp_src {
-                relink(&comp_path, &lang_dir.join(comp));
+                relink(&comp_path, &link_dest);
             }
         }
     }
@@ -531,6 +553,88 @@ mod tests {
         let text = std::fs::read_to_string(t.path().join("ports.toml")).unwrap();
         assert_eq!(text.matches("caddy_http = ").count(), 1, "{text}");
         assert!(text.contains("caddy_http = 9091"), "{text}");
+    }
+
+    #[test]
+    fn lang_use_python_links_python3_and_pip3_to_selected_version() {
+        use std::os::unix::fs::symlink;
+
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        let lang_dir = cli.env.paths.bin().join("python");
+        std::fs::create_dir_all(&lang_dir).unwrap();
+        for f in ["python-3.13", "pip-3.13"] {
+            std::fs::write(lang_dir.join(f), "").unwrap();
+        }
+        // stale links from a previous setup pointing at the system runtime
+        symlink("/usr/bin/python3", lang_dir.join("python3")).unwrap();
+        symlink("/usr/bin/pip3", lang_dir.join("pip3")).unwrap();
+
+        lang_use(&cli, "python", "3.13").unwrap();
+
+        for (link, want) in [
+            ("python", "python-3.13"),
+            ("python3", "python-3.13"),
+            ("pip", "pip-3.13"),
+            ("pip3", "pip-3.13"),
+        ] {
+            let got = std::fs::read_link(lang_dir.join(link)).unwrap();
+            assert_eq!(
+                got.file_name().unwrap(),
+                want,
+                "{link} -> {}",
+                got.display()
+            );
+        }
+    }
+
+    #[test]
+    fn lang_use_links_node_and_java_companions_from_the_runtime() {
+        use std::os::unix::fs::symlink;
+
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        for (lang, version, tools) in [
+            ("node", "24", &["node", "npm", "npx", "corepack"][..]),
+            ("java", "25", &["java", "javac", "jar"][..]),
+        ] {
+            let rt = cli
+                .env
+                .paths
+                .runtimes()
+                .join(lang)
+                .join(version)
+                .join("bin");
+            std::fs::create_dir_all(&rt).unwrap();
+            for tool in tools {
+                std::fs::write(rt.join(tool), "").unwrap();
+            }
+            let lang_dir = cli.env.paths.bin().join(lang);
+            std::fs::create_dir_all(&lang_dir).unwrap();
+            symlink(
+                rt.join(tools[0]),
+                lang_dir.join(format!("{lang}-{version}")),
+            )
+            .unwrap();
+            // the last tool (corepack/jar) is not in the manifest's versioned files
+            for tool in &tools[1..tools.len() - 1] {
+                symlink(rt.join(tool), lang_dir.join(format!("{tool}-{version}"))).unwrap();
+            }
+
+            lang_use(&cli, lang, version).unwrap();
+
+            let got = std::fs::read_link(lang_dir.join(lang)).unwrap();
+            assert_eq!(
+                got.file_name().unwrap().to_string_lossy(),
+                format!("{lang}-{version}")
+            );
+
+            // corepack/jar are not in the manifest's versioned files, so they
+            // must be resolved from the extracted runtime instead.
+            let comp = if lang == "node" { "corepack" } else { "jar" };
+            let got = std::fs::read_link(lang_dir.join(comp)).unwrap();
+            assert_eq!(got, rt.join(comp), "{lang} {comp}");
+        }
     }
 
     #[test]
