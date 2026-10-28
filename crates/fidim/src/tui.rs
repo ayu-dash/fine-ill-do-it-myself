@@ -712,7 +712,7 @@ impl App {
                 self.edit = Some(Edit::Port(key));
                 self.input = value.to_string();
                 self.edit_dirty = false;
-                self.message = "Enter terapkan, Esc batal".into();
+                self.message = "Enter to apply, Esc to cancel".into();
             }
         }
     }
@@ -1063,9 +1063,9 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
     if app.edit.is_some() {
         return vec![
             ("0-9".to_string(), "port digit"),
-            ("backspace".to_string(), "hapus"),
-            ("enter".to_string(), "terapkan"),
-            ("esc".to_string(), "batal"),
+            ("backspace".to_string(), "delete"),
+            ("enter".to_string(), "apply"),
+            ("esc".to_string(), "cancel"),
         ];
     }
     if app.quick_create.is_some() {

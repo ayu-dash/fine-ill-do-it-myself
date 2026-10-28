@@ -72,10 +72,17 @@ pub fn nginx_server_conf(
 "#
         )
     } else {
+        // Frameworks keep their entry point in public/index.php, so anything
+        // that is not a file must be routed through it; flat projects keep 404.
+        let try_files = if site.is_framework() {
+            "try_files $uri $uri/ /index.php?$query_string;"
+        } else {
+            "try_files $uri $uri/ =404;"
+        };
         format!(
             r#"    root {docroot};
     location / {{
-        try_files $uri $uri/ =404;
+        {try_files}
     }}
 {php_location}"#
         )
@@ -225,6 +232,35 @@ mod tests {
 
         assert!(c.contains("root /Sites/shop/public;"), "{c}");
         assert!(!c.contains("root /Sites/shop;"), "{c}");
+    }
+
+    #[test]
+    fn framework_site_falls_back_to_index_php_for_pretty_urls() {
+        let t = tempfile::tempdir().unwrap();
+        let sites = t.path().join("Sites");
+        std::fs::create_dir_all(sites.join("shop/public")).unwrap();
+        std::fs::write(sites.join("shop/public/index.php"), "<?php").unwrap();
+        let site = crate::site::Site::detect("shop", &sites);
+
+        let c = nginx_server_conf(&site, 9004, 8080, 8443, None).unwrap();
+
+        assert!(
+            c.contains("try_files $uri $uri/ /index.php?$query_string;"),
+            "framework routes must reach index.php\n{c}"
+        );
+    }
+
+    #[test]
+    fn flat_site_keeps_a_404_for_missing_paths() {
+        let t = tempfile::tempdir().unwrap();
+        let sites = t.path().join("Sites");
+        std::fs::create_dir_all(sites.join("blog")).unwrap();
+        let site = crate::site::Site::detect("blog", &sites);
+
+        let c = nginx_server_conf(&site, 9004, 8080, 8443, None).unwrap();
+
+        assert!(c.contains("try_files $uri $uri/ =404;"), "{c}");
+        assert!(!c.contains("/index.php?$query_string"), "{c}");
     }
 
     #[test]

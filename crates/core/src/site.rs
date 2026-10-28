@@ -49,6 +49,16 @@ impl Site {
     pub fn docroot_str(&self) -> String {
         self.docroot.display().to_string()
     }
+
+    /// True when the project keeps its entry point in `public/` (Laravel,
+    /// Symfony). Those apps need a front-controller fallback to `index.php`;
+    /// flat PHP projects must keep returning 404 for missing paths.
+    pub fn is_framework(&self) -> bool {
+        self.docroot
+            .file_name()
+            .is_some_and(|name| name == "public")
+            && self.docroot.join("index.php").is_file()
+    }
 }
 
 #[cfg(test)]
@@ -90,5 +100,21 @@ mod tests {
         let site = Site::detect("docs", &sites);
 
         assert_eq!(site.docroot, sites.join("docs"));
+        assert!(!site.is_framework());
+    }
+
+    #[test]
+    fn public_index_php_is_detected_as_a_framework_site() {
+        let t = tempfile::tempdir().unwrap();
+        let sites = t.path().join("Sites");
+        std::fs::create_dir_all(sites.join("shop/public")).unwrap();
+        std::fs::write(sites.join("shop/public/index.php"), "<?php").unwrap();
+
+        let site = Site::detect("shop", &sites);
+
+        assert!(
+            site.is_framework(),
+            "a public/index.php project needs the index.php fallback"
+        );
     }
 }

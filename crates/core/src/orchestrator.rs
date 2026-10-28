@@ -274,7 +274,7 @@ fn start_all_with<R: Runner + Clone>(
         ports: ports.clone(),
         runner: runner.clone(),
     };
-    regenerate_ghosts(env, ports, php_version)?;
+    regenerate_ghosts(env, ports, php_version, runner)?;
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
     let mut out = Vec::new();
     for (name, bin, args, log) in specs {
@@ -413,14 +413,45 @@ fn start_service_with<R: Runner + Clone>(
 }
 
 /// Replay configs + reap ghost processes that own them (pid files were lost).
-fn regenerate_ghosts(env: &Env, ports: &PortPlan, php_version: &str) -> Result<()> {
+/// Services recorded in a live pid file are never touched: `fidim start` on an
+/// already running stack must not restart it.
+fn regenerate_ghosts<R: Runner>(
+    env: &Env,
+    ports: &PortPlan,
+    php_version: &str,
+    runner: &R,
+) -> Result<()> {
     generate_configs(env, ports, php_version)?;
     let web = web_server(env);
     let conf_needle = web_config_path(env, &web).display().to_string();
     let fpm_needle = env.fpm_conf_path(php_version).display().to_string();
-    let ghosts = reap_owners(&[conf_needle, fpm_needle]);
-    let _ = ghosts;
+    let keep = live_service_pids(env, runner);
+    let _ = reap_owners(&[conf_needle, fpm_needle], &keep);
     Ok(())
+}
+
+/// Pids recorded in a live pid file: services we started that must survive a
+/// config replay.
+fn live_service_pids<R: Runner>(env: &Env, runner: &R) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(env.paths.pids()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(base) = name.strip_suffix(".pid") else {
+            continue;
+        };
+        if base.ends_with(".sock") {
+            continue;
+        }
+        if let Ok(Some(pid)) = crate::proc::read_pid_file(&env.paths.pids(), base) {
+            if runner.is_running(pid) {
+                out.push(pid);
+            }
+        }
+    }
+    out
 }
 
 pub fn server_bin_path(env: &Env, server: &str) -> std::path::PathBuf {
@@ -1284,6 +1315,42 @@ mod tests {
     }
 
     #[test]
+    fn live_service_pids_keeps_only_processes_that_are_still_running() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        let f = FakeRunner::default();
+        let alive = f.spawn(&["x".to_string()]).unwrap();
+        crate::proc::write_pid_file(&env.paths.pids(), "caddy", alive).unwrap();
+        crate::proc::write_pid_file(&env.paths.pids(), "php-8.4", 999).unwrap();
+
+        assert_eq!(live_service_pids(&env, &f), vec![alive]);
+    }
+
+    #[test]
+    fn start_all_is_idempotent_and_never_restarts_running_services() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
+        std::fs::write(env.paths.bin().join("php-fpm-8.4"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        let f = FakeRunner::default();
+
+        start_all(&env, &PortPlan::default(), &f, "8.4").unwrap();
+        let spawned_after_first = f.state.spawned.lock().unwrap().len();
+        start_all(&env, &PortPlan::default(), &f, "8.4").unwrap();
+
+        assert_eq!(
+            f.state.spawned.lock().unwrap().len(),
+            spawned_after_first,
+            "a second start must not spawn the stack again"
+        );
+        assert!(
+            f.state.kill_info.lock().unwrap().is_empty(),
+            "a second start must not kill the running stack"
+        );
+    }
+
+    #[test]
     fn list_projects_finds_directories() {
         let (env, _t) = env();
         std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
@@ -1583,11 +1650,14 @@ mod hosts_tests {
 
 /// Find hostile-orphan pids: processes whose cmdline references one of our
 /// generated config files (so shutdown-less ghosts can be reaped).
-pub fn find_owners(proc_dir: &Path, needles: &[String]) -> Vec<u32> {
+pub fn find_owners(proc_dir: &Path, needles: &[String], skip: &[u32]) -> Vec<u32> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(proc_dir) {
         for e in rd.flatten() {
             if let Ok(n) = e.file_name().to_string_lossy().parse::<u32>() {
+                if skip.contains(&n) {
+                    continue;
+                }
                 if let Ok(c) = std::fs::read_to_string(e.path().join("cmdline")) {
                     if !needles.iter().any(|need| c.contains(need)) {
                         continue;
@@ -1603,9 +1673,9 @@ pub fn find_owners(proc_dir: &Path, needles: &[String]) -> Vec<u32> {
 }
 
 /// Kill (SIGKILL) all ghost processes owning our configs before start.
-pub fn reap_owners(needles: &[String]) -> usize {
+pub fn reap_owners(needles: &[String], skip: &[u32]) -> usize {
     let mut killed = 0;
-    for pid in find_owners(Path::new("/proc"), needles) {
+    for pid in find_owners(Path::new("/proc"), needles, skip) {
         if std::process::Command::new("kill")
             .arg("-9")
             .arg(pid.to_string())
@@ -1639,9 +1709,31 @@ mod owners_tests {
         // pid dir 102: the reaper itself
         std::fs::create_dir(p.join("102")).unwrap();
         std::fs::write(p.join("102/cmdline"), "kill\0-9\0").unwrap();
-        let found = find_owners(p, &["/etc/Caddyfile".to_string()]);
+        let found = find_owners(p, &["/etc/Caddyfile".to_string()], &[]);
         assert_eq!(found, vec![100]);
-        assert!(find_owners(p, &["void-str".to_string()]).is_empty());
+        assert!(find_owners(p, &["void-str".to_string()], &[]).is_empty());
+    }
+
+    #[test]
+    fn find_owners_skips_pids_recorded_in_live_pid_files() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path();
+        for pid in [100, 101] {
+            std::fs::create_dir(p.join(pid.to_string())).unwrap();
+            std::fs::write(
+                p.join(pid.to_string()).join("cmdline"),
+                "caddy\0run\0--config\0/etc/Caddyfile\0",
+            )
+            .unwrap();
+        }
+
+        let found = find_owners(p, &["/etc/Caddyfile".to_string()], &[100]);
+
+        assert_eq!(
+            found,
+            vec![101],
+            "the pid from a live pid file must not be reaped"
+        );
     }
 }
 

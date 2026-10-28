@@ -8,7 +8,11 @@ Caddy + PHP-FPM + (optional system) MariaDB, one folder per project under
 
 - `~/Sites/<name>` folders become `https://<name>.test` vhosts automatically
 - Framework-aware docroot: a project with `public/index.php` (Laravel, Symfony)
-  is served from `public/`; flat PHP projects are served from the folder itself
+  is served from `public/`, and unknown paths reach `index.php` (nginx,
+  lighttpd and Caddy natively, Apache through the project's `.htaccess`);
+  flat PHP projects serve their own folder and keep a real 404
+- Quick create from templates: Laravel, WordPress, PHP, static HTML, blank,
+  Node and Python, optionally with a MariaDB database
 - A local certificate authority (one root, one leaf per project) generated with
   openssl — real TLS, no `tls internal` surprises
 - php-fpm pool + caddy config auto-generated per start
@@ -54,10 +58,15 @@ the active `bin/<lang>/<lang>` symlink. Checksums are pinned in the manifest.
 Run `fidim env --install` after selecting a version so `node`, `python3`, `go`,
 `java`, ... resolve to the managed runtime from any directory.
 
+`fidim <lang> remove <version>` deletes the extracted runtime tree, drops the
+version from `lock.toml` and re-points the active `bin/<lang>/<lang>` link (or
+removes it when no managed version is left). Removing a version that is not
+installed is an error, not a silent no-op.
+
 ## Day to day
 
 ```sh
-fidim start     # caddy + php-fpm (+ mariadb if available)
+fidim start     # caddy + php-fpm (+ mariadb if available); safe to re-run
 fidim status
 fidim projects
 fidim dns status    # is seamless *.test resolution installed?
@@ -68,8 +77,11 @@ fidim web use apache   # pick the web server: caddy (default), apache, nginx, li
 fidim web show         # print the server currently selected
 fidim ports show       # active HTTP/HTTPS/FPM/MariaDB ports
 fidim ports set http 8080   # override ports in etc/ports.toml
-fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim.sock
+fidim daemon &  # socket at <data root>/data/fidim.sock; SIGTERM/SIGINT removes it
 ```
+
+The daemon answers one line per request (`ping`, `status`, `start <service>`,
+`stop <service>`); `status` reports the same services as `fidim status`.
 
 **Use `mysql`/`mariadb`/`php`/`node`/`python`/`go`/`java` straight from your
 terminal** — two options:
@@ -90,6 +102,23 @@ server.
 `fidim <lang> use <version>` selection and point at this data root, so they work
 from any directory; re-run it after moving the project or installing a new
 language. `~/.local/bin` must be on your `PATH`.
+
+## Create a project
+
+```sh
+fidim new blog              # PHP welcome page in ~/Sites/blog
+fidim new html landing      # static index.html
+fidim new laravel shop      # composer create-project
+fidim new wordpress wp      # pinned tarball, sha256 checked
+fidim new node app --db     # Node template plus database `app`
+fidim new --template python api
+```
+
+Templates are `laravel`, `wordpress`, `php`, `html`, `blank`, `node` and
+`python`; a name may only contain `a-z`, `0-9` and `-`. Everything is written to
+a hidden staging folder and renamed into place, so a failed download or a
+missing composer leaves no half project. With `--db`, a failure to create the
+database removes the new project folder again and the command exits non-zero.
 
 ## Seamless `*.test` resolution
 
@@ -226,6 +255,36 @@ crates/fidim           clap CLI + ratatui TUI + unix socket daemon
 
 Everything network/process-dependent lives behind small traits (`Fetcher`,
 `Runner`) so the whole suite runs offline, no daemon needed.
+
+## Third-party binaries and licenses
+
+`fidim` does not ship third-party binaries in its repository or in its release
+tarball. `fidim install <name>` downloads them from the upstream URLs listed in
+`default_manifest.toml`, verifies the pinned sha256, and extracts the license
+files that ship with each archive, so every component stays under its own
+license:
+
+| Component | License |
+|---|---|
+| Caddy | Apache-2.0 |
+| nginx | BSD-2-Clause |
+| Apache httpd | Apache-2.0 |
+| lighttpd | BSD-3-Clause |
+| PHP (static-php-cli builds) | PHP License 3.01 |
+| MariaDB server | GPL-2.0 |
+| MariaDB client libraries | LGPL-2.1 |
+| phpMyAdmin | GPL-2.0-or-later |
+| Composer | MIT |
+| Node.js (npm: Artistic-2.0) | MIT |
+| Python | PSF-2.0 |
+| Go | BSD-3-Clause |
+| Eclipse Temurin JDK | GPL-2.0 with Classpath Exception |
+| WordPress (template only) | GPL-2.0-or-later |
+
+Runtimes fetched by `fidim install phpmyadmin` and `fidim new wordpress` are
+downloaded to your machine, not redistributed by this project. Bundling any of
+them into a release artifact means shipping its license text and, for the GPL
+components, the corresponding source or a written offer.
 
 ## Development
 

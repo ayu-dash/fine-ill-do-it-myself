@@ -123,7 +123,41 @@ mod perfolder_tests {
             generate_caddyfile_for_projects("/x", 9004, &["blog".to_string()], 80, 443).unwrap();
         assert!(out.contains("root * /x/blog"), "{out}");
         assert!(out.contains("blog.test"), "{out}");
+        // a flat project only proxies PHP files that exist (no front controller)
+        assert!(out.contains("php_fastcgi @php 127.0.0.1:9004"), "{out}");
+    }
+
+    #[test]
+    fn flat_site_only_proxies_existing_php_files() {
+        let t = tempfile::tempdir().unwrap();
+        let sites_root = t.path().join("Sites");
+        std::fs::create_dir_all(sites_root.join("blog")).unwrap();
+        let site = crate::site::Site::detect("blog", &sites_root);
+
+        let out =
+            generate_caddyfile_for_sites(&[site], 9004, 8080, 8443, &|_| String::new()).unwrap();
+
+        assert!(out.contains("php_fastcgi @php 127.0.0.1:9004"), "{out}");
+        assert!(out.contains("file {"), "{out}");
+        assert!(
+            !out.contains("php_fastcgi 127.0.0.1:9004"),
+            "a flat PHP site must not fall back to index.php for missing files\n{out}"
+        );
+    }
+
+    #[test]
+    fn framework_site_keeps_the_front_controller_fallback() {
+        let t = tempfile::tempdir().unwrap();
+        let sites_root = t.path().join("Sites");
+        std::fs::create_dir_all(sites_root.join("shop/public")).unwrap();
+        std::fs::write(sites_root.join("shop/public/index.php"), "<?php").unwrap();
+        let site = crate::site::Site::detect("shop", &sites_root);
+
+        let out =
+            generate_caddyfile_for_sites(&[site], 9004, 8080, 8443, &|_| String::new()).unwrap();
+
         assert!(out.contains("php_fastcgi 127.0.0.1:9004"), "{out}");
+        assert!(!out.contains("@php"), "{out}");
     }
 
     #[test]
@@ -200,9 +234,24 @@ pub fn generate_caddyfile_for_sites(
         let tls = tls_line(site);
         let body = if let Some(port) = site.proxy {
             format!("\treverse_proxy 127.0.0.1:{port}\n")
-        } else {
+        } else if site.is_framework() {
+            // Frameworks want every unknown path to reach index.php.
             format!(
                 "\troot * {docroot}\n\tphp_fastcgi 127.0.0.1:{php_fpm_port}\n\tfile_server browse\n"
+            )
+        } else {
+            // Flat PHP projects only proxy .php files that exist, so missing
+            // paths return 404 instead of the index page.
+            format!(
+                "\troot * {docroot}\n\
+                 \t@php {{\n\
+                 \t\tpath *.php /\n\
+                 \t\tfile {{\n\
+                 \t\t\ttry_files {{path}} {{path}}/index.php\n\
+                 \t\t}}\n\
+                 \t}}\n\
+                 \tphp_fastcgi @php 127.0.0.1:{php_fpm_port}\n\
+                 \tfile_server browse\n"
             )
         };
         out.push_str(&format!(

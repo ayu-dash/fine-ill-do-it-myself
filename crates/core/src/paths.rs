@@ -59,10 +59,17 @@ impl Paths {
 /// Find project root by traversing upwards from the current directory,
 /// looking for `.fidim`, `Cargo.toml`, or `.git`.
 pub fn find_project_root() -> Option<PathBuf> {
+    find_project_root_from(&std::env::current_dir().ok()?)
+}
+
+/// [`find_project_root`] from an explicit starting directory. Returns `None`
+/// when no marker is found all the way up, so callers fall back to the XDG
+/// data root instead of inventing `<cwd>/.fidim` in an arbitrary folder.
+pub fn find_project_root_from(start: &std::path::Path) -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("FIDIM_PROJECT_ROOT") {
         return Some(PathBuf::from(explicit));
     }
-    let mut cur = std::env::current_dir().ok()?;
+    let mut cur = start.to_path_buf();
     loop {
         if cur.join(".fidim").is_dir()
             || cur.join("Cargo.toml").is_file()
@@ -74,7 +81,7 @@ pub fn find_project_root() -> Option<PathBuf> {
             break;
         }
     }
-    std::env::current_dir().ok()
+    None
 }
 
 /// Default root: `$XDG_DATA_HOME/fine-ill-do-it-myself` (falls back to
@@ -131,5 +138,29 @@ mod tests {
         let t = temp();
         let root = default_root(t.path().to_path_buf());
         assert!(root.ends_with("fine-ill-do-it-myself"));
+    }
+
+    #[test]
+    fn no_marker_falls_back_instead_of_returning_cwd() {
+        let t = temp();
+        let nested = t.path().join("plain/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            find_project_root_from(&nested),
+            None,
+            "a directory without a project marker must not become a data root"
+        );
+    }
+
+    #[test]
+    fn finds_the_nearest_project_marker_upwards() {
+        let t = temp();
+        let project = t.path().join("proj");
+        let nested = project.join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(project.join(".fidim")).unwrap();
+
+        assert_eq!(find_project_root_from(&nested), Some(project));
     }
 }
