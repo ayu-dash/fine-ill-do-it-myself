@@ -460,6 +460,75 @@ pub fn web_use(cli: &CliEnv, server: &str) -> Result<()> {
     Ok(())
 }
 
+/// A project created by `fidim new` / the TUI quick-create flow.
+#[derive(Debug, Clone)]
+pub struct CreatedProject {
+    pub path: std::path::PathBuf,
+    pub template: fine_ill_do_it_myself::project::Template,
+    /// Database created alongside the project (`--db`).
+    pub database: Option<String>,
+}
+
+/// Create a project, optionally its database, and refresh the vhosts.
+pub fn create_project_with<F, C>(
+    cli: &CliEnv,
+    name: &str,
+    template: fine_ill_do_it_myself::project::Template,
+    with_db: bool,
+    fetcher: &F,
+    runner: &C,
+) -> Result<CreatedProject>
+where
+    F: fine_ill_do_it_myself::installer::Fetcher,
+    C: fine_ill_do_it_myself::proc::CommandRunner,
+{
+    let path = fine_ill_do_it_myself::project::create(&cli.env, name, template, fetcher, runner)?;
+    let database = if with_db {
+        fine_ill_do_it_myself::database::create_database(&cli.env, name, runner)?;
+        Some(name.to_string())
+    } else {
+        None
+    };
+    // Refresh vhosts/certs/hosts so `<name>.test` is live right away.
+    orchestrator::generate_configs(&cli.env, &cli.ports, &cli.php_default)?;
+    Ok(CreatedProject {
+        path,
+        template,
+        database,
+    })
+}
+
+/// `fidim new`: create the project with the real downloader/runner, then
+/// restart the active web server only when it was already running.
+pub fn create_project(
+    cli: &CliEnv,
+    name: &str,
+    template: fine_ill_do_it_myself::project::Template,
+    with_db: bool,
+) -> Result<CreatedProject> {
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
+    let runner = fine_ill_do_it_myself::proc::RealCommandRunner;
+    let made = create_project_with(cli, name, template, with_db, &fetcher, &runner)?;
+    restart_web_if_running(cli)?;
+    Ok(made)
+}
+
+/// New vhosts only take effect after a reload; stop/start the chosen server
+/// when it is up, and stay silent when it is not.
+fn restart_web_if_running(cli: &CliEnv) -> Result<()> {
+    let lock = Lock::load(&cli.env.lock_path()).unwrap_or_default();
+    let web = orchestrator::default_web(&lock);
+    let running = orchestrator::status_all(&cli.env, &cli.ports, &RealRunner)
+        .iter()
+        .any(|s| s.name == web && s.state == fine_ill_do_it_myself::service::ServiceState::Running);
+    if !running {
+        return Ok(());
+    }
+    orchestrator::stop_service(&cli.env, &cli.ports, &RealRunner, &web)?;
+    orchestrator::start_service(&cli.env, &cli.ports, &RealRunner, &cli.php_default, &web)?;
+    Ok(())
+}
+
 /// Uninstall a php version.
 pub fn php_remove(cli: &CliEnv, version: &str) -> Result<()> {
     let mut lock = Lock::load(&cli.env.lock_path())?;
@@ -845,5 +914,134 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let err = port_set(t.path(), "banana", 1).unwrap_err();
         assert!(format!("{err}").contains("unknown port key"), "{err}");
+    }
+
+    #[derive(Default)]
+    struct NoFetcher;
+
+    impl fine_ill_do_it_myself::installer::Fetcher for NoFetcher {
+        fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+            Err(Error::Other(format!("no network in tests: {url}")))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        commands: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl fine_ill_do_it_myself::proc::CommandRunner for RecordingRunner {
+        fn run(&self, cmd: &[String], _envs: &[(String, String)]) -> Result<String> {
+            self.commands.lock().unwrap().push(cmd.to_vec());
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn create_project_scaffolds_and_regenerates_the_vhost() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+
+        let made = create_project_with(
+            &cli,
+            "blog",
+            fine_ill_do_it_myself::project::Template::Php,
+            false,
+            &NoFetcher,
+            &RecordingRunner::default(),
+        )
+        .unwrap();
+
+        assert_eq!(made.path, cli.env.paths.sites().join("blog"));
+        assert!(made.path.join("index.php").is_file());
+        assert_eq!(made.database, None);
+        let caddy = std::fs::read_to_string(cli.env.caddyfile_path()).unwrap();
+        assert!(caddy.contains("blog.test"), "{caddy}");
+    }
+
+    #[test]
+    fn create_project_regenerates_a_reverse_proxy_vhost_for_node() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+
+        create_project_with(
+            &cli,
+            "app",
+            fine_ill_do_it_myself::project::Template::Node,
+            false,
+            &NoFetcher,
+            &RecordingRunner::default(),
+        )
+        .unwrap();
+
+        let caddy = std::fs::read_to_string(cli.env.caddyfile_path()).unwrap();
+        assert!(caddy.contains("reverse_proxy 127.0.0.1:3000"), "{caddy}");
+    }
+
+    #[test]
+    fn create_project_with_db_creates_the_database() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        let client = cli.env.paths.bin().join("mariadb/mariadb");
+        std::fs::create_dir_all(client.parent().unwrap()).unwrap();
+        std::fs::write(&client, "").unwrap();
+        let runner = RecordingRunner::default();
+
+        let made = create_project_with(
+            &cli,
+            "shop",
+            fine_ill_do_it_myself::project::Template::Blank,
+            true,
+            &NoFetcher,
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(made.database.as_deref(), Some("shop"));
+        let commands = runner.commands.lock().unwrap();
+        assert!(
+            commands.iter().any(|cmd| cmd
+                .iter()
+                .any(|a| a.contains("CREATE DATABASE IF NOT EXISTS `shop`"))),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn create_project_without_db_never_touches_mariadb() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        let runner = RecordingRunner::default();
+
+        create_project_with(
+            &cli,
+            "blog",
+            fine_ill_do_it_myself::project::Template::Php,
+            false,
+            &NoFetcher,
+            &runner,
+        )
+        .unwrap();
+
+        assert!(runner.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_project_rejects_an_invalid_name_before_writing_anything() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+
+        let err = create_project_with(
+            &cli,
+            "Bad_Name",
+            fine_ill_do_it_myself::project::Template::Php,
+            false,
+            &NoFetcher,
+            &RecordingRunner::default(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("a-z"), "{err}");
+        assert!(!cli.env.paths.sites().join("Bad_Name").exists());
     }
 }

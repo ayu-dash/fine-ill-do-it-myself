@@ -55,15 +55,36 @@ pub fn nginx_server_conf(
     }}
 "#
     );
+    // A proxy site (Node/Python) has no files to serve and no PHP: every
+    // request goes to the app process on 127.0.0.1:<port>.
+    let body = if let Some(port) = site.proxy {
+        format!(
+            r#"    location / {{
+        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }}
+"#
+        )
+    } else {
+        format!(
+            r#"    root {docroot};
+    location / {{
+        try_files $uri $uri/ =404;
+    }}
+{php_location}"#
+        )
+    };
     let mut out = format!(
         r#"server {{
     listen {http_port};
     server_name {project}.test;
-    root {docroot};
-    location / {{
-        try_files $uri $uri/ =404;
-    }}
-{php_location}}}
+{body}}}
 "#
     );
     if let Some((crt, key)) = cert {
@@ -73,13 +94,9 @@ pub fn nginx_server_conf(
             r#"server {{
     listen {https_port} ssl;
     server_name {project}.test;
-    root {docroot};
     ssl_certificate {crt};
     ssl_certificate_key {key};
-    location / {{
-        try_files $uri $uri/ =404;
-    }}
-{php_location}}}
+{body}}}
 "#
         ));
     }
@@ -211,6 +228,18 @@ mod tests {
     }
 
     #[test]
+    fn proxy_site_reverse_proxies_instead_of_serving_files() {
+        let mut site = site("app", "/Sites/app");
+        site.proxy = Some(3000);
+
+        let c = nginx_server_conf(&site, 9004, 8080, 8443, None).unwrap();
+
+        assert!(c.contains("proxy_pass http://127.0.0.1:3000;"), "{c}");
+        assert!(!c.contains("root /Sites/app;"), "{c}");
+        assert!(!c.contains("fastcgi_pass"), "{c}");
+    }
+
+    #[test]
     fn regenerate_writes_conf_and_includes_and_clears_stale() {
         let t = tempfile::tempdir().unwrap();
         let etc = t.path().join("etc");
@@ -239,6 +268,7 @@ mod tests {
         crate::site::Site {
             name: name.to_string(),
             docroot: std::path::PathBuf::from(docroot),
+            proxy: None,
         }
     }
 }

@@ -7,6 +7,12 @@ pub trait Runner: Send + Sync {
     fn spawn(&self, cmd: &[String]) -> Result<u32, std::io::Error>;
     fn is_running(&self, pid: u32) -> bool;
     fn kill(&self, pid: u32) -> std::result::Result<(), std::io::Error>;
+    /// True when `pid` or one of its descendants owns a listening socket on
+    /// `port`. Fakes default to true so unit tests never touch real sockets;
+    /// the real runner verifies the bind actually happened.
+    fn owns_port(&self, _pid: u32, _port: u16) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,7 +43,19 @@ impl Runner for RealRunner {
         cmd_c.spawn().map(|c| c.id())
     }
     fn is_running(&self, pid: u32) -> bool {
-        std::path::Path::new(format!("/proc/{pid}").as_str()).exists()
+        if !std::path::Path::new(format!("/proc/{pid}").as_str()).exists() {
+            return false;
+        }
+        // An exited child stays in /proc as a zombie until reaped; it is not
+        // a running service (a failed bind leaves exactly this behind).
+        proc_state(pid).map(|s| s != 'Z').unwrap_or(true)
+    }
+    fn owns_port(&self, pid: u32, port: u16) -> bool {
+        let Ok(pids) = listening_pids(port) else {
+            return false;
+        };
+        pids.into_iter()
+            .any(|listener| listener == pid || is_descendant(listener, pid))
     }
     fn kill(&self, pid: u32) -> std::result::Result<(), std::io::Error> {
         // kill the whole process tree: php-fpm/nginx masters respawn children
@@ -54,7 +72,7 @@ impl Runner for RealRunner {
         // grace period: escalate anything left
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while std::time::Instant::now() < deadline {
-            if RealRunner.is_running(pid) && child_pids(pid).is_empty() {
+            if !RealRunner.is_running(pid) {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -71,6 +89,35 @@ impl Runner for RealRunner {
             .output();
         Ok(())
     }
+}
+
+/// Parent pid from `/proc/<pid>/stat` (field 4 after the command name).
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Walk the parent chain: is `pid` the same process as `ancestor` or below it?
+fn is_descendant(pid: u32, ancestor: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+        if current == ancestor {
+            return true;
+        }
+        match parent_pid(current) {
+            Some(parent) if parent > 1 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// State letter from `/proc/<pid>/stat` (`R`, `S`, `Z`, ...).
+fn proc_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().next()?.chars().next()
 }
 
 /// PIDs whose parent is `parent` by reading /proc/<pid>/stat (Linux).
@@ -148,13 +195,23 @@ pub fn listening_pids(port: u16) -> std::result::Result<Vec<u32>, std::io::Error
     Ok(out)
 }
 
-/// Does a NUL-separated `/proc/<pid>/cmdline` buffer contain `arg` verbatim?
-/// Used to distinguish fidim-spawned processes from unrelated ones that happen
-/// to listen on the same port.
+/// Does a NUL-separated `/proc/<pid>/cmdline` buffer contain `arg` verbatim or
+/// as the value of a `--flag=<arg>` argument? The latter is how mariadbd
+/// receives `--defaults-file=<path>`. Used to distinguish fidim-spawned
+/// processes from unrelated ones listening on the same port.
 pub fn cmdline_has(raw: &[u8], arg: &std::ffi::OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let needle = arg.as_bytes();
-    !needle.is_empty() && raw.split(|b| *b == 0).any(|part| part == needle)
+    if needle.is_empty() {
+        return false;
+    }
+    raw.split(|b| *b == 0).any(|part| {
+        part == needle
+            || (part.starts_with(b"--")
+                && part.ends_with(needle)
+                && part.len() > needle.len()
+                && part[part.len() - needle.len() - 1] == b'=')
+    })
 }
 
 /// Read `/proc/<pid>/cmdline` and match one argument; false when unreadable.
@@ -181,9 +238,96 @@ pub fn remove_pid_file(dir: &Path, name: &str) {
     let _ = std::fs::remove_file(dir.join(format!("{name}.pid")));
 }
 
+/// Run a command to completion and capture its output. Composer and the
+/// MariaDB client are synchronous tools, unlike the detached services driven
+/// through [`Runner`]; tests inject a fake so no process is spawned.
+pub trait CommandRunner: Send + Sync {
+    fn run(&self, cmd: &[String], envs: &[(String, String)]) -> crate::error::Result<String>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RealCommandRunner;
+
+impl CommandRunner for RealCommandRunner {
+    fn run(&self, cmd: &[String], envs: &[(String, String)]) -> crate::error::Result<String> {
+        let Some(program) = cmd.first() else {
+            return Err(crate::error::Error::Other("empty command".into()));
+        };
+        let out = std::process::Command::new(program)
+            .args(&cmd[1..])
+            .envs(envs.iter().map(|(k, v)| (k, v)))
+            .output()
+            .map_err(|e| crate::error::Error::Other(format!("run {program}: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            return Err(crate::error::Error::Other(format!(
+                "{program} exited with {}: {detail}",
+                out.status.code().unwrap_or(-1)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_runner_kill_escalates_when_sigterm_is_ignored() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; exec sleep 5")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        RealRunner.kill(pid).unwrap();
+
+        // SIGKILL is delivered asynchronously; give the kernel a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while RealRunner.is_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !RealRunner.is_running(pid),
+            "kill must escalate to SIGKILL when SIGTERM is ignored"
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn real_runner_does_not_report_an_exited_child_as_running() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stat = format!("/proc/{pid}/stat");
+        for _ in 0..50 {
+            if std::fs::read_to_string(&stat)
+                .map(|s| s.contains(") Z "))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !RealRunner.is_running(pid),
+            "a zombie child must not be reported as running"
+        );
+        let _ = child.wait();
+    }
 
     #[test]
     fn pid_file_round_trip() {
@@ -195,13 +339,58 @@ mod tests {
     }
 
     #[test]
-    fn cmdline_matches_only_the_exact_argument() {
+    fn cmdline_matches_the_argument_or_an_equals_flag() {
         use std::ffi::OsStr;
         let ours = b"/opt/mariadb/bin/mariadbd\0--defaults-file\0/app/etc/my.cnf\0";
+        let joined = b"/opt/mariadb/bin/mariadbd\0--defaults-file=/app/etc/my.cnf\0";
         let system = b"/usr/sbin/mysqld\0--defaults-file\0/etc/mysql/my.cnf\0";
         let cnf = OsStr::new("/app/etc/my.cnf");
         assert!(cmdline_has(ours, cnf));
+        assert!(
+            cmdline_has(joined, cnf),
+            "mariadbd receives --defaults-file=<path> as one argument"
+        );
         assert!(!cmdline_has(system, cnf));
         assert!(!cmdline_has(b"", cnf));
+    }
+
+    #[test]
+    fn real_command_runner_returns_stdout() {
+        let out = RealCommandRunner
+            .run(&["/bin/sh".into(), "-c".into(), "printf hello".into()], &[])
+            .unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn real_command_runner_passes_extra_environment() {
+        let out = RealCommandRunner
+            .run(
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf %s \"$FIDIM_TEST_VAR\"".into(),
+                ],
+                &[("FIDIM_TEST_VAR".into(), "works".into())],
+            )
+            .unwrap();
+        assert_eq!(out, "works");
+    }
+
+    #[test]
+    fn real_command_runner_reports_a_non_zero_exit() {
+        let err = RealCommandRunner
+            .run(
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo boom >&2; exit 3".into(),
+                ],
+                &[],
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(msg.contains('3'), "{msg}");
     }
 }

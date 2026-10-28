@@ -3,30 +3,45 @@
 //! entry point in `public/` (Laravel, Symfony) serve that subdirectory so the
 //! application code above it is not reachable over HTTP.
 
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+/// Optional `<site>/.fidim.toml` written by the Node/Python templates.
+#[derive(Debug, Default, Deserialize)]
+struct SiteConfig {
+    proxy_port: Option<u16>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Site {
     pub name: String,
     /// Absolute directory the vhost points at.
     pub docroot: PathBuf,
+    /// When set, the vhost reverse-proxies to this local port instead of
+    /// serving files (Node/Python applications).
+    pub proxy: Option<u16>,
 }
 
 impl Site {
     /// Detect the docroot for `name` under `sites_root`. A `public/index.php`
     /// means the framework layout; anything else is served from the project
-    /// folder itself.
+    /// folder itself. `.fidim.toml` can ask for a reverse proxy.
     pub fn detect(name: &str, sites_root: &Path) -> Self {
         let root = sites_root.join(name);
         let public = root.join("public");
         let docroot = if public.join("index.php").is_file() {
             public
         } else {
-            root
+            root.clone()
         };
+        let proxy = std::fs::read_to_string(root.join(".fidim.toml"))
+            .ok()
+            .and_then(|s| toml::from_str::<SiteConfig>(&s).ok())
+            .and_then(|c| c.proxy_port);
         Self {
             name: name.to_string(),
             docroot,
+            proxy,
         }
     }
 

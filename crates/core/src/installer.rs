@@ -314,6 +314,25 @@ pub fn install<F: Fetcher>(
 }
 
 #[cfg(test)]
+pub mod tests_support {
+    /// Build a small .tar.gz in memory for extraction tests.
+    pub fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut w);
+            for (name, data) in entries {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                tar.append_data(&mut h, name, *data).unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        w.finish().unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

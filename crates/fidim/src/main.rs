@@ -55,6 +55,18 @@ enum Commands {
     /// Run the background daemon exposing a unix socket
     Daemon,
     Projects,
+    /// Create a project under Sites from a template
+    New {
+        /// Project name, or template followed by a project name
+        #[arg(value_name = "NAME_OR_TEMPLATE", num_args = 1..=2)]
+        args: Vec<String>,
+        /// laravel, wordpress, php, html, blank, node or python
+        #[arg(long, short)]
+        template: Option<String>,
+        /// Also create a MariaDB database with the same name
+        #[arg(long)]
+        db: bool,
+    },
     /// Download and install a managed binary (caddy, php-fpm-8.4, ...)
     Install {
         name: String,
@@ -294,6 +306,46 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
         Some(Commands::Projects) => {
             for p in cli::projects(&env)? {
                 println!("{p}: http://{p}.test");
+            }
+        }
+        Some(Commands::New { args, template, db }) => {
+            let (name, template) = match (args.as_slice(), template) {
+                ([name], Some(template)) => (name.clone(), template),
+                ([name], None) => (name.clone(), "php".into()),
+                ([template, name], None) => (name.clone(), template.clone()),
+                ([_, _], Some(_)) => {
+                    return Err(fine_ill_do_it_myself::Error::Other(
+                        "use either `fidim new <name> --template <template>` or `fidim new <template> <name>`, not both".into(),
+                    )
+                    .into());
+                }
+                _ => {
+                    return Err(fine_ill_do_it_myself::Error::Other(
+                        "provide a project name, optionally preceded by a template".into(),
+                    )
+                    .into());
+                }
+            };
+            let template = fine_ill_do_it_myself::project::Template::parse(&template).ok_or_else(
+                || {
+                    fine_ill_do_it_myself::Error::Other(format!(
+                        "unknown template `{template}`; use laravel, wordpress, php, html, blank, node or python"
+                    ))
+                },
+            )?;
+            let made = cli::create_project(&env, &name, template, db)?;
+            println!(
+                "created {name} ({}) at {}",
+                made.template.id(),
+                made.path.display()
+            );
+            println!("{name}: http://{name}.test");
+            if let Some(database) = &made.database {
+                println!("database: {database}");
+            }
+            let next = template.next_step(&name);
+            if !next.is_empty() {
+                println!("next: {next}");
             }
         }
         Some(Commands::Php { cmd }) => match cmd {
@@ -548,6 +600,70 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    }
+
+    #[test]
+    fn new_command_scaffolds_a_php_project_and_prints_its_url() {
+        let t = tempfile::tempdir().unwrap();
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .env("HOME", t.path())
+            .arg("--data-root")
+            .arg(t.path())
+            .args(["new", "blog"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let sites = t.path().join("sites");
+        assert!(sites.join("blog/index.php").is_file());
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("blog"), "{s}");
+        assert!(s.contains("blog.test"), "{s}");
+    }
+
+    #[test]
+    fn new_command_accepts_template_before_project_name() {
+        let t = tempfile::tempdir().unwrap();
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .env("HOME", t.path())
+            .arg("--data-root")
+            .arg(t.path())
+            .args(["new", "html", "landing"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(t.path().join("sites/landing/index.html").is_file());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("created landing (html)"), "{stdout}");
+    }
+
+    #[test]
+    fn new_command_rejects_an_unknown_template() {
+        let t = tempfile::tempdir().unwrap();
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .env("HOME", t.path())
+            .arg("--data-root")
+            .arg(t.path())
+            .args(["new", "blog", "--template", "django"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let s = String::from_utf8_lossy(&out.stderr);
+        assert!(s.contains("unknown template"), "{s}");
+        assert!(
+            s.contains("wordpress"),
+            "must list the valid templates: {s}"
+        );
     }
 }
 mod daemon;
