@@ -27,6 +27,7 @@ pub mod installer;
 pub fn installer_defaults() -> &'static str {
     include_str!("default_manifest.toml")
 }
+pub mod composer;
 pub mod database;
 pub mod dns;
 pub mod editor;

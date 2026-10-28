@@ -62,13 +62,12 @@ fn find_file_in_dir(root: &Path, rel: &str) -> Option<PathBuf> {
 
 pub fn unpack_binary(
     bytes: &[u8],
-    tar_gz: bool,
     files: &[String],
     staging: &Path,
     dest_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     let mut moved = Vec::new();
-    if tar_gz {
+    {
         let gz = flate2::read::GzDecoder::new(bytes);
         let mut archive = tar::Archive::new(gz);
         fs::create_dir_all(staging)?;
@@ -105,25 +104,33 @@ pub fn unpack_binary(
             fs::rename(&found[0], &out)?;
             moved.push(out);
         }
-    } else {
-        fs::create_dir_all(dest_dir)?;
-        if let Some(_parent) = staging.parent() {
-            let out = dest_dir;
-            fs::write(out, bytes)?;
-            moved.push(out.to_path_buf());
-        }
     }
     for p in &moved {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = fs::metadata(p)?.permissions();
-            perm.set_mode(0o755);
-            fs::set_permissions(p, perm)?;
-        }
+        make_executable(p)?;
     }
     let _ = fs::remove_dir_all(staging);
     Ok(moved)
+}
+
+/// Single-file artifact (composer.phar): the fetched bytes are the binary.
+fn write_single_file(bytes: &[u8], dest: &Path) -> Result<Vec<PathBuf>> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dest, bytes)?;
+    make_executable(dest)?;
+    Ok(vec![dest.to_path_buf()])
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(path)?.permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(path, perm)?;
+    }
+    Ok(())
 }
 
 /// Extract a tarball into `dest_dir`, stripping `strip` leading path components.
@@ -291,9 +298,9 @@ pub fn install<F: Fetcher>(
     // Single-binary / selected-files install (Caddy, PHP-FPM, ...)
     let dest = env.paths.bin();
     let targets = if src.tar_gz {
-        unpack_binary(&bytes, true, &src.files, &staging, &dest)?
+        unpack_binary(&bytes, &src.files, &staging, &dest)?
     } else {
-        unpack_binary(&bytes, false, &src.files, &staging, &dest)?
+        write_single_file(&bytes, &dest.join(name))?
     };
     // expose the binary under its manifest name (e.g. php-fpm-8.4)
     if let Some(first) = targets.first() {
@@ -365,6 +372,41 @@ files = []
         assert!(env.caddy_bin().exists());
     }
 
+    /// Single-file artifacts (composer.phar) are not tarballs: the bytes are
+    /// the binary itself, so they must land in `bin/<name>` ready to execute.
+    #[test]
+    fn unpack_single_file_artifact_into_bin() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let manifest: Manifest = toml::from_str(
+            r#"[[binaries]]
+name = "composer"
+version = "2.10.3"
+url = "https://example.test/composer.phar"
+sha256 = ""
+tar_gz = false
+"#,
+        )
+        .unwrap();
+        let payload = b"#!/usr/bin/env php\n<?php echo 'composer';\n";
+        let f = FakeFetcher(payload.to_vec());
+        let mut lock = Lock::default();
+
+        let out = install(&env, &manifest, &mut lock, "composer", &f).unwrap();
+
+        assert_eq!(out, env.paths.bin().join("composer"));
+        assert_eq!(std::fs::read(&out).unwrap(), payload);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "composer must be executable, mode {mode:o}"
+            );
+        }
+    }
+
     #[test]
     fn installer_verifies_recorded_checksum_on_update() {
         let t = tempfile::tempdir().unwrap();
@@ -408,7 +450,7 @@ files = []
             "bin/npx:node/npx-20".to_string(),
         ];
 
-        let moved = unpack_binary(&bytes, true, &files, &staging, &dest).unwrap();
+        let moved = unpack_binary(&bytes, &files, &staging, &dest).unwrap();
         assert_eq!(moved.len(), 3);
         assert!(
             dest.join("node/node-20").exists(),
