@@ -1102,6 +1102,9 @@ fn init_datadir(env: &Env, basedir: &Path, datadir: &Path) -> Result<()> {
         .env("LD_LIBRARY_PATH", library_path)
         .status()?;
     if !status.success() {
+        // A half-written datadir looks initialized to `datadir_missing`, which
+        // would make every later start fail with a confusing server error.
+        let _ = std::fs::remove_dir_all(datadir);
         return Err(Error::Other(
             "MariaDB data directory initialization failed".into(),
         ));
@@ -1174,6 +1177,35 @@ mod mariadb_tests {
         let (bin, basedir) = resolve_mariadb(&env).unwrap();
         assert_eq!(basedir, env.paths.runtimes().join("mariadb/11.4.13"));
         assert_eq!(bin, basedir.join("bin/mariadbd"));
+    }
+
+    #[test]
+    fn failed_init_removes_partial_datadir_before_returning_error() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let basedir = env.paths.runtimes().join("mariadb/11.4.13");
+        std::fs::create_dir_all(basedir.join("bin")).unwrap();
+        std::fs::write(basedir.join("bin/mariadbd"), "fake").unwrap();
+        std::fs::create_dir_all(basedir.join("scripts")).unwrap();
+        let init = basedir.join("scripts/mariadb-install-db");
+        // mimic a failed initializer: it creates the schema dir, then bails out
+        std::fs::write(
+            &init,
+            "#!/bin/sh\nd=\"${2#--datadir=}\"\n/bin/mkdir -p \"$d/mysql\"\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let datadir = env.paths.data().join("mariadb");
+        let err = init_datadir(&env, &basedir, &datadir).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Other(_)), "{err:?}");
+        assert!(
+            datadir_missing(&datadir),
+            "partial datadir must be removed so the next start retries init"
+        );
     }
 }
 
