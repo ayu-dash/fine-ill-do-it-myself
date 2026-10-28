@@ -52,8 +52,8 @@ pub fn start_cmd(bin: &Path, basedir: &Path, cnf: &Path) -> Vec<String> {
     }
     cmd.extend([
         bin.display().to_string(),
-        "--defaults-file".into(),
-        cnf.display().to_string(),
+        // must be one word: `--defaults-file <path>` is silently ignored by mariadbd
+        format!("--defaults-file={}", cnf.display()),
     ]);
     cmd
 }
@@ -102,14 +102,13 @@ mod tests {
     #[test]
     fn start_cmd_references_defaults_file() {
         let t = tempfile::tempdir().unwrap();
-        let cmd = start_cmd(
-            Path::new("/usr/sbin/mariadbd"),
-            t.path(),
-            Path::new("/d/etc/my.cnf"),
-        );
+        let cnf = Path::new("/d/etc/my.cnf");
+        let cmd = start_cmd(Path::new("/usr/sbin/mariadbd"), t.path(), cnf);
         assert_eq!(cmd[0], "/usr/sbin/mariadbd");
-        assert_eq!(cmd[1], "--defaults-file");
-        assert!(cmd[2].contains("my.cnf"));
+        // `--defaults-file` only works as a single `--defaults-file=<path>` word;
+        // splitting it makes mariadbd fall back to its compiled-in datadir.
+        assert_eq!(cmd[1], format!("--defaults-file={}", cnf.display()));
+        assert_eq!(cmd.len(), 2);
     }
 
     #[test]
