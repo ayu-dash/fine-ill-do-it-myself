@@ -1010,6 +1010,15 @@ pub fn mariadb_config(
     Ok(Some(mariadb_start_cmd(&bin, &basedir, cnf_path)))
 }
 
+/// Order MariaDB runtime directory names (`11.4.13`, `9.11.2`, ...) by numeric
+/// version components instead of lexically, so `11.4` beats `9.11`.
+fn version_key(name: &std::ffi::OsStr) -> Vec<u64> {
+    name.to_string_lossy()
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
 /// Resolve a FIDIM-managed MariaDB first, then retain support for system installs.
 fn resolve_mariadb(env: &Env) -> Option<(PathBuf, PathBuf)> {
     let runtime_root = env.paths.runtimes().join("mariadb");
@@ -1018,7 +1027,7 @@ fn resolve_mariadb(env: &Env) -> Option<(PathBuf, PathBuf)> {
             .flatten()
             .filter(|entry| entry.path().is_dir())
             .collect();
-        versions.sort_by_key(|entry| entry.file_name());
+        versions.sort_by_key(|entry| version_key(&entry.file_name()));
         for version in versions.into_iter().rev() {
             let basedir = version.path();
             let managed_bin = basedir.join("bin/mariadbd");
@@ -1148,6 +1157,23 @@ mod mariadb_tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, "binary").unwrap();
         assert_eq!(resolve_mariadb(&env), Some((bin, basedir)));
+    }
+
+    #[test]
+    fn managed_mariadb_prefers_highest_numeric_version() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        for version in ["9.11.2", "11.4.13", "11.4.9"] {
+            let bin = env
+                .paths
+                .runtimes()
+                .join(format!("mariadb/{version}/bin/mariadbd"));
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "binary").unwrap();
+        }
+        let (bin, basedir) = resolve_mariadb(&env).unwrap();
+        assert_eq!(basedir, env.paths.runtimes().join("mariadb/11.4.13"));
+        assert_eq!(bin, basedir.join("bin/mariadbd"));
     }
 }
 
