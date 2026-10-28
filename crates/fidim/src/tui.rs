@@ -117,13 +117,23 @@ pub fn progress_bar(done: u64, total: u64, width: usize) -> String {
     s
 }
 
-/// True when the cursor sits on a service or language row and the key matches the binding.
+/// True when the cursor sits on a service row (not a language runtime) and the
+/// key matches the binding. `node`/`python`/`go`/`java` are runtimes, not
+/// long-running services, so they have nothing to start or stop.
 pub fn cursor_is_service_row(
     app: &App,
     want: crossterm::event::KeyCode,
     recv: crossterm::event::KeyCode,
 ) -> bool {
-    !app.panel_right && app.cursor() < app.services.len() && want == recv
+    !app.panel_right
+        && app.cursor() < app.services.len()
+        && !is_runtime_only(&app.services[app.cursor()].name)
+        && want == recv
+}
+
+/// Language runtimes that are not services: everything except php-fpm.
+fn is_runtime_only(name: &str) -> bool {
+    is_language(name) && !name.starts_with("php")
 }
 
 /// True if a service is a programming language runtime (e.g. php-8.4).
@@ -355,10 +365,29 @@ impl App {
                 }
             }
             KeyCode::Enter => match focused_panel(self) {
-                // services or languages: toggle under cursor (start when stopped, stop when running)
-                "services" | "languages" => {
+                // services: toggle under cursor (start when stopped, stop when running)
+                "services" => {
                     let i = self.cursor();
                     if self.services[i].state == ServiceState::Running {
+                        self.message = "stop requested".into();
+                        self.actions.push(Action::StopService(i));
+                    } else {
+                        self.message = "start requested".into();
+                        self.actions.push(Action::StartService(i));
+                    }
+                }
+                // languages: php-fpm is a service and toggles; the other
+                // runtimes have no process to stop, so Enter opens their
+                // version list instead.
+                "languages" => {
+                    let i = self.cursor();
+                    let name = self.services[i].name.clone();
+                    if is_runtime_only(&name) {
+                        self.detail = Some(format!("detail: {name}"));
+                        self.panel_right = true;
+                        self.cursor_right = 0;
+                        self.message = "select a version, Enter to activate".into();
+                    } else if self.services[i].state == ServiceState::Running {
                         self.message = "stop requested".into();
                         self.actions.push(Action::StopService(i));
                     } else {
@@ -377,6 +406,18 @@ impl App {
                     self.message = "enter not implemented; use compose panel keys".into();
                 }
             },
+            _ if !self.panel_right
+                && self.cursor() < self.services.len()
+                && is_runtime_only(&self.services[self.cursor()].name)
+                && [
+                    self.keybinds.start,
+                    self.keybinds.stop,
+                    self.keybinds.restart,
+                ]
+                .contains(&key) =>
+            {
+                self.message = "runtime selected: Enter opens its versions".into();
+            }
             _ if cursor_is_service_row(self, key, self.keybinds.start) => {
                 self.message = "start requested".into();
                 self.actions.push(Action::StartService(self.cursor()));
@@ -2283,6 +2324,58 @@ mod tests {
         // verify PortPlan::resolve reads it back
         let resolved = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |_| None);
         assert_eq!(resolved.caddy_http, 9090, "resolve must return saved value");
+    }
+
+    #[test]
+    fn enter_on_a_language_runtime_opens_versions_instead_of_toggling_service() {
+        let mut a = App::new(vec![svc("caddy", true), svc("node-24", true)], vec![]);
+        a.cursor_left = 1;
+        assert_eq!(focused_panel(&a), "languages");
+
+        a.on_key(KeyCode::Enter);
+
+        assert!(
+            a.actions.is_empty(),
+            "runtime rows must not start/stop anything: {:?}",
+            a.actions
+        );
+        assert!(a.panel_right, "Enter should focus the version panel");
+        assert!(a.detail.is_some(), "the version panel must be visible");
+    }
+
+    #[test]
+    fn start_stop_restart_keys_ignore_language_runtimes() {
+        let mut a = App::new(vec![svc("caddy", true), svc("python-3.13", true)], vec![]);
+        a.cursor_left = 1;
+
+        a.on_key(KeyCode::Char('s'));
+        a.on_key(KeyCode::Char('x'));
+        a.on_key(KeyCode::Char('r'));
+
+        assert!(
+            a.actions.is_empty(),
+            "runtime rows are not services: {:?}",
+            a.actions
+        );
+    }
+
+    #[test]
+    fn enter_on_php_fpm_row_still_toggles_the_service() {
+        let mut a = App::new(vec![svc("php-8.4", true)], vec![]);
+        assert_eq!(focused_panel(&a), "languages");
+
+        a.on_key(KeyCode::Enter);
+
+        assert_eq!(a.actions, vec![Action::StopService(0)]);
+        assert!(!a.panel_right);
+    }
+
+    #[test]
+    fn enter_on_a_service_row_still_toggles_the_service() {
+        let mut a = App::new(vec![svc("caddy", false)], vec![]);
+        a.on_key(KeyCode::Enter);
+
+        assert_eq!(a.actions, vec![Action::StartService(0)]);
     }
 
     #[test]
