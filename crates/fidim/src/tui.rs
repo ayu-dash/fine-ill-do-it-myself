@@ -28,6 +28,43 @@ pub enum Action {
     OpenEditor(String),
     /// Download/refresh the managed composer.phar.
     InstallComposer,
+    /// Create a new project from the TUI quick-create flow.
+    CreateProject {
+        name: String,
+        template: fine_ill_do_it_myself::project::Template,
+        db: bool,
+    },
+}
+
+/// Focused field of the new-project modal form (`n` opens it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuickCreateField {
+    /// Project name, typed in place.
+    Name,
+    /// Template list, walked with ↑/↓ or j/k.
+    Template,
+    /// MariaDB checkbox, toggled with Space.
+    Database,
+}
+
+impl QuickCreateField {
+    /// Next field on `Tab` (wraps back to the name).
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Template,
+            Self::Template => Self::Database,
+            Self::Database => Self::Name,
+        }
+    }
+
+    /// Previous field on `Shift+Tab` (wraps to the database).
+    fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Database,
+            Self::Template => Self::Name,
+            Self::Database => Self::Template,
+        }
+    }
 }
 
 /// One row of the config panel.
@@ -267,6 +304,17 @@ pub struct App {
     /// Terminal editors cannot run while the TUI owns the screen, so the
     /// action parks the argv here and the event loop hands the screen over.
     pub pending_terminal_editor: Option<Vec<String>>,
+    /// New-project modal state. `None` = closed; `Some(field)` = open with
+    /// that field focused.
+    pub quick_create: Option<QuickCreateField>,
+    /// Project name being typed in the modal.
+    pub name_input: String,
+    /// Index into `Template::ALL` on the template field.
+    pub template_cursor: usize,
+    /// Whether to also create a MariaDB database (`--db`).
+    pub with_db: bool,
+    /// Inline validation message shown inside the modal.
+    pub form_error: Option<String>,
 }
 
 impl App {
@@ -294,6 +342,11 @@ impl App {
             mgmt_lines: Vec::new(),
             editor: None,
             pending_terminal_editor: None,
+            quick_create: None,
+            name_input: String::new(),
+            template_cursor: default_template_index(),
+            with_db: false,
+            form_error: None,
         }
     }
 
@@ -321,9 +374,106 @@ impl App {
             .count()
     }
 
+    /// Open the new-project modal with a fresh name, default template and no
+    /// database, focused on the name field.
+    pub fn begin_quick_create(&mut self) {
+        self.quick_create = Some(QuickCreateField::Name);
+        self.name_input.clear();
+        self.template_cursor = default_template_index();
+        self.with_db = false;
+        self.form_error = None;
+        self.message = "new project: type a name, then Enter".into();
+    }
+
+    fn cancel_quick_create(&mut self) {
+        self.quick_create = None;
+        self.name_input.clear();
+        self.with_db = false;
+        self.form_error = None;
+        self.message = "create cancelled".into();
+    }
+
+    /// Validate the name, then queue the project creation. An invalid name keeps
+    /// the form open on the name field with the reason shown inline.
+    fn submit_quick_create(&mut self) {
+        let name = self.name_input.trim().to_string();
+        if let Err(e) = fine_ill_do_it_myself::project::validate_name(&name) {
+            self.form_error = Some(e.to_string());
+            self.quick_create = Some(QuickCreateField::Name);
+            self.message = format!("invalid name: {e}");
+            return;
+        }
+        let template = fine_ill_do_it_myself::project::Template::ALL[self.template_cursor];
+        self.quick_create = None;
+        self.name_input.clear();
+        self.form_error = None;
+        self.message = format!("creating {name} ({})...", template.label());
+        self.actions.push(Action::CreateProject {
+            name,
+            template,
+            db: self.with_db,
+        });
+        self.with_db = false;
+    }
+
     /// Pure transition for a key event.
     pub fn on_key(&mut self, key: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
+        // The new-project form owns every key while it is open.
+        if let Some(field) = self.quick_create {
+            match key {
+                KeyCode::Esc => {
+                    self.cancel_quick_create();
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.quick_create = Some(field.next());
+                    return;
+                }
+                KeyCode::BackTab => {
+                    self.quick_create = Some(field.prev());
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.submit_quick_create();
+                    return;
+                }
+                _ => {}
+            }
+            match field {
+                QuickCreateField::Name => match key {
+                    KeyCode::Backspace => {
+                        self.name_input.pop();
+                        self.form_error = None;
+                    }
+                    KeyCode::Char(c) if name_char(c) => {
+                        if self.name_input.len() < 63 {
+                            self.name_input.push(c);
+                        }
+                        self.form_error = None;
+                    }
+                    _ => {}
+                },
+                QuickCreateField::Template => match key {
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
+                        self.template_cursor = self.template_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
+                        self.template_cursor = (self.template_cursor + 1)
+                            .min(fine_ill_do_it_myself::project::Template::ALL.len() - 1);
+                    }
+                    KeyCode::Char('d') => self.with_db = !self.with_db,
+                    _ => {}
+                },
+                QuickCreateField::Database => match key {
+                    KeyCode::Char(' ') | KeyCode::Char('d') | KeyCode::Char('x') => {
+                        self.with_db = !self.with_db;
+                    }
+                    _ => {}
+                },
+            }
+            return;
+        }
         // bottom-bar editor captures digits/backspace/enter/esc while active
         if self.edit.is_some() {
             match key {
@@ -369,6 +519,15 @@ impl App {
         }
         if key == self.keybinds.quit {
             self.quit = true;
+            return;
+        }
+        // `n` starts the in-TUI quick-create flow from the projects panel.
+        if key == KeyCode::Char('n')
+            && !self.panel_right
+            && focused_panel(self) == "projects"
+            && self.quick_create.is_none()
+        {
+            self.begin_quick_create();
             return;
         }
         if key == self.keybinds.editor {
@@ -606,6 +765,10 @@ impl App {
                 self.panel_right = false;
                 if let Some(&row) = self.container_rows(other).first() {
                     self.cursor_left = row;
+                } else if other == Container::Projects {
+                    // Keep an explicit focus position even while the projects
+                    // list is empty, so `n` can create its first entry.
+                    self.cursor_left = self.services.len();
                 }
                 self.normalize_left_cursor();
             }
@@ -619,7 +782,11 @@ impl App {
         let available: Vec<Container> = CONTAINERS
             .iter()
             .copied()
-            .filter(|c| *c == Container::Management || !self.container_rows(*c).is_empty())
+            .filter(|c| {
+                *c == Container::Management
+                    || *c == Container::Projects
+                    || !self.container_rows(*c).is_empty()
+            })
             .collect();
         if available.is_empty() {
             return;
@@ -830,7 +997,9 @@ pub fn focused_panel(app: &App) -> &'static str {
             "services"
         } else if cur < non_lang_count + lang_count {
             "languages"
-        } else if cur < non_lang_count + lang_count + app.projects.len() {
+        } else if cur < non_lang_count + lang_count + app.projects.len()
+            || (app.projects.is_empty() && cur == non_lang_count + lang_count)
+        {
             "projects"
         } else {
             "services"
@@ -899,6 +1068,15 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
             ("esc".to_string(), "batal"),
         ];
     }
+    if app.quick_create.is_some() {
+        return vec![
+            ("tab".to_string(), "field"),
+            ("↑/↓".to_string(), "template"),
+            ("space".to_string(), "database"),
+            ("enter".to_string(), "create"),
+            ("esc".to_string(), "cancel"),
+        ];
+    }
     let fixed = [
         (disp(app.keybinds.quit), "quit"),
         ("j".to_string(), "down"),
@@ -912,6 +1090,13 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
         (disp(app.keybinds.restart), "restart"),
         (disp(app.keybinds.restart_all), "all"),
     ];
+    let mut fixed = fixed.to_vec();
+    // The new-project form is only reachable from the projects panel, so the
+    // hint belongs there and nowhere else.
+    if focused_panel(app) == "projects" && app.quick_create.is_none() {
+        // First, so the footer never clips it behind the fixed service keys.
+        fixed.insert(0, ("n".to_string(), "new project"));
+    }
     let mut out: Vec<(String, &'static str)> = Vec::new();
     for (k, l) in fixed {
         if !out.iter().any(|(seen, _)| seen == &k) {
@@ -1103,6 +1288,239 @@ fn composer_row(env: &fine_ill_do_it_myself::Env) -> String {
     } else {
         format!("  composer.install {version}")
     }
+}
+
+/// Template preselected in the modal: a plain PHP page needs no Composer or
+/// network, so the first project always works.
+fn default_template_index() -> usize {
+    fine_ill_do_it_myself::project::Template::ALL
+        .iter()
+        .position(|t| *t == fine_ill_do_it_myself::project::Template::Php)
+        .unwrap_or(0)
+}
+
+/// Characters accepted while typing a project name (DNS label subset).
+fn name_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+}
+
+/// Centered modal rectangle, clamped so it keeps a sane size on small
+/// terminals without ever exceeding the screen.
+fn quick_create_modal(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let width = area.width.saturating_sub(4).min(80);
+    let height = area.height.saturating_sub(2).min(20);
+    ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Draw the new-project modal form: name input, template list, database
+/// checkbox, inline validation and key hints. Extracted from the event loop so
+/// tests can render it on a `TestBackend` without a real terminal.
+pub fn render_quick_create(app: &App, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::layout::{Alignment, Constraint, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph,
+    };
+
+    let Some(field) = app.quick_create else {
+        return;
+    };
+    let modal = quick_create_modal(area);
+    // Hide whatever is behind the form so it reads as one dialog.
+    frame.render_widget(Clear, modal);
+    let outer = Block::default()
+        .title(Span::styled(
+            " New project ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(Alignment::Left)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(modal);
+    frame.render_widget(outer, modal);
+
+    let [name_area, hint_area, template_title_area, templates_area, db_area, error_area, help_area] =
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(7),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+
+    // Name input -------------------------------------------------------
+    let name_focused = field == QuickCreateField::Name;
+    frame.render_widget(
+        Paragraph::new(app.name_input.as_str()).block(
+            Block::default()
+                .title(" Name ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if name_focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })),
+        ),
+        name_area,
+    );
+    if name_focused {
+        let x = name_area.x + 1 + app.name_input.len() as u16;
+        let y = name_area.y + 1;
+        if x < name_area.x + name_area.width.saturating_sub(1) {
+            frame.set_cursor_position((x, y));
+        }
+    }
+    let valid = fine_ill_do_it_myself::project::validate_name(&app.name_input).is_ok();
+    let hint = if app.name_input.is_empty() {
+        Line::from(Span::styled(
+            " a-z, 0-9 and - · the site opens at https://<name>.test",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if valid {
+        Line::from(vec![
+            Span::styled(" → ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("https://{}.test", app.name_input),
+                Style::default().fg(Color::Green),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " a-z, 0-9 and - only",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    frame.render_widget(Paragraph::new(hint), hint_area);
+
+    // Template list ----------------------------------------------------
+    let template_focused = field == QuickCreateField::Template;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " Template",
+                Style::default()
+                    .fg(if template_focused {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ↑/↓ to choose", Style::default().fg(Color::DarkGray)),
+        ])),
+        template_title_area,
+    );
+    let template_items: Vec<ListItem> = quick_create_template_options()
+        .into_iter()
+        .map(|(template, description)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<16}", template.label()),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(description, Style::default().fg(Color::Gray)),
+            ]))
+        })
+        .collect();
+    let mut template_state = ListState::default();
+    template_state.select(Some(app.template_cursor));
+    frame.render_stateful_widget(
+        List::new(template_items)
+            .highlight_symbol(" ▸ ")
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        templates_area,
+        &mut template_state,
+    );
+
+    // Database checkbox -------------------------------------------------
+    let db_focused = field == QuickCreateField::Database;
+    let db_style = if db_focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if app.with_db {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if db_focused { " ▸ " } else { "   " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                if app.with_db { "[x] " } else { "[ ] " },
+                Style::default().fg(if app.with_db {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled("Create a MariaDB database with the same name", db_style),
+        ])),
+        db_area,
+    );
+
+    // Inline error + key hints ------------------------------------------
+    let error = app
+        .form_error
+        .as_ref()
+        .map(|e| {
+            Line::from(Span::styled(
+                format!(" ⚠ {e}"),
+                Style::default().fg(Color::Red),
+            ))
+        })
+        .unwrap_or_default();
+    frame.render_widget(Paragraph::new(error), error_area);
+    frame.render_widget(
+        Paragraph::new(" Tab: field · ↑/↓: template · Space: db · Enter: create · Esc: cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        help_area,
+    );
+}
+
+/// Template choices and concise descriptions shown in the quick-create list.
+fn quick_create_template_options() -> Vec<(fine_ill_do_it_myself::project::Template, &'static str)>
+{
+    use fine_ill_do_it_myself::project::Template;
+
+    Template::ALL
+        .into_iter()
+        .map(|template| {
+            let description = match template {
+                Template::Laravel => "Laravel application · Composer and internet required",
+                Template::Wordpress => "WordPress site · download required",
+                Template::Php => "PHP welcome page · index.php",
+                Template::Html => "Static website · index.html",
+                Template::Blank => "Empty project directory",
+                Template::Node => "Node.js HTTP server · reverse proxy on port 3000",
+                Template::Python => "Python HTTP server · reverse proxy on port 8000",
+            };
+            (template, description)
+        })
+        .collect()
 }
 
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
@@ -1350,16 +1768,24 @@ pub fn run_tui(
                             .min(app.projects.len().saturating_sub(1)),
                     ));
                 }
+                let proj_title = format!(
+                    " projects ({}: ~/Sites){} ",
+                    app.projects.len(),
+                    if proj_focus { " ◀" } else { "" }
+                );
                 let proj_list = List::new(proj_items)
-                    .highlight_symbol(if proj_focus { "▶ " } else { "  " }.to_owned())
+                    .highlight_symbol(
+                        if proj_focus && app.quick_create.is_none() {
+                            "▶ "
+                        } else {
+                            "  "
+                        }
+                        .to_owned(),
+                    )
                     .highlight_style(Style::default().bg(Color::Blue))
                     .block(
                         Block::default()
-                            .title(format!(
-                                " projects ({}: ~/Sites){} ",
-                                app.projects.len(),
-                                if proj_focus { " ◀" } else { "" }
-                            ))
+                            .title(proj_title)
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
                             .border_style(Style::default().fg(if proj_focus {
@@ -1368,8 +1794,12 @@ pub fn run_tui(
                                 Color::DarkGray
                             })),
                     );
-                f.render_stateful_widget(proj_list, projects, &mut plst); // detail panel - shown when 'd' is pressed; items come from
-                                                                          // mgmt_panel so Enter (mgmt_enter) acts on exactly these lines
+                f.render_stateful_widget(proj_list, projects, &mut plst);
+
+                render_quick_create(&app, f, area);
+
+                // detail panel - shown when 'd' is pressed; items come from
+                // mgmt_panel so Enter (mgmt_enter) acts on exactly these lines
                 if let Some(detail_area) = detail_area {
                     let (mgmt_title, lines) = mgmt_panel(env, &app);
                     app.mgmt_line_count = lines.len();
@@ -1801,6 +2231,25 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 })
                 .map(|_| vec![])
         }
+        Action::CreateProject { name, template, db } => {
+            let cli = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: php.clone(),
+            };
+            crate::cli::create_project(&cli, name, *template, *db).map(|made| {
+                app.projects.push(
+                    made.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                app.projects.sort();
+                app.projects.dedup();
+                vec![]
+            })
+        }
     };
     match r {
         Ok(_) => match action {
@@ -1824,11 +2273,15 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 app.message = format!("opening {p} in {editor}");
             }
             Action::InstallComposer => app.message = "composer installed".into(),
+            Action::CreateProject { name, template, .. } => {
+                app.message = format!("created {name} ({})", template.label());
+            }
             _ => app.message = format!("{action:?} ok").to_lowercase(),
         },
         Err(e) => match action {
             Action::OpenEditor(p) => app.message = format!("{p}: {e}"),
             Action::InstallComposer => app.message = format!("composer install: {e}"),
+            Action::CreateProject { name, .. } => app.message = format!("create {name}: {e}"),
             _ => app.message = format!("{action:?}: {e}").to_lowercase(),
         },
     }
@@ -1943,8 +2396,11 @@ mod tests {
     }
 
     #[test]
-    fn tab_skips_containers_without_rows() {
+    fn tab_keeps_empty_projects_panel_available_for_quick_create() {
         let mut a = App::new(vec![svc("caddy", false)], vec![]);
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "projects");
 
         a.on_key(KeyCode::Tab);
         assert_eq!(focused_panel(&a), "management");
@@ -2121,6 +2577,386 @@ mod tests {
         assert_eq!(focused_panel(&a), "projects", "no languages installed");
         a.on_key(KeyCode::BackTab);
         assert_eq!(focused_panel(&a), "services");
+    }
+
+    // ---- quick-create flow -------------------------------------------------
+
+    /// Flatten a ratatui buffer into text, one line per terminal row.
+    fn rendered_text(buf: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn modal_defaults_to_the_offline_php_template() {
+        let mut app = App::new(vec![], vec![]);
+
+        app.begin_quick_create();
+
+        assert_eq!(app.quick_create, Some(QuickCreateField::Name));
+        assert_eq!(
+            fine_ill_do_it_myself::project::Template::ALL[app.template_cursor],
+            fine_ill_do_it_myself::project::Template::Php
+        );
+    }
+
+    #[test]
+    fn footer_hints_name_the_new_project_key_only_on_the_projects_panel() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["blog".into()]);
+        let services = footer_hints(&a);
+        assert!(
+            !services.iter().any(|(key, _)| key == "n"),
+            "services panel must not claim n: {services:?}"
+        );
+
+        a.on_key(KeyCode::Tab); // -> projects (no language rows here)
+        let projects = footer_hints(&a);
+        assert!(
+            projects
+                .iter()
+                .any(|(key, label)| key == "n" && *label == "new project"),
+            "projects panel must offer n: {projects:?}"
+        );
+    }
+
+    #[test]
+    fn new_project_modal_shows_every_field_on_one_screen() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(vec![], vec![]);
+        app.begin_quick_create();
+        app.name_input = "blog".into();
+        app.with_db = true;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        term.draw(|f| {
+            let area = f.area();
+            render_quick_create(&app, f, area);
+        })
+        .unwrap();
+
+        let text = rendered_text(term.backend().buffer());
+        for needle in [
+            "New project",
+            "Name",
+            "blog",
+            "https://blog.test",
+            "Template",
+            "Laravel",
+            "WordPress",
+            "Python",
+            "[x] Create a MariaDB database",
+            "Enter: create",
+            "Esc: cancel",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn template_picker_options_show_all_templates_with_useful_descriptions() {
+        let options = quick_create_template_options();
+
+        assert_eq!(
+            options.len(),
+            fine_ill_do_it_myself::project::Template::ALL.len()
+        );
+        assert!(options
+            .iter()
+            .all(|(_, description)| !description.is_empty()));
+        assert!(options.iter().any(|(template, description)| {
+            *template == fine_ill_do_it_myself::project::Template::Laravel
+                && description.contains("Composer")
+        }));
+        assert!(options.iter().any(|(template, description)| {
+            *template == fine_ill_do_it_myself::project::Template::Node
+                && description.contains("3000")
+        }));
+    }
+
+    #[test]
+    fn n_starts_quick_create_from_projects_panel() {
+        let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        a.on_key(KeyCode::Tab); // -> projects
+        assert_eq!(focused_panel(&a), "projects");
+        a.on_key(KeyCode::Char('n'));
+        assert!(a.quick_create.is_some(), "n must start the flow");
+        assert_eq!(a.quick_create.unwrap(), QuickCreateField::Name);
+        assert!(a.name_input.is_empty());
+    }
+
+    #[test]
+    fn quick_create_can_start_when_no_projects_exist_yet() {
+        let mut a = App::new(vec![svc("caddy", false)], vec![]);
+
+        a.on_key(KeyCode::Tab);
+
+        assert_eq!(focused_panel(&a), "projects");
+        a.on_key(KeyCode::Char('n'));
+        assert_eq!(a.quick_create, Some(QuickCreateField::Name));
+    }
+
+    #[test]
+    fn enter_in_the_name_field_creates_with_the_default_php_template() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "blog".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+
+        a.on_key(KeyCode::Enter);
+
+        assert!(a.quick_create.is_none(), "Enter must submit the form");
+        assert_eq!(
+            a.actions,
+            vec![Action::CreateProject {
+                name: "blog".into(),
+                template: fine_ill_do_it_myself::project::Template::Php,
+                db: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_empty_name_never_queues_a_project() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+
+        a.on_key(KeyCode::Enter);
+        a.on_key(KeyCode::Enter);
+
+        assert!(a.quick_create.is_some(), "the form must stay open");
+        assert!(
+            a.actions.is_empty(),
+            "an empty name must not create anything"
+        );
+    }
+
+    #[test]
+    fn tab_walks_name_template_and_database_fields() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "blog".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+
+        a.on_key(KeyCode::Tab); // template
+        a.on_key(KeyCode::Tab); // database
+        a.on_key(KeyCode::Char(' '));
+
+        assert!(a.with_db, "Space in the database field must tick it");
+        a.on_key(KeyCode::Tab); // back to name
+        a.on_key(KeyCode::Backspace);
+        assert_eq!(a.name_input, "blo", "the name field must be editable again");
+    }
+
+    #[test]
+    fn enter_from_the_database_field_creates_with_the_database() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "shop".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char(' '));
+
+        a.on_key(KeyCode::Enter);
+
+        assert_eq!(
+            a.actions,
+            vec![Action::CreateProject {
+                name: "shop".into(),
+                template: fine_ill_do_it_myself::project::Template::Php,
+                db: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn quick_create_action_creates_project_and_refreshes_the_list() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        let runner = SpawnRecorder::default();
+        let mut app = App::new(vec![], vec![]);
+
+        perform_action(
+            &env,
+            runner,
+            &mut app,
+            &Action::CreateProject {
+                name: "landing".into(),
+                template: fine_ill_do_it_myself::project::Template::Html,
+                db: false,
+            },
+        );
+
+        assert!(env.paths.sites().join("landing/index.html").is_file());
+        assert_eq!(app.projects, vec!["landing"]);
+        assert!(app.message.contains("created landing"), "{}", app.message);
+    }
+
+    #[test]
+    fn n_ignored_outside_projects_panel() {
+        let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        a.on_key(KeyCode::Char('n')); // services panel
+        assert!(a.quick_create.is_none());
+    }
+
+    #[test]
+    fn new_project_form_keeps_name_and_template_together() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab); // into projects
+        a.on_key(KeyCode::Char('n'));
+        for c in "my-site".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.name_input, "my-site");
+        a.on_key(KeyCode::Tab);
+        assert_eq!(a.quick_create, Some(QuickCreateField::Template));
+        assert_eq!(a.name_input, "my-site");
+        assert_eq!(
+            fine_ill_do_it_myself::project::Template::ALL[a.template_cursor],
+            fine_ill_do_it_myself::project::Template::Php,
+            "name and template live in the same form"
+        );
+    }
+
+    #[test]
+    fn project_form_tabs_between_fields_and_keeps_database_selection() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "my-site".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(a.quick_create, Some(QuickCreateField::Template));
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::BackTab);
+        assert_eq!(a.quick_create, Some(QuickCreateField::Name));
+        assert!(a.with_db);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Enter);
+
+        assert_eq!(
+            a.actions,
+            vec![Action::CreateProject {
+                name: "my-site".into(),
+                template: fine_ill_do_it_myself::project::Template::Php,
+                db: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_form_rejects_an_empty_or_invalid_name_and_shows_the_reason() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        a.on_key(KeyCode::Enter);
+        assert!(a.quick_create.is_some(), "empty name keeps the form open");
+        assert!(a.form_error.is_some(), "the reason must be shown inline");
+
+        a.on_key(KeyCode::Char('b'));
+        a.on_key(KeyCode::Char('a'));
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Char('-'));
+        a.on_key(KeyCode::Enter);
+        assert!(a.quick_create.is_some(), "a trailing - keeps the form open");
+        assert!(a.actions.is_empty());
+    }
+
+    #[test]
+    fn esc_cancels_the_form_without_creating_anything() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "my-site".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+        a.on_key(KeyCode::Esc);
+
+        assert!(a.quick_create.is_none());
+        assert!(a.name_input.is_empty());
+        assert!(a.actions.is_empty());
+    }
+    #[test]
+    fn template_field_arrows_move_the_selection_and_enter_creates() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "my-site".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+        a.on_key(KeyCode::Tab); // template field
+        a.on_key(KeyCode::Right);
+        a.on_key(KeyCode::Right);
+        assert_eq!(
+            fine_ill_do_it_myself::project::Template::ALL[a.template_cursor],
+            fine_ill_do_it_myself::project::Template::Blank
+        );
+        a.on_key(KeyCode::Char('d')); // toggle db
+        assert!(a.with_db);
+        a.on_key(KeyCode::Enter);
+        assert!(a.quick_create.is_none());
+        assert_eq!(
+            a.actions,
+            vec![Action::CreateProject {
+                name: "my-site".into(),
+                template: fine_ill_do_it_myself::project::Template::Blank,
+                db: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn template_navigation_clamps_at_both_ends() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+        for c in "my-site".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+        a.on_key(KeyCode::Tab); // template field
+        for _ in 0..10 {
+            a.on_key(KeyCode::Up);
+        }
+        assert_eq!(a.template_cursor, 0, "k never wraps past the top");
+        let last = fine_ill_do_it_myself::project::Template::ALL.len() - 1;
+        for _ in 0..10 {
+            a.on_key(KeyCode::Char('j'));
+        }
+        assert_eq!(a.template_cursor, last, "j clamps at the last template");
+    }
+
+    #[test]
+    fn jk_type_into_the_name_instead_of_moving_the_template() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["x".into()]);
+        a.on_key(KeyCode::Tab);
+        a.on_key(KeyCode::Char('n'));
+
+        for c in "jak".chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+
+        assert_eq!(a.name_input, "jak");
+        assert_eq!(
+            fine_ill_do_it_myself::project::Template::ALL[a.template_cursor],
+            fine_ill_do_it_myself::project::Template::Php
+        );
     }
 
     #[test]

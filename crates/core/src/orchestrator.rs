@@ -290,6 +290,7 @@ fn start_all_with<R: Runner + Clone>(
         let wrapped = with_log_append(&full, &log)?;
         let pid = sup.runner.spawn(&wrapped)?;
         sup.write_pid(&name, pid)?;
+        ensure_started(&sup, &name, pid, &log, service_port(&name, ports))?;
         out.push(sup.status(&name));
     }
     Ok(out)
@@ -336,9 +337,11 @@ fn start_service_with<R: Runner + Clone>(
         let datadir = env.paths.data().join("mariadb");
         let cmd = mariadb_config(env, &cnf, &datadir, &env.paths.pids(), ports.mariadb)?
             .ok_or_else(|| Error::Other("MariaDB binary was not resolved".into()))?;
-        let wrapped = with_log_append(&cmd, &env.paths.logs().join("mariadb.log"))?;
+        let log = env.paths.logs().join("mariadb.log");
+        let wrapped = with_log_append(&cmd, &log)?;
         let pid = sup.runner.spawn(&wrapped)?;
         sup.write_pid(MARIADB, pid)?;
+        ensure_started(&sup, MARIADB, pid, &log, Some(ports.mariadb))?;
         return Ok(sup.status(MARIADB));
     }
     generate_configs(env, ports, php_version)?;
@@ -380,6 +383,7 @@ fn start_service_with<R: Runner + Clone>(
     let wrapped = with_log_append(&full, &log)?;
     let pid = sup.runner.spawn(&wrapped)?;
     sup.write_pid(&name, pid)?;
+    ensure_started(&sup, &name, pid, &log, service_port(&name, ports))?;
 
     // If starting a web server, ensure php-fpm is also running so PHP requests succeed
     if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str()) {
@@ -396,6 +400,7 @@ fn start_service_with<R: Runner + Clone>(
                         if let Ok(pwrapped) = with_log_append(&pfull, &plog) {
                             if let Ok(ppid) = sup.runner.spawn(&pwrapped) {
                                 let _ = sup.write_pid(&php_service, ppid);
+                                ensure_started(&sup, &php_service, ppid, &plog, Some(fpm_port))?;
                             }
                         }
                     }
@@ -597,6 +602,95 @@ pub fn web_args(env: &Env, web: &str) -> Vec<String> {
         ],
         _ => vec!["run".into(), "--config".into(), conf],
     }
+}
+
+/// How long a freshly spawned service must stay alive before it is treated as
+/// started. A bind failure exits within a few milliseconds.
+const STARTUP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+const STARTUP_ALIVE_POLLS: usize = 10;
+/// Upper bound for the port actually appearing (servers fork workers first).
+const STARTUP_PORT_POLLS: usize = 60;
+/// MariaDB runs InnoDB recovery before it binds, which can take several
+/// seconds right after a restart.
+const STARTUP_PORT_POLLS_DB: usize = 750;
+
+/// A service that exits (or never binds its port) right after spawn would
+/// otherwise show as "Running" while serving nothing. Report it, clean up the
+/// pid file and point at the port setting.
+fn ensure_started<R: Runner>(
+    sup: &Supervisor<R>,
+    name: &str,
+    pid: u32,
+    log: &Path,
+    port: Option<u16>,
+) -> Result<()> {
+    let mut polls = 0;
+    loop {
+        std::thread::sleep(STARTUP_POLL);
+        polls += 1;
+        if !sup.runner.is_running(pid) {
+            crate::proc::remove_pid_file(&sup.env.paths.pids(), name);
+            return Err(start_error(
+                name,
+                log,
+                "exited right after start; its port may already be in use",
+            ));
+        }
+        match port {
+            Some(p) if sup.runner.owns_port(pid, p) => return Ok(()),
+            Some(_) => {}
+            None if polls >= STARTUP_ALIVE_POLLS => return Ok(()),
+            None => {}
+        }
+        let limit = if name == MARIADB {
+            STARTUP_PORT_POLLS_DB
+        } else {
+            STARTUP_PORT_POLLS
+        };
+        if polls >= limit {
+            let _ = sup.runner.kill(pid);
+            crate::proc::remove_pid_file(&sup.env.paths.pids(), name);
+            return Err(start_error(
+                name,
+                log,
+                &format!(
+                    "is running but never listened on port {}; the port may already be in use",
+                    port.unwrap_or_default()
+                ),
+            ));
+        }
+    }
+}
+
+fn start_error(name: &str, log: &Path, reason: &str) -> Error {
+    let detail = last_log_line(log)
+        .map(|line| format!("\nlast line of {}: {line}", log.display()))
+        .unwrap_or_default();
+    Error::Other(format!(
+        "{name} {reason}. Choose another port with `fidim ports set <key> <port>`.{detail}"
+    ))
+}
+
+/// The TCP port a service must own once started.
+fn service_port(name: &str, ports: &PortPlan) -> Option<u16> {
+    if name == MARIADB {
+        Some(ports.mariadb)
+    } else if let Some(version) = name.strip_prefix("php-") {
+        Some(fpm_port_for(version, ports.fpm_base, ports))
+    } else if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name) {
+        Some(ports.web_ports(name).0)
+    } else {
+        None
+    }
+}
+
+fn last_log_line(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
 }
 
 /// Fail early with a helpful message and alternative port when something
@@ -835,6 +929,93 @@ mod tests {
     fn env() -> (Env, tempfile::TempDir) {
         let t = tempfile::tempdir().unwrap();
         (Env::new(t.path().join("app"), t.path().join("Sites")), t)
+    }
+
+    /// Spawn "succeeds" but the process is gone right away, as when a server
+    /// cannot bind its port.
+    #[derive(Clone, Default)]
+    struct DyingRunner;
+
+    impl Runner for DyingRunner {
+        fn spawn(&self, _cmd: &[String]) -> std::result::Result<u32, std::io::Error> {
+            Ok(4242)
+        }
+        fn is_running(&self, _pid: u32) -> bool {
+            false
+        }
+        fn kill(&self, _pid: u32) -> std::result::Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    /// Spawn stays alive (like an nginx master retrying a failed bind) but the
+    /// port is owned by another process.
+    #[derive(Clone, Default)]
+    struct PortlessRunner;
+
+    impl Runner for PortlessRunner {
+        fn spawn(&self, _cmd: &[String]) -> std::result::Result<u32, std::io::Error> {
+            Ok(4243)
+        }
+        fn is_running(&self, _pid: u32) -> bool {
+            true
+        }
+        fn kill(&self, _pid: u32) -> std::result::Result<(), std::io::Error> {
+            Ok(())
+        }
+        fn owns_port(&self, _pid: u32, _port: u16) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn start_reports_a_service_that_never_binds_and_clears_its_pid() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
+        std::fs::write(env.paths.bin().join("php-fpm-8.4"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+
+        let err = start_all_with(&env, &PortPlan::default(), &PortlessRunner, "8.4", &|_| {
+            Ok(vec![])
+        })
+        .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(msg.contains("listened"), "{msg}");
+        assert!(msg.contains("port"), "{msg}");
+        assert!(
+            !env.paths.pids().join("caddy.pid").exists(),
+            "a service that never bound must not keep a pid file"
+        );
+    }
+
+    #[test]
+    fn start_reports_a_service_that_exits_immediately_and_removes_its_pid() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
+        std::fs::write(env.paths.bin().join("php-fpm-8.4"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+
+        let err = start_all_with(&env, &PortPlan::default(), &DyingRunner, "8.4", &|_| {
+            Ok(vec![])
+        })
+        .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("caddy"),
+            "must name the failing service: {msg}"
+        );
+        assert!(
+            msg.contains("port"),
+            "must point at the occupied port: {msg}"
+        );
+        assert!(
+            !env.paths.pids().join("caddy.pid").exists(),
+            "a dead service must not keep a pid file"
+        );
     }
 
     #[test]

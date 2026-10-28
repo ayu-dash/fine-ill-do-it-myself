@@ -58,6 +58,7 @@ pub fn generate_caddyfile_for_projects(
         .map(|p| crate::site::Site {
             name: p.clone(),
             docroot: std::path::PathBuf::from(format!("{sites_root}/{p}")),
+            proxy: None,
         })
         .collect();
     generate_caddyfile_for_sites(&sites, php_fpm_port, http_port, https_port, &|_| {
@@ -141,15 +142,33 @@ mod perfolder_tests {
     }
 
     #[test]
+    fn proxy_site_uses_reverse_proxy_instead_of_root() {
+        let sites = vec![crate::site::Site {
+            name: "app".into(),
+            docroot: "/x/app".into(),
+            proxy: Some(3000),
+        }];
+
+        let out =
+            generate_caddyfile_for_sites(&sites, 9004, 8080, 8443, &|_| String::new()).unwrap();
+
+        assert!(out.contains("reverse_proxy 127.0.0.1:3000"), "{out}");
+        assert!(!out.contains("root * /x/app"), "{out}");
+        assert!(!out.contains("php_fastcgi"), "{out}");
+    }
+
+    #[test]
     fn per_folder_blocks_use_each_site_docroot() {
         let sites = vec![
             crate::site::Site {
                 name: "blog".into(),
                 docroot: "/x/blog".into(),
+                proxy: None,
             },
             crate::site::Site {
                 name: "shop".into(),
                 docroot: "/x/shop/public".into(),
+                proxy: None,
             },
         ];
 
@@ -179,12 +198,17 @@ pub fn generate_caddyfile_for_sites(
         let esc = site.name.replace('.', "\\.");
         let docroot = site.docroot_str();
         let tls = tls_line(site);
+        let body = if let Some(port) = site.proxy {
+            format!("\treverse_proxy 127.0.0.1:{port}\n")
+        } else {
+            format!(
+                "\troot * {docroot}\n\tphp_fastcgi 127.0.0.1:{php_fpm_port}\n\tfile_server browse\n"
+            )
+        };
         out.push_str(&format!(
-            "https://{esc}.test:{https_port} {{\n{tls}\troot * {docroot}\n\tphp_fastcgi 127.0.0.1:{php_fpm_port}\n\tfile_server browse\n}}\n\n"
+            "https://{esc}.test:{https_port} {{\n{tls}{body}}}\n\n"
         ));
-        out.push_str(&format!(
-            "http://{esc}.test:{http_port} {{\n\troot * {docroot}\n\tphp_fastcgi 127.0.0.1:{php_fpm_port}\n\tfile_server browse\n}}\n\n"
-        ));
+        out.push_str(&format!("http://{esc}.test:{http_port} {{\n{body}}}\n\n"));
     }
     Ok(out)
 }
@@ -198,6 +222,7 @@ mod tls_tests {
         let sites = vec![crate::site::Site {
             name: "blog".into(),
             docroot: "/x/blog".into(),
+            proxy: None,
         }];
         let out = generate_caddyfile_for_sites(&sites, 9004, 8080, 8443, &|s| {
             format!(

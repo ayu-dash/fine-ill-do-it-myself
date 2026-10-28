@@ -25,6 +25,7 @@ LoadModule autoindex_module modules/mod_autoindex.so
 LoadModule mime_module modules/mod_mime.so
 LoadModule rewrite_module modules/mod_rewrite.so
 LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_http_module modules/mod_proxy_http.so
 LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
 LoadModule ssl_module modules/mod_ssl.so
 LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
@@ -77,8 +78,17 @@ pub fn apache_vhost_conf(
         return Err(Error::Other("project name must not be empty".into()));
     }
     let docroot = site.docroot_str();
-    let handler = format!(
-        r#"    <FilesMatch "\.php$">
+    let body = if let Some(port) = site.proxy {
+        format!(
+            r#"    ProxyPass "/" "http://127.0.0.1:{port}/"
+    ProxyPassReverse "/" "http://127.0.0.1:{port}/"
+    ProxyPreserveHost On
+"#
+        )
+    } else {
+        format!(
+            r#"    DocumentRoot "{docroot}"
+    <FilesMatch "\.php$">
         SetHandler "proxy:fcgi://127.0.0.1:{fpm_port}"
     </FilesMatch>
     DirectoryIndex index.php index.html index.htm login.php
@@ -88,12 +98,12 @@ pub fn apache_vhost_conf(
         Require all granted
     </Directory>
 "#
-    );
+        )
+    };
     let mut out = format!(
         r#"<VirtualHost *:{http_port}>
-    DocumentRoot "{docroot}"
     ServerName {project}.test
-{handler}    AllowEncodedSlashes On
+{body}    AllowEncodedSlashes On
 </VirtualHost>
 "#
     );
@@ -102,12 +112,11 @@ pub fn apache_vhost_conf(
         let key = key.display();
         out.push_str(&format!(
             r#"<VirtualHost *:{https_port}>
-    DocumentRoot "{docroot}"
     ServerName {project}.test
     SSLEngine on
     SSLCertificateFile "{crt}"
     SSLCertificateKeyFile "{key}"
-{handler}</VirtualHost>
+{body}</VirtualHost>
 "#
         ));
     }
@@ -281,6 +290,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_site_uses_proxypass_instead_of_a_document_root() {
+        let mut site = site("app", "/Sites/app");
+        site.proxy = Some(3000);
+
+        let c = apache_vhost_conf(&site, 9004, 8080, 8443, None).unwrap();
+
+        assert!(
+            c.contains("ProxyPass \"/\" \"http://127.0.0.1:3000/\""),
+            "{c}"
+        );
+        assert!(
+            c.contains("ProxyPassReverse \"/\" \"http://127.0.0.1:3000/\""),
+            "{c}"
+        );
+        assert!(!c.contains("DocumentRoot \"/Sites/app\""), "{c}");
+    }
+
+    #[test]
     fn regenerate_writes_main_conf_and_per_project_includes() {
         let t = tempfile::tempdir().unwrap();
         let etc = t.path().join("etc");
@@ -320,6 +347,7 @@ mod tests {
         crate::site::Site {
             name: name.to_string(),
             docroot: std::path::PathBuf::from(docroot),
+            proxy: None,
         }
     }
 }

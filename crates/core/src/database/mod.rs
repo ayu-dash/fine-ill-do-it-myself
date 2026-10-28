@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::supervisor::Env;
 
 /// Generate a minimal my.cnf for a fidim-managed datadir.
 pub fn generate_mariadb_cnf(
@@ -76,9 +77,115 @@ pub fn datadir_missing(dir: &Path) -> bool {
     !dir.join("mysql").is_dir()
 }
 
+/// `mariadb` client to issue SQL: the managed copy first, then the system one.
+pub fn mariadb_client(env: &Env) -> Option<std::path::PathBuf> {
+    let managed = env.paths.bin().join("mariadb").join("mariadb");
+    if managed.is_file() {
+        return Some(managed);
+    }
+    crate::orchestrator::which_system("mariadb")
+}
+
+/// Command that creates `<name>` (utf8mb4) through the managed socket.
+pub fn create_database_cmd(env: &Env, name: &str) -> Result<Vec<String>> {
+    crate::project::validate_name(name)?;
+    let client = mariadb_client(env).ok_or_else(|| {
+        Error::Other(
+            "mariadb client not found; run `fidim install mariadb` or install MariaDB".into(),
+        )
+    })?;
+    let socket = env.paths.pids().join(crate::orchestrator::MARIADB_SOCKET);
+    Ok(vec![
+        client.display().to_string(),
+        format!("--socket={}", socket.display()),
+        "-uroot".into(),
+        "-e".into(),
+        format!(
+            "CREATE DATABASE IF NOT EXISTS `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        ),
+    ])
+}
+
+/// Create the database used by a new project (`fidim new --db`).
+pub fn create_database<C: crate::proc::CommandRunner>(
+    env: &Env,
+    name: &str,
+    runner: &C,
+) -> Result<()> {
+    let cmd = create_database_cmd(env, name)?;
+    runner.run(&cmd, &[]).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(t: &tempfile::TempDir) -> Env {
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        env
+    }
+
+    #[derive(Default)]
+    struct FakeRunner {
+        commands: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl crate::proc::CommandRunner for FakeRunner {
+        fn run(&self, cmd: &[String], _envs: &[(String, String)]) -> Result<String> {
+            self.commands.lock().unwrap().push(cmd.to_vec());
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn create_database_targets_the_managed_socket_and_client() {
+        let t = tempfile::tempdir().unwrap();
+        let env = env(&t);
+        let client = env.paths.bin().join("mariadb/mariadb");
+        std::fs::create_dir_all(client.parent().unwrap()).unwrap();
+        std::fs::write(&client, "").unwrap();
+
+        let cmd = create_database_cmd(&env, "shop").unwrap();
+
+        assert_eq!(cmd[0], client.display().to_string());
+        let socket = env.paths.pids().join("db.sock");
+        assert!(
+            cmd.iter()
+                .any(|a| a == &format!("--socket={}", socket.display())),
+            "{cmd:?}"
+        );
+        assert!(
+            cmd.iter()
+                .any(|a| a.contains("CREATE DATABASE IF NOT EXISTS `shop`")),
+            "{cmd:?}"
+        );
+        assert!(
+            cmd.iter().any(|a| a.contains("utf8mb4")),
+            "database must be utf8mb4: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn create_database_rejects_an_unsafe_name() {
+        let t = tempfile::tempdir().unwrap();
+        let env = env(&t);
+        assert!(create_database_cmd(&env, "shop; DROP DATABASE x").is_err());
+    }
+
+    #[test]
+    fn create_database_runs_the_client_once() {
+        let t = tempfile::tempdir().unwrap();
+        let env = env(&t);
+        let client = env.paths.bin().join("mariadb/mariadb");
+        std::fs::create_dir_all(client.parent().unwrap()).unwrap();
+        std::fs::write(&client, "").unwrap();
+        let runner = FakeRunner::default();
+
+        create_database(&env, "shop", &runner).unwrap();
+
+        assert_eq!(runner.commands.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn cnf_contains_datadir_socket_port() {
