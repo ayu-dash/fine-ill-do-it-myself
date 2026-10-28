@@ -552,6 +552,182 @@ pub fn daemon(env: &Env, sock: &std::path::Path) -> Result<()> {
     crate::daemon::run_daemon(env.clone(), sock)
 }
 
+fn home_dir() -> Result<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| Error::Other("cannot resolve $HOME".into()))
+}
+
+fn dns_plan() -> Result<fine_ill_do_it_myself::dns::InstallPlan> {
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::Other(format!("cannot locate the fidim binary: {e}")))?;
+    Ok(fine_ill_do_it_myself::dns::install_plan(
+        &exe,
+        &home_dir()?,
+        fine_ill_do_it_myself::dns::DEFAULT_PORT,
+    ))
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| Error::Other(format!("failed to run {program}: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Other(format!(
+            "{program} {} failed ({status})",
+            args.join(" ")
+        )))
+    }
+}
+
+fn run_sudo_tee(path: &std::path::Path, body: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sudo")
+        .args(["tee", &path.display().to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Error::Other(format!("failed to spawn sudo: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| Error::Other(format!("failed to write to sudo: {e}")))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| Error::Other(format!("sudo tee failed: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Other("sudo tee was rejected".into()))
+    }
+}
+
+fn systemd_resolved_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "systemd-resolved"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Report whether seamless `*.test` resolution is installed and running.
+pub fn dns_status() -> Result<Vec<String>> {
+    let plan = dns_plan()?;
+    let port = fine_ill_do_it_myself::dns::DEFAULT_PORT;
+    let active = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "fidim-dns.service"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(vec![
+        format!("resolver: 127.0.0.1:{port}"),
+        format!(
+            "resolved drop-in: {} ({})",
+            plan.dropin.display(),
+            if plan.dropin.exists() {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+        format!(
+            "user unit: {} ({})",
+            plan.unit.display(),
+            if plan.unit.exists() {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+        format!("service: {active}"),
+    ])
+}
+
+/// One-time setup that makes every `*.test` name resolve to 127.0.0.1.
+///
+/// Without `apply` it only prints the plan and the root commands. With
+/// `apply` it writes a per-user systemd unit (no root) and, via sudo, a
+/// systemd-resolved drop-in that forwards only `.test`.
+pub fn dns_install(apply: bool) -> Result<()> {
+    let plan = dns_plan()?;
+    let port = fine_ill_do_it_myself::dns::DEFAULT_PORT;
+    println!("fidim can answer every *.test name itself, so new projects never need /etc/hosts.");
+    println!("This installs:");
+    println!(
+        "  {} (routes *.test to 127.0.0.1:{port})",
+        plan.dropin.display()
+    );
+    println!(
+        "  {} (keeps the responder running in your session)",
+        plan.unit.display()
+    );
+
+    if !apply {
+        println!("\nNothing was changed. Apply with:\n  fidim dns install --yes");
+        println!("\nRoot is used once, for:");
+        println!("  sudo mkdir -p /etc/systemd/resolved.conf.d");
+        println!(
+            "  sudo tee {} <<'EOF'\n{}EOF",
+            plan.dropin.display(),
+            plan.dropin_body
+        );
+        println!("  sudo systemctl restart systemd-resolved");
+        return Ok(());
+    }
+
+    if !systemd_resolved_active() {
+        return Err(Error::Other(
+            "systemd-resolved is not running; use `fidim hosts` as a fallback".into(),
+        ));
+    }
+
+    if let Some(parent) = plan.unit.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&plan.unit, &plan.unit_body)?;
+    run_command("systemctl", &["--user", "daemon-reload"])?;
+    run_command(
+        "systemctl",
+        &["--user", "enable", "--now", "fidim-dns.service"],
+    )?;
+
+    run_command("sudo", &["mkdir", "-p", "/etc/systemd/resolved.conf.d"])?;
+    run_sudo_tee(&plan.dropin, &plan.dropin_body)?;
+    run_command("sudo", &["systemctl", "restart", "systemd-resolved"])?;
+
+    println!("\ninstalled: any *.test name now resolves to 127.0.0.1");
+    Ok(())
+}
+
+/// Undo [`dns_install`].
+pub fn dns_uninstall(apply: bool) -> Result<()> {
+    let plan = dns_plan()?;
+    if !apply {
+        println!("This removes:");
+        println!("  {}", plan.dropin.display());
+        println!("  {}", plan.unit.display());
+        println!("\nNothing was changed. Apply with:\n  fidim dns uninstall --yes");
+        return Ok(());
+    }
+    let _ = run_command(
+        "systemctl",
+        &["--user", "disable", "--now", "fidim-dns.service"],
+    );
+    let _ = std::fs::remove_file(&plan.unit);
+    let _ = run_command("systemctl", &["--user", "daemon-reload"]);
+    let dropin = plan.dropin.display().to_string();
+    run_command("sudo", &["rm", "-f", &dropin])?;
+    run_command("sudo", &["systemctl", "restart", "systemd-resolved"])?;
+    println!("removed: *.test uses the system resolver again");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

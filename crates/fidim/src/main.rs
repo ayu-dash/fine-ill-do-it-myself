@@ -36,7 +36,7 @@ enum Commands {
         #[arg(long)]
         install: bool,
     },
-    /// Manage /etc/hosts entries for .test projects (applies via sudo by default)
+    /// Manage /etc/hosts entries for .test projects (fallback when DNS is unavailable)
     Hosts {
         /// Only print missing entries without modifying /etc/hosts
         #[arg(long, short = 'n')]
@@ -44,6 +44,11 @@ enum Commands {
         /// Deprecated alias (syncing is now default)
         #[arg(long, short, hide = true)]
         sync: bool,
+    },
+    /// Seamless *.test resolution via a wildcard local DNS responder
+    Dns {
+        #[command(subcommand)]
+        cmd: DnsCommands,
     },
     /// Print steps to trust the local CA (needs root)
     Trust,
@@ -106,6 +111,27 @@ enum WebCommands {
     Use { server: String },
     /// Show currently selected web server
     Show,
+}
+
+#[derive(Subcommand)]
+enum DnsCommands {
+    /// Run the wildcard DNS responder in the foreground
+    Serve {
+        #[arg(long, default_value_t = fine_ill_do_it_myself::dns::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Show whether *.test resolution is installed and running
+    Status,
+    /// One-time setup: route *.test to fidim (prints the plan unless --yes)
+    Install {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove the resolved drop-in and the user unit
+    Uninstall {
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,6 +263,16 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 Err(e) => Err(e),
             }?;
         }
+        Some(Commands::Dns { cmd }) => match cmd {
+            DnsCommands::Serve { port } => fine_ill_do_it_myself::dns::serve(port)?,
+            DnsCommands::Status => {
+                for line in cli::dns_status()? {
+                    println!("{line}");
+                }
+            }
+            DnsCommands::Install { yes } => cli::dns_install(yes)?,
+            DnsCommands::Uninstall { yes } => cli::dns_uninstall(yes)?,
+        },
         Some(Commands::Trust) => {
             for line in cli::trust(&env)? {
                 println!("{line}");
@@ -480,6 +516,24 @@ mod tests {
             .unwrap();
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("caddy: Stopped"), "stdout: {s}");
+    }
+
+    #[test]
+    fn dns_install_prints_the_plan_without_touching_the_system() {
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .args(["dns", "install"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("resolved.conf.d/90-fidim.conf"), "{s}");
+        assert!(s.contains("sudo systemctl restart systemd-resolved"), "{s}");
+        assert!(s.contains("--yes"), "must explain how to apply\n{s}");
     }
 
     #[test]
