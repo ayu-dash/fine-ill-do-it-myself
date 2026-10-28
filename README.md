@@ -129,15 +129,24 @@ sudo update-ca-certificates
 
 ## Where things live
 
+Inside a project (a directory with `.git`, `Cargo.toml`, or `.fidim`) the data
+root is `<project>/.fidim/`; run outside a project it falls back to the XDG
+directory `~/.local/share/fine-ill-do-it-myself/`. Use `fidim --data-root <dir>`
+to pin one explicitly.
+
 ```
-~/.local/share/fine-ill-do-it-myself/
-  bin/        managed binaries (caddy, php-fpm-<ver>)
+<data root>/
+  bin/        managed binaries (caddy, php-fpm-<ver>, node, ...)
+  runtimes/   extracted language/web runtimes (node/24, phpmyadmin/5.2.3, ...)
   etc/        generated configs (Caddyfile, php-fpm conf, my.cnf, certs/)
   run/        pid files + sockets
   logs/       service logs
   lock.toml   what is installed + sha256 pins
   sources.toml download manifest (copy of default_manifest.toml)
 ```
+
+Tool directories under `bin/` are created only when something is installed
+there, so a fresh data root stays small.
 
 ## Architecture
 

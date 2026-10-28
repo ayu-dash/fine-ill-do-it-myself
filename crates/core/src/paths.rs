@@ -50,14 +50,8 @@ impl Paths {
         ] {
             std::fs::create_dir_all(d)?;
         }
-        for sub in [
-            "caddy", "nginx", "httpd", "lighttpd", "php", "node", "python", "go", "java",
-        ] {
-            let d = self.bin().join(sub);
-            if !d.is_file() {
-                std::fs::create_dir_all(d)?;
-            }
-        }
+        // `bin/<tool>` is created on demand by the installer / `<lang> use`,
+        // so a fresh data root does not fill up with empty directories.
         Ok(())
     }
 }
@@ -114,6 +108,22 @@ mod tests {
         assert!(p.pids().exists());
         assert!(p.data().exists());
         assert_eq!(p.sites(), std::path::Path::new(t.path()).join("Sites"));
+    }
+
+    #[test]
+    fn fresh_layout_does_not_create_empty_tool_dirs() {
+        let t = temp();
+        let p = Paths::new(t.path().join("app"), t.path().join("Sites"));
+        p.create_all().unwrap();
+        // Tool dirs appear only when something is installed into them.
+        for sub in [
+            "caddy", "nginx", "httpd", "lighttpd", "php", "node", "python", "go", "java",
+        ] {
+            assert!(
+                !p.bin().join(sub).exists(),
+                "empty bin/{sub} must not be created eagerly"
+            );
+        }
     }
 
     #[test]
