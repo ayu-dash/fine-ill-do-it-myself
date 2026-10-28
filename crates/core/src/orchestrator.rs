@@ -237,9 +237,14 @@ pub fn generate_web_configs(
         )?,
     )?;
     let ini_path = env.php_ini_path(php_version);
-    if !ini_path.exists() {
-        let _ = std::fs::write(&ini_path, crate::php::fpm::generate_php_ini(&[]));
-    }
+    let socket = env.paths.pids().join(crate::orchestrator::MARIADB_SOCKET);
+    // Always regenerate: this file is fidim-owned and must track the current
+    // socket (e.g. after moving the data root), so `mysqli_connect('localhost')`
+    // finds the managed MariaDB instead of a system socket.
+    let _ = std::fs::write(
+        &ini_path,
+        crate::php::fpm::generate_php_ini(&[], Some(&socket)),
+    );
     Ok(())
 }
 
@@ -548,9 +553,22 @@ pub fn apache_server_root(bin: &std::path::Path) -> std::path::PathBuf {
 pub fn web_args(env: &Env, web: &str) -> Vec<String> {
     let conf = web_config_path(env, web).display().to_string();
     match web {
-        NGINX => vec!["-c".into(), conf],
+        // The downloaded nginx/lighttpd binaries are built with the old data
+        // root compiled in, so point them at this root's prefix/module dir.
+        NGINX => vec![
+            "-c".into(),
+            conf,
+            "-p".into(),
+            env.paths.root().join("nginx").display().to_string(),
+        ],
         APACHE => vec!["-f".into(), conf, "-DFOREGROUND".into()],
-        LIGHTTPD => vec!["-D".into(), "-f".into(), conf],
+        LIGHTTPD => vec![
+            "-D".into(),
+            "-f".into(),
+            conf,
+            "-m".into(),
+            env.paths.root().join("lighttpd/lib").display().to_string(),
+        ],
         _ => vec!["run".into(), "--config".into(), conf],
     }
 }
@@ -697,7 +715,23 @@ mod webchoice_tests {
         );
         assert_eq!(
             web_args(&env, NGINX),
-            vec!["-c".to_string(), nginx.display().to_string()]
+            vec![
+                "-c".to_string(),
+                nginx.display().to_string(),
+                "-p".to_string(),
+                env.paths.root().join("nginx").display().to_string(),
+            ]
+        );
+        let lighttpd = web_config_path(&env, LIGHTTPD);
+        assert_eq!(
+            web_args(&env, LIGHTTPD),
+            vec![
+                "-D".to_string(),
+                "-f".to_string(),
+                lighttpd.display().to_string(),
+                "-m".to_string(),
+                env.paths.root().join("lighttpd/lib").display().to_string(),
+            ]
         );
         assert_eq!(
             web_args(&env, CADDY),

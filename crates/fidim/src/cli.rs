@@ -245,12 +245,15 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     if let Some(parent) = ini_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if !ini_path.exists() {
-        let _ = std::fs::write(
-            &ini_path,
-            fine_ill_do_it_myself::php::fpm::generate_php_ini(&[]),
-        );
-    }
+    let socket = cli
+        .env
+        .paths
+        .pids()
+        .join(fine_ill_do_it_myself::orchestrator::MARIADB_SOCKET);
+    let _ = std::fs::write(
+        &ini_path,
+        fine_ill_do_it_myself::php::fpm::generate_php_ini(&[], Some(&socket)),
+    );
 
     let php_dir = cli.env.paths.bin().join("php");
     if php_dir.is_dir() {
@@ -288,7 +291,15 @@ pub fn php_ini(cli: &CliEnv, version: Option<&str>) -> Result<std::path::PathBuf
     };
     let ini = cli.env.php_ini_path(&ver);
     if !ini.exists() {
-        let _ = std::fs::write(&ini, fine_ill_do_it_myself::php::fpm::generate_php_ini(&[]));
+        let socket = cli
+            .env
+            .paths
+            .pids()
+            .join(fine_ill_do_it_myself::orchestrator::MARIADB_SOCKET);
+        let _ = std::fs::write(
+            &ini,
+            fine_ill_do_it_myself::php::fpm::generate_php_ini(&[], Some(&socket)),
+        );
     }
     Ok(ini)
 }
