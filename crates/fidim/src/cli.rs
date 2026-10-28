@@ -1,5 +1,4 @@
-//! Non-interactive subcommands, thin orchestration over `core`.
-use fine_ill_do_it_myself::error::Result;
+use fine_ill_do_it_myself::error::{Error, Result};
 use fine_ill_do_it_myself::manifest::{Lock, Manifest, PhpManager};
 use fine_ill_do_it_myself::orchestrator;
 use fine_ill_do_it_myself::proc::RealRunner;
@@ -403,6 +402,34 @@ pub fn hosts_missing(cli: &CliEnv) -> Result<Vec<String>> {
         .filter(|p| !hosts.contains(&format!("{p}.{HOST_TLD}")))
         .map(|p| format!("127.0.0.1 {p}.{HOST_TLD}"))
         .collect())
+}
+
+/// Write the missing entries to /etc/hosts using sudo tee -a.
+pub fn hosts_sync(entries: &[String]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut payload = entries.join("\n");
+    payload.push('\n');
+    let mut child = std::process::Command::new("sudo")
+        .args(["tee", "-a", "/etc/hosts"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Error::Other(format!("failed to spawn sudo: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(payload.as_bytes())
+            .map_err(|e| Error::Other(format!("failed to write to sudo: {e}")))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| Error::Other(format!("failed to wait for sudo: {e}")))?;
+    if !status.success() {
+        return Err(Error::Other("sudo tee -a /etc/hosts failed".into()));
+    }
+    Ok(())
 }
 
 const HOST_TLD: &str = "test";

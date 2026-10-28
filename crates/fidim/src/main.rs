@@ -30,8 +30,15 @@ enum Commands {
     },
     Restart,
     Status,
-    /// Manage /etc/hosts entries for .test projects
-    Hosts,
+    /// Manage /etc/hosts entries for .test projects (applies via sudo by default)
+    Hosts {
+        /// Only print missing entries without modifying /etc/hosts
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+        /// Deprecated alias (syncing is now default)
+        #[arg(long, short, hide = true)]
+        sync: bool,
+    },
     /// Print steps to trust the local CA (needs root)
     Trust,
     /// Run the background daemon exposing a unix socket
@@ -182,17 +189,26 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{s}");
             }
         }
-        Some(Commands::Hosts) => {
+        Some(Commands::Hosts { dry_run, sync: _ }) => {
             match cli::hosts_missing(&env) {
                 Ok(entries) => {
                     if entries.is_empty() {
                         println!("hosts up to date");
-                    } else {
+                    } else if dry_run {
                         for e in &entries {
                             println!("{e}");
                         }
                         let all = entries.join("\n");
-                        println!("sudo tee -a /etc/hosts <<'EOF'\n{all}\nEOF");
+                        println!("\nTo apply, run:\n  fidim hosts\nor:\n  sudo tee -a /etc/hosts <<'EOF'\n{all}\nEOF");
+                    } else {
+                        for e in &entries {
+                            println!("adding to /etc/hosts: {e}");
+                        }
+                        cli::hosts_sync(&entries)?;
+                        println!(
+                            "successfully updated /etc/hosts (added {} entries)",
+                            entries.len()
+                        );
                     }
                     Ok(())
                 }

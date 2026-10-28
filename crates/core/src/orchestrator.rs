@@ -322,6 +322,34 @@ pub fn start_service<R: Runner + Clone>(
     let wrapped = with_log_append(&full, &log)?;
     let pid = sup.runner.spawn(&wrapped)?;
     sup.write_pid(&name, pid)?;
+
+    // If starting a web server, ensure php-fpm is also running so PHP requests succeed
+    if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str()) {
+        let php_service = format!("php-{php_version}");
+        if sup.status(&php_service).state != crate::service::ServiceState::Running {
+            if let Ok(php_specs) = service_cmds(env, ports, php_version) {
+                if let Some((_, pbin, pargs, plog)) =
+                    php_specs.into_iter().find(|(n, ..)| n == &php_service)
+                {
+                    if let Ok(pids) = crate::proc::listening_pids(fpm_port) {
+                        for p in pids {
+                            let _ = crate::proc::RealRunner.kill(p);
+                        }
+                    }
+                    if check_port(fpm_port, &pbin).is_ok() {
+                        let mut pfull = vec![pbin];
+                        pfull.extend(pargs);
+                        if let Ok(pwrapped) = with_log_append(&pfull, &plog) {
+                            if let Ok(ppid) = sup.runner.spawn(&pwrapped) {
+                                let _ = sup.write_pid(&php_service, ppid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(sup.status(&name))
 }
 

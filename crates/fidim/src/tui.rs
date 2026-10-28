@@ -22,6 +22,8 @@ pub enum Action {
     UseServerVersion { server: String, version: String },
     /// Switch a programming language version (e.g. node -> node-22).
     UseLang { lang: String, version: String },
+    /// Open a project in the default browser.
+    OpenProject(String),
 }
 
 /// One row of the config panel.
@@ -301,8 +303,15 @@ impl App {
                         self.actions.push(Action::StartService(i));
                     }
                 }
+                "projects" => {
+                    let proj_idx = self.cursor().saturating_sub(self.services.len());
+                    if let Some(p) = self.projects.get(proj_idx).cloned() {
+                        self.message = format!("opening {p}.test in browser...");
+                        self.actions.push(Action::OpenProject(p));
+                    }
+                }
                 _ => {
-                    self.message = "projects enter not implemented; use compose panel keys".into();
+                    self.message = "enter not implemented; use compose panel keys".into();
                 }
             },
             _ if cursor_is_service_row(self, key, self.keybinds.start) => {
@@ -1458,9 +1467,46 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             app.detail = Some(detail);
             Ok(vec![])
         }
+        Action::OpenProject(project) => {
+            let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+            let web = fine_ill_do_it_myself::orchestrator::default_web(&lock);
+            let (http_port, _) = ports.web_ports(&web);
+            let url = if http_port == 80 {
+                format!("http://{project}.test")
+            } else {
+                format!("http://{project}.test:{http_port}")
+            };
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            if !hosts.contains(&format!("{project}.test")) {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "opened {url} (note: {project}.test missing in /etc/hosts, run: fidim hosts --sync)"
+                )))
+            } else {
+                Ok(vec![])
+            }
+        }
     };
     match r {
-        Ok(_) => app.message = format!("{action:?} ok").to_lowercase(),
+        Ok(_) => match action {
+            Action::OpenProject(p) => {
+                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                let web = fine_ill_do_it_myself::orchestrator::default_web(&lock);
+                let (http_port, _) = ports.web_ports(&web);
+                let port_str = if http_port == 80 {
+                    String::new()
+                } else {
+                    format!(":{http_port}")
+                };
+                app.message = format!("opened http://{p}.test{port_str} in browser");
+            }
+            _ => app.message = format!("{action:?} ok").to_lowercase(),
+        },
         Err(e) => app.message = format!("{action:?}: {e}").to_lowercase(),
     }
 }

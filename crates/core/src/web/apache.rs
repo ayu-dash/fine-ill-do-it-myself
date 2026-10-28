@@ -21,9 +21,9 @@ Listen {https_port}
 LoadModule mpm_event_module modules/mod_mpm_event.so
 LoadModule authz_core_module modules/mod_authz_core.so
 LoadModule dir_module modules/mod_dir.so
-LoadModule log_config_module modules/mod_log_config.so
+LoadModule autoindex_module modules/mod_autoindex.so
 LoadModule mime_module modules/mod_mime.so
-LoadModule unixd_module modules/mod_unixd.so
+LoadModule rewrite_module modules/mod_rewrite.so
 LoadModule proxy_module modules/mod_proxy.so
 LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
 LoadModule ssl_module modules/mod_ssl.so
@@ -33,12 +33,25 @@ PidFile \"{{pid}}\"
 
 ErrorLog \"{{error_log}}\"
 TypesConfig {{mime}}
-DirectoryIndex index.php index.html
+DirectoryIndex index.php index.html index.htm login.php
 <Directory />
     Options FollowSymLinks
     AllowOverride None
     Require all granted
 </Directory>
+
+# Default fallback / localhost dashboard
+<VirtualHost *:{http_port}>
+    ServerName localhost
+    ServerAlias 127.0.0.1
+    DocumentRoot \"{{dashboard}}\"
+    DirectoryIndex index.html
+    <Directory \"{{dashboard}}\">
+        Options FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+</VirtualHost>
 "
     );
     let mut includes = Vec::new();
@@ -68,7 +81,12 @@ pub fn apache_vhost_conf(
         r#"    <FilesMatch "\.php$">
         SetHandler "proxy:fcgi://127.0.0.1:{fpm_port}"
     </FilesMatch>
-    DirectoryIndex index.php
+    DirectoryIndex index.php index.html index.htm login.php
+    <Directory "{docroot}">
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
 "#
     );
     let mut out = format!(
@@ -112,11 +130,17 @@ pub fn regenerate(
 ) -> Result<()> {
     let conf_dir = etc.join("apache");
     let sites_dir = conf_dir.join("sites");
+    let dashboard_dir = etc.join("dashboard");
     std::fs::create_dir_all(&sites_dir)?;
+    std::fs::create_dir_all(&dashboard_dir)?;
+    let dashboard_html = generate_dashboard_html(projects, http_port);
+    std::fs::write(dashboard_dir.join("index.html"), dashboard_html)?;
+
     let conf = generate_apache_conf(server_root, projects, http_port, https_port)?
         .replace("{pid}", pid)
         .replace("{error_log}", error_log)
-        .replace("{sites}", &sites_dir.display().to_string());
+        .replace("{sites}", &sites_dir.display().to_string())
+        .replace("{dashboard}", &dashboard_dir.display().to_string());
     // drop LoadModule lines for modules not shipped by this httpd build
     let mods_dir = std::path::Path::new(server_root).join("modules");
     let conf = conf
@@ -157,6 +181,35 @@ pub fn regenerate(
         std::fs::write(sites_dir.join(format!("{p}.conf")), body)?;
     }
     Ok(())
+}
+
+/// Generate a simple dashboard HTML displaying only the list of active projects without CSS or extra text.
+pub fn generate_dashboard_html(projects: &[String], http_port: u16) -> String {
+    let port_suffix = if http_port == 80 {
+        String::new()
+    } else {
+        format!(":{http_port}")
+    };
+    let mut items = String::new();
+    for p in projects {
+        let url = format!("http://{p}.test{port_suffix}");
+        items.push_str(&format!("        <li><a href=\"{url}\">{p}</a></li>\n"));
+    }
+
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Projects</title>
+</head>
+<body>
+    <ul>
+{items}    </ul>
+</body>
+</html>
+"#
+    )
 }
 
 /// Tiny static MIME table so httpd never depends on a system mime.types.

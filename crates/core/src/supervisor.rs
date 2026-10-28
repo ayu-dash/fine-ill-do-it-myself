@@ -33,8 +33,19 @@ impl Env {
         }
         if let Some(proj) = crate::paths::find_project_root() {
             let root = proj.join(".fidim");
+            let home_sites = std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join("Sites"))
+                .ok();
             let sites = if proj.join("sites").is_dir() {
                 proj.join("sites")
+            } else if root.join("sites").is_dir() {
+                root.join("sites")
+            } else if let Some(ref hs) = home_sites {
+                if hs.is_dir() {
+                    hs.clone()
+                } else {
+                    root.join("sites")
+                }
             } else {
                 root.join("sites")
             };
