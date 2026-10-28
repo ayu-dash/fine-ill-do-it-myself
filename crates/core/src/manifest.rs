@@ -254,6 +254,18 @@ files = ["caddy"]
     }
 
     #[test]
+    fn bundled_manifest_offers_composer_with_a_pinned_checksum() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let c = m.find("composer").expect("composer missing");
+
+        assert_eq!(c.version, "2.10.3");
+        assert!(c.url.starts_with("https://"), "{}", c.url);
+        assert_eq!(c.sha256.len(), 64, "checksum must be pinned");
+        assert!(!c.tar_gz, "composer.phar is a single file, not a tarball");
+        assert!(c.files.is_empty());
+    }
+
+    #[test]
     fn bundled_manifest_offers_phpmyadmin_with_a_pinned_checksum() {
         let m = Manifest::parse(crate::installer_defaults()).unwrap();
         let pma = m.find("phpmyadmin").expect("phpmyadmin missing");

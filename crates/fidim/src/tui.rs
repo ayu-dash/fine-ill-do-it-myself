@@ -26,6 +26,8 @@ pub enum Action {
     OpenProject(String),
     /// Open a project folder in the user's code editor.
     OpenEditor(String),
+    /// Download/refresh the managed composer.phar.
+    InstallComposer,
 }
 
 /// One row of the config panel.
@@ -494,7 +496,11 @@ impl App {
         let sel = self.cursor().min(lines.len().saturating_sub(1));
         let line = lines.get(sel).cloned().unwrap_or_default();
         let text = line.trim().trim_start_matches("▶ ").trim();
-        if let Some(v) = text.strip_prefix("php.use ") {
+        if let Some(v) = text.strip_prefix("composer.install") {
+            let v = v.trim();
+            self.message = format!("composer.install {v} requested");
+            self.actions.push(Action::InstallComposer);
+        } else if let Some(v) = text.strip_prefix("php.use ") {
             self.message = format!("php.use {v} requested");
             self.actions.push(Action::UsePhp(v.to_string()));
         } else if let Some(n) = text.strip_prefix("web.use ") {
@@ -1067,24 +1073,36 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
         }
     }
     // no service focused: the global config list
-    (
-        " config (select service) ".to_string(),
-        app.config_rows
-            .iter()
-            .map(|r| match r {
-                ConfigRow::UsePhp(v) => {
-                    let mark = if *v == cur_php { "▶ " } else { "  " };
-                    format!("{mark}php.use {v}")
-                }
-                ConfigRow::UseWeb { name, ver } => {
-                    let mark = if name == &cur_web { "▶ " } else { "  " };
-                    let v = ver.as_deref().unwrap_or("not installed");
-                    format!("{mark}web.use {name}  [{v}]")
-                }
-                ConfigRow::Port { key, value } => format!("  port {key} = {value}"),
-            })
-            .collect(),
-    )
+    let mut lines: Vec<String> = app
+        .config_rows
+        .iter()
+        .map(|r| match r {
+            ConfigRow::UsePhp(v) => {
+                let mark = if *v == cur_php { "▶ " } else { "  " };
+                format!("{mark}php.use {v}")
+            }
+            ConfigRow::UseWeb { name, ver } => {
+                let mark = if name == &cur_web { "▶ " } else { "  " };
+                let v = ver.as_deref().unwrap_or("not installed");
+                format!("{mark}web.use {name}  [{v}]")
+            }
+            ConfigRow::Port { key, value } => format!("  port {key} = {value}"),
+        })
+        .collect();
+    lines.push(composer_row(env));
+    (" config (select service) ".to_string(), lines)
+}
+
+/// Management row for the managed composer.phar: version plus install action
+/// when it is missing.
+fn composer_row(env: &fine_ill_do_it_myself::Env) -> String {
+    let version =
+        fine_ill_do_it_myself::composer::pinned_version(env).unwrap_or_else(|| "?".to_string());
+    if fine_ill_do_it_myself::composer::is_installed(env) {
+        format!("  composer {version} [installed]")
+    } else {
+        format!("  composer.install {version}")
+    }
 }
 
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
@@ -1768,6 +1786,21 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 ))
             }
         }
+        Action::InstallComposer => {
+            let cli = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: php.clone(),
+            };
+            crate::cli::load_or_default_manifest(&cli)
+                .and_then(|manifest| {
+                    let mut lock =
+                        fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
+                    fine_ill_do_it_myself::composer::ensure(env, &manifest, &mut lock, &fetcher)
+                })
+                .map(|_| vec![])
+        }
     };
     match r {
         Ok(_) => match action {
@@ -1790,10 +1823,12 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                     .unwrap_or_else(|| "editor".into());
                 app.message = format!("opening {p} in {editor}");
             }
+            Action::InstallComposer => app.message = "composer installed".into(),
             _ => app.message = format!("{action:?} ok").to_lowercase(),
         },
         Err(e) => match action {
             Action::OpenEditor(p) => app.message = format!("{p}: {e}"),
+            Action::InstallComposer => app.message = format!("composer install: {e}"),
             _ => app.message = format!("{action:?}: {e}").to_lowercase(),
         },
     }
@@ -2675,6 +2710,54 @@ mod tests {
                 version: "2.9.1".into()
             }]
         );
+    }
+
+    // ---- composer management row ------------------------------------------
+
+    #[test]
+    fn mgmt_panel_lists_composer_with_its_install_action() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let app = App::new(vec![], vec!["blog".into()]);
+
+        let (_, lines) = mgmt_panel(&env, &app);
+
+        assert!(
+            lines.iter().any(|l| l.contains("composer.install")),
+            "composer must be installable from the panel: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn mgmt_panel_marks_an_installed_composer() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.paths.bin().join("composer"), "phar").unwrap();
+        let app = App::new(vec![], vec!["blog".into()]);
+
+        let (_, lines) = mgmt_panel(&env, &app);
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("composer") && l.contains("2.10.3") && l.contains("installed")),
+            "installed composer must show its pinned version: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("composer.install")),
+            "no install action once it is there: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_composer_row_queues_the_install_action() {
+        let mut a = App::new(vec![], vec![]);
+
+        a.mgmt_enter(&["  composer.install 2.10.3".to_string()]);
+
+        assert_eq!(a.actions, vec![Action::InstallComposer]);
     }
 
     // ---- `o` opens the project in the code editor -------------------------

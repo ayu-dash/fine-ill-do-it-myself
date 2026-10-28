@@ -29,6 +29,7 @@ Bootstrap binaries from the manifest (defaults ship inside the binary):
 ```sh
 fidim install caddy
 fidim install mariadb   # optional, portable Linux x86_64 runtime (downloaded with curl)
+fidim install composer  # optional: pinned composer.phar, run through the managed PHP
 fidim install phpmyadmin   # optional: served at https://phpmyadmin.test
 fidim php install 8.4
 fidim php use 8.4
@@ -143,6 +144,13 @@ at the fidim-managed MariaDB socket and uses the normal login form: user
 setup; otherwise add the entry once via `fidim hosts`. The symlink is only
 replaced when it is a fidim symlink, never when a real project folder has that
 name.
+
+**Composer**: `fidim install composer` downloads the pinned `composer.phar`
+(currently 2.10.3) into `bin/composer` and never relies on a system-wide
+Composer. `fidim env --install` writes a shim that runs it through the managed
+PHP (`bin/php/php`), with `COMPOSER_HOME` and `COMPOSER_CACHE_DIR` kept under
+the data root instead of `$HOME`. In the TUI the same install is available from
+the management panel (`composer.install <version>`).
 
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
 keys (defaults q/r/s/x/a/o):
