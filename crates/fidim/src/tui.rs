@@ -24,6 +24,8 @@ pub enum Action {
     UseLang { lang: String, version: String },
     /// Open a project in the default browser.
     OpenProject(String),
+    /// Open a project folder in the user's code editor.
+    OpenEditor(String),
 }
 
 /// One row of the config panel.
@@ -54,6 +56,8 @@ pub struct Keybinds {
     pub stop: crossterm::event::KeyCode,
     /// restart everything (a)
     pub restart_all: crossterm::event::KeyCode,
+    /// open the project folder in the code editor (o)
+    pub editor: crossterm::event::KeyCode,
 }
 
 impl Default for Keybinds {
@@ -64,6 +68,7 @@ impl Default for Keybinds {
             start: crossterm::event::KeyCode::Char('s'),
             stop: crossterm::event::KeyCode::Char('x'),
             restart_all: crossterm::event::KeyCode::Char('a'),
+            editor: crossterm::event::KeyCode::Char('o'),
         }
     }
 }
@@ -83,6 +88,7 @@ pub fn load_keybinds(text: &str) -> Keybinds {
                 "start" => k.start = code,
                 "stop" => k.stop = code,
                 "restart_all" => k.restart_all = code,
+                "editor" => k.editor = code,
                 _ => {}
             }
         }
@@ -254,6 +260,11 @@ pub struct App {
     pub mgmt_line_count: usize,
     /// Cached management panel lines for cursor-skip logic.
     pub mgmt_lines: Vec<String>,
+    /// Editor resolved once at startup (`o` on a project row).
+    pub editor: Option<fine_ill_do_it_myself::editor::Editor>,
+    /// Terminal editors cannot run while the TUI owns the screen, so the
+    /// action parks the argv here and the event loop hands the screen over.
+    pub pending_terminal_editor: Option<Vec<String>>,
 }
 
 impl App {
@@ -279,6 +290,8 @@ impl App {
             progress: None,
             mgmt_line_count: 0,
             mgmt_lines: Vec::new(),
+            editor: None,
+            pending_terminal_editor: None,
         }
     }
 
@@ -354,6 +367,20 @@ impl App {
         }
         if key == self.keybinds.quit {
             self.quit = true;
+            return;
+        }
+        if key == self.keybinds.editor {
+            // `o` opens the project folder in the code editor; it only makes
+            // sense on the projects container (the browser stays on Enter).
+            if !self.panel_right && focused_panel(self) == "projects" {
+                let idx = self.cursor().saturating_sub(self.services.len());
+                if let Some(p) = self.projects.get(idx).cloned() {
+                    self.message = format!("opening {p} in editor...");
+                    self.actions.push(Action::OpenEditor(p));
+                    return;
+                }
+            }
+            self.message = "select a project first (tab to the projects panel)".into();
             return;
         }
         if key == KeyCode::Esc {
@@ -873,6 +900,7 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
         ("d".to_string(), "detail"),
         ("enter".to_string(), "apply"),
         ("tab".to_string(), "panel"),
+        (disp(app.keybinds.editor), "edit"),
         (disp(app.keybinds.start), "start"),
         (disp(app.keybinds.stop), "stop"),
         (disp(app.keybinds.restart), "restart"),
@@ -1080,6 +1108,7 @@ pub fn run_tui(
 
     let projects: Vec<String> = fine_ill_do_it_myself::list_projects(env);
     let mut app = App::new(Vec::new(), projects);
+    app.editor = fine_ill_do_it_myself::editor::detect_default();
     app.keybinds = load_keybinds(
         &std::fs::read_to_string(env.paths.etc().join("keys.toml")).unwrap_or_default(),
     );
@@ -1435,6 +1464,27 @@ pub fn run_tui(
                         act(&mut app, &a);
                         refresh(&mut app);
                     }
+                    // A terminal editor (vim, nano, ...) cannot run while the
+                    // TUI owns the screen: give the terminal back, run it
+                    // attached, then restore the TUI.
+                    if let Some(cmd) = app.pending_terminal_editor.take() {
+                        let _ = terminal::disable_raw_mode();
+                        let _ =
+                            crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
+                        let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
+                        let _ =
+                            crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
+                        let _ = terminal::enable_raw_mode();
+                        if let Some(t) = term.as_mut() {
+                            let _ = t.clear();
+                        }
+                        app.message = match status {
+                            Ok(s) if s.success() => "editor closed".into(),
+                            Ok(s) => format!("editor exited with {s}"),
+                            Err(e) => format!("editor failed: {e}"),
+                        };
+                        refresh(&mut app);
+                    }
                 }
             }
         }
@@ -1693,6 +1743,31 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 Ok(vec![])
             }
         }
+        Action::OpenEditor(project) => {
+            let site = env.paths.sites().join(project);
+            if !site.is_dir() {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "project folder {} not found",
+                    site.display()
+                )))
+            } else if let Some(editor) = app.editor.clone() {
+                let cmd = editor.command(&site);
+                if editor.kind == fine_ill_do_it_myself::editor::EditorKind::Terminal {
+                    // the event loop owns the terminal: park the argv there
+                    app.pending_terminal_editor = Some(cmd);
+                    Ok(vec![])
+                } else {
+                    runner
+                        .spawn(&cmd)
+                        .map(|_| vec![])
+                        .map_err(fine_ill_do_it_myself::Error::Io)
+                }
+            } else {
+                Err(fine_ill_do_it_myself::Error::Other(
+                    "no code editor found; set FIDIM_EDITOR (e.g. FIDIM_EDITOR=code)".into(),
+                ))
+            }
+        }
     };
     match r {
         Ok(_) => match action {
@@ -1707,9 +1782,20 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 };
                 app.message = format!("opened http://{p}.test{port_str} in browser");
             }
+            Action::OpenEditor(p) => {
+                let editor = app
+                    .editor
+                    .as_ref()
+                    .map(|e| e.name())
+                    .unwrap_or_else(|| "editor".into());
+                app.message = format!("opening {p} in {editor}");
+            }
             _ => app.message = format!("{action:?} ok").to_lowercase(),
         },
-        Err(e) => app.message = format!("{action:?}: {e}").to_lowercase(),
+        Err(e) => match action {
+            Action::OpenEditor(p) => app.message = format!("{p}: {e}"),
+            _ => app.message = format!("{action:?}: {e}").to_lowercase(),
+        },
     }
 }
 
@@ -2120,7 +2206,7 @@ mod tests {
         let h = footer_hints(&a);
         let keys: Vec<&str> = h.iter().map(|(k, _)| k.as_str()).collect();
         // fixed navigation & selection keys
-        for want in ["d", "enter", "tab", "j", "k"] {
+        for want in ["d", "enter", "tab", "j", "k", "o"] {
             assert!(keys.contains(&want), "missing key {want}\n{keys:?}");
         }
         // remapable keybinds (defaults q/r/s/x/a)
@@ -2588,6 +2674,161 @@ mod tests {
                 server: "caddy".into(),
                 version: "2.9.1".into()
             }]
+        );
+    }
+
+    // ---- `o` opens the project in the code editor -------------------------
+
+    #[derive(Clone, Default)]
+    struct SpawnRecorder {
+        spawned: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl fine_ill_do_it_myself::Runner for SpawnRecorder {
+        fn spawn(&self, cmd: &[String]) -> std::result::Result<u32, std::io::Error> {
+            self.spawned.lock().unwrap().push(cmd.to_vec());
+            Ok(1)
+        }
+        fn is_running(&self, _pid: u32) -> bool {
+            false
+        }
+        fn kill(&self, _pid: u32) -> std::result::Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    fn editor_env(t: &tempfile::TempDir) -> (fine_ill_do_it_myself::Env, std::path::PathBuf) {
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let site = env.paths.sites().join("blog");
+        std::fs::create_dir_all(&site).unwrap();
+        (env, site)
+    }
+
+    fn gui_editor() -> fine_ill_do_it_myself::editor::Editor {
+        fine_ill_do_it_myself::editor::Editor {
+            program: std::path::PathBuf::from("/usr/bin/code"),
+            args: Vec::new(),
+            kind: fine_ill_do_it_myself::editor::EditorKind::Gui,
+        }
+    }
+
+    #[test]
+    fn o_on_a_project_queues_the_editor_action() {
+        let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        a.on_key(KeyCode::Tab); // services -> projects (no languages installed)
+        assert_eq!(focused_panel(&a), "projects");
+
+        a.on_key(KeyCode::Char('o'));
+
+        assert_eq!(a.actions, vec![Action::OpenEditor("blog".into())]);
+    }
+
+    #[test]
+    fn o_outside_the_projects_container_only_hints() {
+        let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        assert_eq!(focused_panel(&a), "services");
+
+        a.on_key(KeyCode::Char('o'));
+
+        assert!(a.actions.is_empty(), "must not open anything from services");
+        assert!(
+            a.message.contains("project"),
+            "message should tell the user to pick a project, got {:?}",
+            a.message
+        );
+    }
+
+    #[test]
+    fn editor_keybind_can_be_remapped() {
+        let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        a.keybinds = load_keybinds("editor = e\n");
+        a.on_key(KeyCode::Tab);
+
+        a.on_key(KeyCode::Char('e'));
+        assert_eq!(a.actions, vec![Action::OpenEditor("blog".into())]);
+
+        a.actions.clear();
+        a.on_key(KeyCode::Char('o'));
+        assert!(a.actions.is_empty(), "the default key must stop working");
+    }
+
+    #[test]
+    fn open_editor_spawns_a_gui_editor_detached() {
+        let t = tempfile::tempdir().unwrap();
+        let (env, site) = editor_env(&t);
+        let runner = SpawnRecorder::default();
+        let mut app = App::new(vec![], vec!["blog".into()]);
+        app.editor = Some(gui_editor());
+
+        perform_action(
+            &env,
+            runner.clone(),
+            &mut app,
+            &Action::OpenEditor("blog".into()),
+        );
+
+        let spawned = runner.spawned.lock().unwrap().clone();
+        assert_eq!(
+            spawned,
+            vec![vec![
+                "/usr/bin/code".to_string(),
+                site.display().to_string()
+            ]]
+        );
+        assert!(app.pending_terminal_editor.is_none());
+        assert!(app.message.contains("blog"), "got {:?}", app.message);
+    }
+
+    #[test]
+    fn open_editor_defers_a_terminal_editor_to_the_event_loop() {
+        let t = tempfile::tempdir().unwrap();
+        let (env, site) = editor_env(&t);
+        let runner = SpawnRecorder::default();
+        let mut app = App::new(vec![], vec!["blog".into()]);
+        app.editor = Some(fine_ill_do_it_myself::editor::Editor {
+            program: std::path::PathBuf::from("/usr/bin/vim"),
+            args: Vec::new(),
+            kind: fine_ill_do_it_myself::editor::EditorKind::Terminal,
+        });
+
+        perform_action(
+            &env,
+            runner.clone(),
+            &mut app,
+            &Action::OpenEditor("blog".into()),
+        );
+
+        assert!(
+            runner.spawned.lock().unwrap().is_empty(),
+            "a terminal editor must not be spawned behind the TUI"
+        );
+        assert_eq!(
+            app.pending_terminal_editor,
+            Some(vec!["/usr/bin/vim".to_string(), site.display().to_string()])
+        );
+    }
+
+    #[test]
+    fn open_editor_without_a_detected_editor_explains_how_to_set_one() {
+        let t = tempfile::tempdir().unwrap();
+        let (env, _site) = editor_env(&t);
+        let runner = SpawnRecorder::default();
+        let mut app = App::new(vec![], vec!["blog".into()]);
+        app.editor = None;
+
+        perform_action(
+            &env,
+            runner.clone(),
+            &mut app,
+            &Action::OpenEditor("blog".into()),
+        );
+
+        assert!(runner.spawned.lock().unwrap().is_empty());
+        assert!(
+            app.message.contains("FIDIM_EDITOR"),
+            "message should name the override variable, got {:?}",
+            app.message
         );
     }
 }

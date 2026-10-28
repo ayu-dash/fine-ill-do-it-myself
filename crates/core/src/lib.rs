@@ -29,4 +29,5 @@ pub fn installer_defaults() -> &'static str {
 }
 pub mod database;
 pub mod dns;
+pub mod editor;
 pub mod lang;
