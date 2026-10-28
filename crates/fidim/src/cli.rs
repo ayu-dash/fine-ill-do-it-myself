@@ -532,8 +532,14 @@ where
 {
     let path = fine_ill_do_it_myself::project::create(&cli.env, name, template, fetcher, runner)?;
     let database = if with_db {
-        fine_ill_do_it_myself::database::create_database(&cli.env, name, runner)?;
-        Some(name.to_string())
+        match fine_ill_do_it_myself::database::create_database(&cli.env, name, runner) {
+            Ok(()) => Some(name.to_string()),
+            Err(e) => {
+                // `new --db` must not leave a project whose database failed.
+                let _ = std::fs::remove_dir_all(&path);
+                return Err(e);
+            }
+        }
     } else {
         None
     };
@@ -1028,6 +1034,39 @@ mod tests {
         let err = php_remove(&cli, "9.9").unwrap_err();
 
         assert!(format!("{err}").contains("not installed"), "{err}");
+    }
+
+    struct FailingRunner;
+
+    impl fine_ill_do_it_myself::proc::CommandRunner for FailingRunner {
+        fn run(&self, _cmd: &[String], _envs: &[(String, String)]) -> Result<String> {
+            Err(Error::Other("database server is down".into()))
+        }
+    }
+
+    #[test]
+    fn new_with_db_rolls_back_the_project_when_the_database_fails() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        let client = cli.env.paths.bin().join("mariadb/mariadb");
+        std::fs::create_dir_all(client.parent().unwrap()).unwrap();
+        std::fs::write(&client, "").unwrap();
+
+        let err = create_project_with(
+            &cli,
+            "shop",
+            fine_ill_do_it_myself::project::Template::Blank,
+            true,
+            &NoFetcher,
+            &FailingRunner,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("database"), "{err}");
+        assert!(
+            !cli.env.paths.sites().join("shop").exists(),
+            "a failed --db must not leave a half project behind"
+        );
     }
 
     #[test]
