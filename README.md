@@ -145,7 +145,7 @@ replaced when it is a fidim symlink, never when a real project folder has that
 name.
 
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
-keys (defaults q/r/s/x/a):
+keys (defaults q/r/s/x/a/o):
 
 ```toml
 quit = z
@@ -153,6 +153,19 @@ restart = t      # restart service under the cursor
 start = b        # start service under the cursor
 stop = n         # stop service under the cursor
 restart_all = g  # stop+start everything
+editor = o       # open the project under the cursor in your code editor
+```
+
+`Enter` on a project opens it in the browser; `o` opens the project folder in a
+code editor. The editor is taken from `FIDIM_EDITOR`, then `$VISUAL`, then
+`$EDITOR`, then the first installed GUI editor (`code`, `codium`, `cursor`,
+`zed`, `subl`, `idea`, `kate`, `geany`) and finally a terminal editor
+(`nvim`, `vim`, `nano`, `hx`, `micro`). GUI editors are spawned detached;
+terminal editors take over the terminal while they run. `FIDIM_EDITOR` may
+carry arguments:
+
+```sh
+FIDIM_EDITOR="code --reuse-window" fidim
 ```
 
 Non-standard ports (no root needed):
