@@ -256,6 +256,23 @@ pub fn start_all<R: Runner + Clone>(
     runner: &R,
     php_version: &str,
 ) -> Result<Vec<crate::service::ServiceStatus>> {
+    start_all_with(
+        env,
+        ports,
+        runner,
+        php_version,
+        &crate::proc::listening_pids,
+    )
+}
+
+/// [`start_all`] with an injected port scan (tests must not touch sockets).
+fn start_all_with<R: Runner + Clone>(
+    env: &Env,
+    ports: &PortPlan,
+    runner: &R,
+    php_version: &str,
+    scan: crate::supervisor::PortScan<'_>,
+) -> Result<Vec<crate::service::ServiceStatus>> {
     let specs = service_cmds(env, ports, php_version)?;
     let sup = Supervisor {
         env: env.clone(),
@@ -270,12 +287,8 @@ pub fn start_all<R: Runner + Clone>(
             continue;
         }
         // orphaned php-fpm pool children survive master death without a pid
-        // file: reclaim by killing whatever already listens on the fpm port
-        if name.starts_with("php-") {
-            for p in crate::proc::listening_pids(fpm_port)? {
-                let _ = crate::proc::RealRunner.kill(p);
-            }
-        }
+        // file: reclaim the port before spawning a new master
+        sup.reap_orphans(&name, scan)?;
         check_port(fpm_port, &bin)?;
         let mut full = vec![bin];
         full.extend(args);
@@ -295,6 +308,25 @@ pub fn start_service<R: Runner + Clone>(
     php_version: &str,
     name: &str,
 ) -> Result<crate::service::ServiceStatus> {
+    start_service_with(
+        env,
+        ports,
+        runner,
+        php_version,
+        name,
+        &crate::proc::listening_pids,
+    )
+}
+
+/// [`start_service`] with an injected port scan (tests must not touch sockets).
+fn start_service_with<R: Runner + Clone>(
+    env: &Env,
+    ports: &PortPlan,
+    runner: &R,
+    php_version: &str,
+    name: &str,
+    scan: crate::supervisor::PortScan<'_>,
+) -> Result<crate::service::ServiceStatus> {
     if name == MARIADB {
         let sup = Supervisor {
             env: env.clone(),
@@ -304,6 +336,7 @@ pub fn start_service<R: Runner + Clone>(
         if sup.status(MARIADB).state == crate::service::ServiceState::Running {
             return Ok(sup.status(MARIADB));
         }
+        sup.reap_orphans(MARIADB, scan)?;
         let cnf = env.paths.etc().join("my.cnf");
         let datadir = env.paths.data().join("mariadb");
         let cmd = mariadb_config(env, &cnf, &datadir, &env.paths.pids(), ports.mariadb)?
@@ -345,6 +378,7 @@ pub fn start_service<R: Runner + Clone>(
     };
     let (name, bin, args, log) =
         spec.ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
+    sup.reap_orphans(&name, scan)?;
     check_port(fpm_port, &bin)?;
     let mut full = vec![bin];
     full.extend(args);
@@ -360,11 +394,7 @@ pub fn start_service<R: Runner + Clone>(
                 if let Some((_, pbin, pargs, plog)) =
                     php_specs.into_iter().find(|(n, ..)| n == &php_service)
                 {
-                    if let Ok(pids) = crate::proc::listening_pids(fpm_port) {
-                        for p in pids {
-                            let _ = crate::proc::RealRunner.kill(p);
-                        }
-                    }
+                    let _ = sup.reap_orphans(&php_service, scan);
                     if check_port(fpm_port, &pbin).is_ok() {
                         let mut pfull = vec![pbin];
                         pfull.extend(pargs);
@@ -922,6 +952,31 @@ mod tests {
         assert!(st
             .iter()
             .all(|s| s.state == crate::service::ServiceState::Stopped));
+    }
+
+    #[test]
+    fn starting_a_php_service_reaps_workers_left_by_a_dead_master() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        std::fs::write(env.paths.bin().join("php-fpm-8.4"), "#!/bin/sh\n").unwrap();
+        // the master is gone but its pool workers still hold the fpm port
+        let f = FakeRunner::default();
+        f.state.spawned.lock().unwrap().push(999);
+        std::fs::write(env.paths.pids().join("php-8.4.pid"), "999").unwrap();
+
+        start_service_with(&env, &PortPlan::default(), &f, "8.4", "php-8.4", &|_| {
+            Ok(vec![999])
+        })
+        .unwrap();
+
+        assert!(
+            f.state.kill_info.lock().unwrap().contains(&999),
+            "orphan workers must be reaped before spawning a new master"
+        );
+        let pid = std::fs::read_to_string(env.paths.pids().join("php-8.4.pid")).unwrap();
+        assert_ne!(pid.trim(), "999", "the stale pid file must be replaced");
     }
 
     #[test]

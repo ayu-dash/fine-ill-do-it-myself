@@ -235,6 +235,10 @@ impl PortPlan {
     }
 }
 
+/// Look up the pids listening on a TCP port. Injected so tests stay off real
+/// sockets; production passes [`crate::proc::listening_pids`].
+pub type PortScan<'a> = &'a dyn Fn(u16) -> std::io::Result<Vec<u32>>;
+
 /// Supervisor: starts/stops services as detached background processes with
 /// PID files. `Runner` and init-directory roots are injected so tests use fakes.
 #[derive(Debug, Clone)]
@@ -283,29 +287,47 @@ impl<R: Runner> Supervisor<R> {
         }
     }
 
+    /// Kill processes still listening on this service's port (php-fpm workers
+    /// outlive their master) and drop a pid file whose process is gone.
+    /// The port lookup is injected so tests never touch real sockets.
+    pub fn reap_orphans(&self, name: &str, scan: PortScan<'_>) -> Result<()> {
+        if let Some(pid) = read_pid_file(&self.env.paths.pids(), name)? {
+            if !self.runner.is_running(pid) {
+                remove_pid_file(&self.env.paths.pids(), name);
+            }
+        }
+        // Only php-fpm (workers outlive the master) and mariadbd (socket
+        // helpers) fork detached children. A web server that died leaves
+        // nothing behind, and its port may belong to a system server we must
+        // never touch.
+        if !forks_detached_children(name) {
+            return Ok(());
+        }
+        let Some(port) = self.orphan_reaping_port(name).filter(|p| *p != 0) else {
+            return Ok(());
+        };
+        let Ok(pids) = scan(port) else {
+            return Ok(());
+        };
+        // For mariadb only touch processes started with OUR my.cnf: a system
+        // MySQL/MariaDB that happens to listen on the same port must survive.
+        let our_cnf = self.env.paths.etc().join("my.cnf");
+        for pid in pids {
+            let ours = name != crate::orchestrator::MARIADB
+                || crate::proc::pid_cmdline_has(pid, our_cnf.as_os_str());
+            if ours {
+                let _ = self.runner.kill(pid);
+            }
+        }
+        Ok(())
+    }
+
     pub fn stop(&self, name: &str) -> Result<()> {
         if let Some(pid) = read_pid_file(&self.env.paths.pids(), name)? {
             self.runner.kill(pid)?;
             remove_pid_file(&self.env.paths.pids(), name);
         }
-        // reap any orphan still holding the service port (workers outlive the master).
-        // For mariadb only touch processes started with OUR my.cnf: a system
-        // MySQL/MariaDB that happens to listen on the same port must survive.
-        if let Some(port) = self.orphan_reaping_port(name) {
-            if port != 0 {
-                let our_cnf = self.env.paths.etc().join("my.cnf");
-                if let Ok(pids) = crate::proc::listening_pids(port) {
-                    for pid in pids {
-                        let ours = name != crate::orchestrator::MARIADB
-                            || crate::proc::pid_cmdline_has(pid, our_cnf.as_os_str());
-                        if ours {
-                            let _ = self.runner.kill(pid);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.reap_orphans(name, &crate::proc::listening_pids)
     }
 
     pub fn status(&self, name: &str) -> ServiceStatus {
@@ -358,6 +380,11 @@ impl<R: Runner> Supervisor<R> {
         v.sort();
         v
     }
+}
+
+/// True for services that spawn detached children which survive their master.
+fn forks_detached_children(name: &str) -> bool {
+    name.starts_with("php-") || name == crate::orchestrator::MARIADB
 }
 
 /// Given a command, wrap it so output is appended to the service log file and
@@ -488,6 +515,86 @@ mod tests {
         assert_eq!(s.orphan_reaping_port("mariadb"), Some(s.ports.mariadb));
         assert_eq!(s.orphan_reaping_port("php-8.4"), Some(9004));
         assert_eq!(s.orphan_reaping_port("something"), None);
+    }
+
+    #[test]
+    fn reap_orphans_kills_php_workers_holding_the_fpm_port() {
+        let s = sup();
+        s.env.ensure_dirs().unwrap();
+        s.runner.alive.lock().unwrap().extend([111, 222]);
+
+        s.reap_orphans("php-8.2", &|port| {
+            assert_eq!(port, 9002, "must scan the port of that php version");
+            Ok(vec![111, 222])
+        })
+        .unwrap();
+
+        assert!(
+            s.runner.alive.lock().unwrap().is_empty(),
+            "orphan workers must be killed"
+        );
+    }
+
+    #[test]
+    fn reap_orphans_clears_a_pid_file_whose_process_is_gone() {
+        let s = sup();
+        s.env.ensure_dirs().unwrap();
+        s.write_pid("php-8.2", 4242).unwrap();
+
+        s.reap_orphans("php-8.2", &|_| Ok(vec![])).unwrap();
+
+        assert_eq!(
+            s.read_pid("php-8.2").unwrap(),
+            None,
+            "a stale pid file must not survive"
+        );
+        assert_eq!(
+            s.status("php-8.2").state,
+            ServiceState::Stopped,
+            "status must not keep reporting Error"
+        );
+    }
+
+    #[test]
+    fn reap_orphans_keeps_our_pid_file_when_the_process_is_alive() {
+        let s = sup();
+        s.env.ensure_dirs().unwrap();
+        s.runner.alive.lock().unwrap().push(77);
+        s.write_pid("php-8.2", 77).unwrap();
+
+        s.reap_orphans("php-8.2", &|_| Ok(vec![])).unwrap();
+
+        assert_eq!(s.read_pid("php-8.2").unwrap(), Some(77));
+    }
+
+    #[test]
+    fn reap_orphans_never_kills_a_foreign_mariadb_on_the_same_port() {
+        let s = sup();
+        s.env.ensure_dirs().unwrap();
+        // pid 111 is not a process of ours: its cmdline lacks our my.cnf
+        s.runner.alive.lock().unwrap().push(111);
+
+        s.reap_orphans("mariadb", &|_| Ok(vec![111])).unwrap();
+
+        assert_eq!(
+            s.runner.alive.lock().unwrap().as_slice(),
+            &[111],
+            "a system MariaDB listening on our port must survive"
+        );
+    }
+
+    #[test]
+    fn reap_orphans_does_not_scan_ports_for_web_servers() {
+        let s = sup();
+        s.env.ensure_dirs().unwrap();
+        s.runner.alive.lock().unwrap().push(111);
+
+        s.reap_orphans("caddy", &|_| {
+            panic!("web servers do not fork detached children; never scan their port")
+        })
+        .unwrap();
+
+        assert_eq!(s.runner.alive.lock().unwrap().as_slice(), &[111]);
     }
 
     #[test]
