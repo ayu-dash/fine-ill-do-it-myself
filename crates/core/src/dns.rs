@@ -164,6 +164,17 @@ pub struct InstallPlan {
     pub unit_body: String,
 }
 
+/// Prefer an installed copy over the current binary, so the user unit keeps
+/// working when the checkout is rebuilt, moved, or cleaned.
+pub fn binary_for_unit(current_exe: &Path, home: &Path) -> PathBuf {
+    let installed = home.join(".local/bin/fidim");
+    if installed.is_file() {
+        installed
+    } else {
+        current_exe.to_path_buf()
+    }
+}
+
 /// Build the install plan without touching the filesystem, so it can be shown
 /// to the user (and tested) before anything runs with root.
 pub fn install_plan(fidim_bin: &Path, home: &Path, port: u16) -> InstallPlan {
@@ -171,7 +182,7 @@ pub fn install_plan(fidim_bin: &Path, home: &Path, port: u16) -> InstallPlan {
         dropin: dropin_path(),
         dropin_body: resolved_dropin(port),
         unit: user_unit_path(home),
-        unit_body: user_unit(fidim_bin, port),
+        unit_body: user_unit(&binary_for_unit(fidim_bin, home), port),
     }
 }
 
@@ -242,6 +253,32 @@ mod tests {
         q[2] |= 0x80; // QR = response
 
         assert!(answer(&q, Ipv4Addr::LOCALHOST).is_none());
+    }
+
+    #[test]
+    fn install_plan_prefers_an_installed_fidim_over_the_current_binary() {
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("fidim"), "#!/bin/sh\n").unwrap();
+
+        let plan = install_plan(
+            Path::new("/repo/target/debug/fidim"),
+            t.path(),
+            DEFAULT_PORT,
+        );
+
+        assert!(
+            plan.unit_body
+                .contains(&bin.join("fidim").display().to_string()),
+            "{}",
+            plan.unit_body
+        );
+        assert!(
+            !plan.unit_body.contains("/repo/target/debug/fidim"),
+            "a dev build path must not end up in the unit\n{}",
+            plan.unit_body
+        );
     }
 
     #[test]
