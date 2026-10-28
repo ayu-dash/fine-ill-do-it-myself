@@ -209,6 +209,24 @@ fn language_representatives(
     reps
 }
 
+/// Focusable regions of the main screen. `Tab`/`Shift+Tab` cycle through them;
+/// the arrow keys and `j`/`k` never leave the active one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Container {
+    Services,
+    Languages,
+    Projects,
+    Management,
+}
+
+/// Cycle order used by `Tab` (and reversed by `Shift+Tab`).
+const CONTAINERS: [Container; 4] = [
+    Container::Services,
+    Container::Languages,
+    Container::Projects,
+    Container::Management,
+];
+
 pub struct App {
     pub services: Vec<ServiceStatus>,
     pub projects: Vec<String>,
@@ -351,10 +369,8 @@ impl App {
         match key {
             KeyCode::Down | KeyCode::Char('j') => self.cursor_move(1),
             KeyCode::Up | KeyCode::Char('k') => self.cursor_move(-1),
-            KeyCode::Tab => {
-                self.panel_right = !self.panel_right;
-                self.clamp_cursor();
-            }
+            KeyCode::Tab => self.cycle_container(1),
+            KeyCode::BackTab => self.cycle_container(-1),
             KeyCode::Char('d') => {
                 if self.cursor() < self.services.len() && !self.panel_right {
                     let name = self.services[self.cursor()].name.clone();
@@ -509,20 +525,76 @@ impl App {
         }
     }
 
-    /// Service/project indices that actually have a visible row in the left
-    /// panel: non-language services, one row per language family, projects.
-    fn visible_left_rows(&self) -> Vec<usize> {
-        let mut rows: Vec<usize> = (0..self.services.len())
-            .filter(|&i| !is_language(&self.services[i].name))
-            .collect();
-        rows.extend(
-            self.language_reps
+    /// Which container currently holds the cursor.
+    fn container(&self) -> Container {
+        if self.panel_right {
+            return Container::Management;
+        }
+        if self.cursor_left < self.services.len() {
+            if is_language(&self.services[self.cursor_left].name) {
+                Container::Languages
+            } else {
+                Container::Services
+            }
+        } else {
+            Container::Projects
+        }
+    }
+
+    /// Visible row indices of one container. `Management` has no left rows.
+    fn container_rows(&self, container: Container) -> Vec<usize> {
+        match container {
+            Container::Services => (0..self.services.len())
+                .filter(|&i| !is_language(&self.services[i].name))
+                .collect(),
+            Container::Languages => self
+                .language_reps
                 .iter()
                 .copied()
-                .filter(|&i| i < self.services.len()),
-        );
-        rows.extend(self.services.len()..self.services.len() + self.projects.len());
-        rows
+                .filter(|&i| i < self.services.len())
+                .collect(),
+            Container::Projects => {
+                (self.services.len()..self.services.len() + self.projects.len()).collect()
+            }
+            Container::Management => Vec::new(),
+        }
+    }
+
+    /// Give the focus to `container`, landing on its first row.
+    fn focus_container(&mut self, container: Container) {
+        match container {
+            Container::Management => {
+                self.panel_right = true;
+                self.cursor_right = 0;
+                self.clamp_cursor();
+                self.skip_unselectable(1);
+            }
+            other => {
+                self.panel_right = false;
+                if let Some(&row) = self.container_rows(other).first() {
+                    self.cursor_left = row;
+                }
+                self.normalize_left_cursor();
+            }
+        }
+    }
+
+    /// `Tab`/`Shift+Tab`: move the focus to the next/previous container,
+    /// skipping the ones that have no rows. Only these keys change containers;
+    /// the arrows stay inside the active one.
+    fn cycle_container(&mut self, direction: i32) {
+        let available: Vec<Container> = CONTAINERS
+            .iter()
+            .copied()
+            .filter(|c| *c == Container::Management || !self.container_rows(*c).is_empty())
+            .collect();
+        if available.is_empty() {
+            return;
+        }
+        let current = self.container();
+        let index = available.iter().position(|c| *c == current).unwrap_or(0) as i32;
+        let next = (index + direction).rem_euclid(available.len() as i32) as usize;
+        self.focus_container(available[next]);
     }
 
     /// Move a cursor that landed on a hidden language version to that family's
@@ -548,39 +620,16 @@ impl App {
 
     fn cursor_move(&mut self, by: i32) {
         if !self.panel_right {
-            let rows = self.visible_left_rows();
+            let rows = self.container_rows(self.container());
             if rows.is_empty() {
-                self.cursor_left = 0;
-                // nothing to select on the left: flow into the right panel
-                if by > 0 {
-                    self.focus_right_panel();
-                }
                 return;
             }
-            let cur = self.cursor_left;
-            let pos = match rows.iter().position(|&r| r == cur) {
-                Some(pos) => pos as i32,
-                // cursor on a hidden version: land on the next visible row in
-                // the direction of travel instead of stepping through it
-                None if by >= 0 => {
-                    rows.iter().position(|&r| r > cur).unwrap_or(rows.len() - 1) as i32
-                }
-                None => rows.iter().rposition(|&r| r < cur).unwrap_or(0) as i32,
-            };
-            let next = pos + by;
-            // stepping past the last row crosses into the right panel instead
-            // of stopping at the edge (j/arrow-down should reach every panel)
-            if next >= rows.len() as i32 {
-                self.focus_right_panel();
-                return;
-            }
-            self.cursor_left = rows[next.clamp(0, rows.len() as i32 - 1) as usize];
-            return;
-        }
-        // stepping up from the first selectable management line returns to the
-        // left list, so k/arrow-up reaches every panel too
-        if by < 0 && !self.has_selectable_above() {
-            self.focus_left_panel();
+            let pos = rows
+                .iter()
+                .position(|&r| r == self.cursor_left)
+                .unwrap_or(0) as i32;
+            let next = (pos + by).clamp(0, rows.len() as i32 - 1) as usize;
+            self.cursor_left = rows[next];
             return;
         }
         let cur = self.cursor_mut();
@@ -591,32 +640,6 @@ impl App {
         if self.detail.is_some() {
             self.skip_unselectable(by);
         }
-    }
-
-    /// Move focus to the right panel, landing on its first selectable line.
-    fn focus_right_panel(&mut self) {
-        self.panel_right = true;
-        self.cursor_right = 0;
-        self.clamp_cursor();
-        self.skip_unselectable(1);
-    }
-
-    /// Move focus back to the left list, landing on its last visible row.
-    fn focus_left_panel(&mut self) {
-        self.panel_right = false;
-        self.cursor_left = self.visible_left_rows().last().copied().unwrap_or(0);
-        self.normalize_left_cursor();
-    }
-
-    /// Is there any selectable management line above the current cursor?
-    fn has_selectable_above(&self) -> bool {
-        if self.mgmt_lines.is_empty() {
-            return self.cursor_right > 0;
-        }
-        self.mgmt_lines
-            .iter()
-            .take(self.cursor_right)
-            .any(|l| Self::is_mgmt_selectable(l))
     }
 
     /// Check whether a management panel line is selectable (non-empty and not
@@ -1746,72 +1769,83 @@ mod tests {
     }
 
     #[test]
-    fn arrow_keys_walk_the_left_list_and_flow_into_the_right_panel() {
+    fn arrows_clamp_inside_the_services_container() {
         let mut a = App::new(
-            vec![svc("caddy", false), svc("php-8.4", false)],
+            vec![svc("caddy", false), svc("mariadb", false)],
             vec!["blog".into()],
         );
         a.on_key(KeyCode::Down);
         assert_eq!(a.cursor_left, 1);
         a.on_key(KeyCode::Down);
-        assert_eq!(a.cursor_left, 2, "cursor walks past services into projects");
-        a.on_key(KeyCode::Down);
-        assert!(a.panel_right, "one more step crosses into the right panel");
+        assert_eq!(a.cursor_left, 1, "must not walk into projects");
+        assert_eq!(focused_panel(&a), "services");
         a.on_key(KeyCode::Up);
-        assert!(
-            !a.panel_right,
-            "up from the top of the right panel goes back"
-        );
-        assert_eq!(a.cursor_left, 2, "lands on the last visible left row");
-        a.on_key(KeyCode::Char('k'));
-        assert_eq!(a.cursor_left, 1);
+        assert_eq!(a.cursor_left, 0);
+        a.on_key(KeyCode::Up);
+        assert_eq!(a.cursor_left, 0, "clamped at the first service");
     }
 
     #[test]
-    fn j_at_the_last_left_row_flows_into_the_right_panel() {
-        let mut a = App::new(vec![svc("caddy", false)], vec!["blog".into()]);
-        a.on_key(KeyCode::Char('j'));
-        assert_eq!(a.cursor_left, 1, "on the project row");
-        assert!(!a.panel_right);
-
-        a.on_key(KeyCode::Char('j'));
-
-        assert!(a.panel_right, "j must cross into the management panel");
-        assert_eq!(a.cursor_right, 0);
-    }
-
-    #[test]
-    fn k_at_the_first_right_panel_row_flows_back_to_the_left_list() {
-        let mut a = App::new(vec![svc("caddy", false)], vec!["blog".into()]);
-        a.panel_right = true;
-        a.cursor_right = 0;
-
-        a.on_key(KeyCode::Char('k'));
-
-        assert!(!a.panel_right);
-        assert_eq!(a.cursor_left, 1, "lands on the last visible left row");
-    }
-
-    #[test]
-    fn down_at_the_bottom_of_the_right_panel_stays_in_that_panel() {
-        let mut a = App::new(vec![svc("caddy", false)], vec![]);
-        a.panel_right = true;
-        a.cursor_right = 0;
-
-        a.on_key(KeyCode::Char('j'));
-
-        assert!(a.panel_right, "the right panel clamps at its end");
-        assert_eq!(a.cursor_right, 0);
-    }
-
-    #[test]
-    fn down_with_an_empty_left_list_still_reaches_the_right_panel() {
-        let mut a = App::new(vec![], vec![]);
+    fn arrows_clamp_inside_the_projects_container() {
+        let mut a = App::new(vec![svc("caddy", false)], vec!["a".into(), "b".into()]);
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "projects", "no languages installed");
 
         a.on_key(KeyCode::Down);
+        assert_eq!(a.cursor_left, 2);
+        a.on_key(KeyCode::Down);
+        assert_eq!(a.cursor_left, 2, "clamped at the last project");
+    }
 
-        assert!(a.panel_right);
-        assert_eq!(a.cursor_right, 0);
+    #[test]
+    fn tab_cycles_through_every_container() {
+        let mut a = App::new(
+            vec![svc("caddy", false), svc("php-8.4", false)],
+            vec!["blog".into()],
+        );
+        assert_eq!(focused_panel(&a), "services");
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "languages");
+        assert_eq!(a.cursor_left, 1);
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "projects");
+        assert_eq!(a.cursor_left, 2);
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "management");
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "services");
+        assert_eq!(a.cursor_left, 0);
+    }
+
+    #[test]
+    fn tab_skips_containers_without_rows() {
+        let mut a = App::new(vec![svc("caddy", false)], vec![]);
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "management");
+
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "services");
+    }
+
+    #[test]
+    fn backtab_walks_containers_backwards() {
+        let mut a = App::new(
+            vec![svc("caddy", false), svc("php-8.4", false)],
+            vec!["blog".into()],
+        );
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "languages");
+
+        a.on_key(KeyCode::BackTab);
+        assert_eq!(focused_panel(&a), "services");
+
+        a.on_key(KeyCode::BackTab);
+        assert_eq!(focused_panel(&a), "management");
     }
 
     #[test]
@@ -1870,15 +1904,15 @@ mod tests {
         a.on_key(KeyCode::Char('s'));
         assert_eq!(a.actions[0], Action::StartService(0));
         a.actions.clear();
-        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Tab); // services -> languages (php-8.4)
         a.on_key(KeyCode::Char('x'));
         assert_eq!(a.actions[0], Action::StopService(1));
         a.actions.clear();
         a.on_key(KeyCode::Char('r'));
         assert_eq!(a.actions[0], Action::RestartService(1));
-        // on the projects panel `r` restarts everything
+        // on the projects container `r` restarts everything
         a.actions.clear();
-        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Tab); // languages -> projects
         a.on_key(KeyCode::Char('r'));
         assert_eq!(a.actions[0], Action::RestartAll);
     }
@@ -1900,21 +1934,26 @@ mod tests {
             vec!["blog".into()],
         );
 
-        // one step per visible row: services, one row per language family,
-        // then projects. Hidden versions must not consume key presses.
+        // Tab into the languages container; from there one step per visible
+        // family row. Hidden versions must not consume key presses, and the
+        // arrows must not leak into the neighbouring containers.
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "languages");
+        assert_eq!(a.cursor_left, 2, "starts on the php family row");
+
         let mut down = vec![a.cursor_left];
-        for _ in 0..7 {
+        for _ in 0..4 {
             a.on_key(KeyCode::Down);
             down.push(a.cursor_left);
         }
-        assert_eq!(down, vec![0, 1, 2, 4, 6, 7, 8, 9], "down path");
+        assert_eq!(down, vec![2, 4, 6, 7, 8], "one row per language family");
 
         let mut up = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..5 {
             a.on_key(KeyCode::Up);
             up.push(a.cursor_left);
         }
-        assert_eq!(up, vec![8, 7, 6, 4, 2, 1, 0], "up path");
+        assert_eq!(up, vec![7, 6, 4, 2, 2], "up path clamps at the top");
     }
 
     #[test]
@@ -1957,9 +1996,9 @@ mod tests {
     fn focused_panel_follows_cursor_into_projects() {
         let mut a = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
         assert_eq!(focused_panel(&a), "services");
-        a.on_key(KeyCode::Down);
-        assert_eq!(focused_panel(&a), "projects");
-        a.on_key(KeyCode::Up);
+        a.on_key(KeyCode::Tab);
+        assert_eq!(focused_panel(&a), "projects", "no languages installed");
+        a.on_key(KeyCode::BackTab);
         assert_eq!(focused_panel(&a), "services");
     }
 
@@ -2494,14 +2533,14 @@ mod tests {
 
         // Cursor at 0: services container
         assert_eq!(focused_panel(&a), "services");
-        // Cursor at 1: services container
+        // Cursor at 1: still services
         a.on_key(KeyCode::Down);
         assert_eq!(focused_panel(&a), "services");
-        // Cursor at 2: languages container
-        a.on_key(KeyCode::Down);
+        // Tab crosses into the languages container
+        a.on_key(KeyCode::Tab);
         assert_eq!(focused_panel(&a), "languages");
-        // Cursor at 3: projects container
-        a.on_key(KeyCode::Down);
+        // Tab again reaches projects
+        a.on_key(KeyCode::Tab);
         assert_eq!(focused_panel(&a), "projects");
     }
 
