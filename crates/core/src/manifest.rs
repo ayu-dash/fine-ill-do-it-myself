@@ -237,6 +237,85 @@ files = ["caddy"]
     }
 
     #[test]
+    fn bundled_manifest_offers_new_language_versions() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        for name in [
+            "node-24",
+            "node-26",
+            "python-3.13",
+            "python-3.14",
+            "python-3.15",
+            "go-1.26",
+            "go-1.27",
+            "java-25",
+        ] {
+            assert!(m.find(name).is_some(), "manifest is missing {name}");
+        }
+    }
+
+    #[test]
+    fn bundled_language_entries_are_pinned_https_and_installable() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        for lang in ["node", "python", "go", "java"] {
+            let prefix = format!("{lang}-");
+            let entries: Vec<_> = m
+                .binaries
+                .iter()
+                .filter(|b| b.name.starts_with(&prefix))
+                .collect();
+            assert!(
+                entries.len() >= 3,
+                "{lang} should offer at least 3 versions, got {}",
+                entries.len()
+            );
+            for b in entries {
+                let short = b.name.trim_start_matches(&prefix);
+                assert!(
+                    b.url.starts_with("https://"),
+                    "{} url must be https",
+                    b.name
+                );
+                assert_eq!(
+                    b.sha256.len(),
+                    64,
+                    "{} sha256 must be pinned (got {:?})",
+                    b.name,
+                    b.sha256
+                );
+                assert!(
+                    b.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{} sha256 must be hex",
+                    b.name
+                );
+                assert!(b.tar_gz, "{} must be a tarball", b.name);
+                assert_eq!(
+                    b.install_dir,
+                    format!("{lang}/{short}"),
+                    "{} install_dir",
+                    b.name
+                );
+                assert!(
+                    b.version.starts_with(&format!("{short}.")),
+                    "{} version {} should start with {short}.",
+                    b.name,
+                    b.version
+                );
+                assert!(!b.files.is_empty(), "{} needs files", b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_manifest_has_unique_binary_names() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let mut names: Vec<&str> = m.binaries.iter().map(|b| b.name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate manifest entry names");
+    }
+
+    #[test]
     fn php_manager_lists_installed_versions() {
         let t = tempfile::tempdir().unwrap();
         let bin = t.path().join("bin");

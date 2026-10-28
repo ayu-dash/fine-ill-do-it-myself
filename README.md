@@ -31,6 +31,21 @@ fidim php install 8.4
 fidim php use 8.4
 ```
 
+Language runtimes are managed per version:
+
+```sh
+fidim node install 24       # available: 20, 22, 24, 26
+fidim node use 24
+fidim python install 3.13   # available: 3.11, 3.12, 3.13, 3.14, 3.15
+fidim go install 1.27       # available: 1.22, 1.23, 1.26, 1.27
+fidim java install 25       # available: 17, 21, 25
+fidim node list             # installed versions (plus `system` when found)
+```
+
+Each runtime is extracted under the data root (`runtimes/<lang>/<major>/`) with
+its binaries symlinked into `bin/<lang>/`; `fidim <lang> use <version>` switches
+the active `bin/<lang>/<lang>` symlink. Checksums are pinned in the manifest.
+
 ## Day to day
 
 ```sh
