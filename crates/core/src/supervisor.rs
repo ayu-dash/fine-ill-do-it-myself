@@ -288,12 +288,19 @@ impl<R: Runner> Supervisor<R> {
             self.runner.kill(pid)?;
             remove_pid_file(&self.env.paths.pids(), name);
         }
-        // reap any orphan still holding the service port (workers outlive the master)
+        // reap any orphan still holding the service port (workers outlive the master).
+        // For mariadb only touch processes started with OUR my.cnf: a system
+        // MySQL/MariaDB that happens to listen on the same port must survive.
         if let Some(port) = self.orphan_reaping_port(name) {
             if port != 0 {
+                let our_cnf = self.env.paths.etc().join("my.cnf");
                 if let Ok(pids) = crate::proc::listening_pids(port) {
                     for pid in pids {
-                        let _ = self.runner.kill(pid);
+                        let ours = name != crate::orchestrator::MARIADB
+                            || crate::proc::pid_cmdline_has(pid, our_cnf.as_os_str());
+                        if ours {
+                            let _ = self.runner.kill(pid);
+                        }
                     }
                 }
             }

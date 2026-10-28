@@ -148,6 +148,22 @@ pub fn listening_pids(port: u16) -> std::result::Result<Vec<u32>, std::io::Error
     Ok(out)
 }
 
+/// Does a NUL-separated `/proc/<pid>/cmdline` buffer contain `arg` verbatim?
+/// Used to distinguish fidim-spawned processes from unrelated ones that happen
+/// to listen on the same port.
+pub fn cmdline_has(raw: &[u8], arg: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let needle = arg.as_bytes();
+    !needle.is_empty() && raw.split(|b| *b == 0).any(|part| part == needle)
+}
+
+/// Read `/proc/<pid>/cmdline` and match one argument; false when unreadable.
+pub fn pid_cmdline_has(pid: u32, arg: &std::ffi::OsStr) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| cmdline_has(&raw, arg))
+        .unwrap_or(false)
+}
+
 pub fn write_pid_file(dir: &Path, name: &str, pid: u32) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join(format!("{name}.pid")), pid.to_string())
@@ -176,5 +192,16 @@ mod tests {
         assert_eq!(read_pid_file(t.path(), "caddy").unwrap(), Some(42));
         remove_pid_file(t.path(), "caddy");
         assert_eq!(read_pid_file(t.path(), "caddy").unwrap(), None);
+    }
+
+    #[test]
+    fn cmdline_matches_only_the_exact_argument() {
+        use std::ffi::OsStr;
+        let ours = b"/opt/mariadb/bin/mariadbd\0--defaults-file\0/app/etc/my.cnf\0";
+        let system = b"/usr/sbin/mysqld\0--defaults-file\0/etc/mysql/my.cnf\0";
+        let cnf = OsStr::new("/app/etc/my.cnf");
+        assert!(cmdline_has(ours, cnf));
+        assert!(!cmdline_has(system, cnf));
+        assert!(!cmdline_has(b"", cnf));
     }
 }
