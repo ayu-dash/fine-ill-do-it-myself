@@ -266,7 +266,7 @@ pub fn install<F: Fetcher>(
         pinned.or_else(|| {
             lock.binaries
                 .get(name)
-                .filter(|h| !h.sha256.is_empty())
+                .filter(|h| !h.sha256.is_empty() && h.url == src.url)
                 .map(|e| &e.sha256)
         })
     };
@@ -277,6 +277,7 @@ pub fn install<F: Fetcher>(
     }
     // record sha so future reinstalls/re-images verify integrity
     let entry = lock.binaries.entry(name.to_string()).or_default();
+    entry.url = src.url.clone();
     entry.sha256 = hex.clone();
     let _ = entry;
     lock.save(&env.lock_path())?;
@@ -297,7 +298,8 @@ pub fn install<F: Fetcher>(
     // expose the binary under its manifest name (e.g. php-fpm-8.4)
     if let Some(first) = targets.first() {
         let want = dest.join(name);
-        if *first != want && !want.exists() {
+        if *first != want {
+            let _ = fs::remove_file(&want);
             fs::hard_link(first, &want).or_else(|_| fs::copy(first, &want).map(|_| ()))?;
         }
     }

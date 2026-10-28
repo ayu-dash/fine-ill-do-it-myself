@@ -15,37 +15,86 @@ sha256 = "5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd"
 tar_gz = true
 files = ["caddy"]
 
+# ─── MariaDB (portable Linux x86_64 binary tarball) ──────────────────────────
+[[binaries]]
+name = "mariadb"
+version = "11.4.13"
+url = "https://archive.mariadb.org/mariadb-11.4.13/bintar-linux-systemd-x86_64/mariadb-11.4.13-linux-systemd-x86_64.tar.gz"
+sha256 = "3cebf63914df3154b7cb6d548337eb2be42c773aeb641110446b72e2746cfed7"
+tar_gz = true
+install_dir = "mariadb/11.4.13"
+strip_components = 1
+files = [
+  "bin/mariadbd:mariadb/mariadbd",
+  "scripts/mariadb-install-db:mariadb/mariadb-install-db",
+  "bin/mariadb-admin:mariadb/mariadb-admin",
+  "bin/mariadb:mariadb/mariadb",
+  "bin/mysql:mariadb/mysql",
+]
+
 [[binaries]]
 name = "php-fpm-8.1"
 version = "8.1.34"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.1.34-fpm-linux-x86_64.tar.gz"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.1.34-fpm-linux-x86_64.tar.gz"
 sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.1"]
 
 [[binaries]]
 name = "php-fpm-8.2"
-version = "8.2.30"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.2.30-fpm-linux-x86_64.tar.gz"
+version = "8.2.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.2.32-fpm-linux-x86_64.tar.gz"
 sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.2"]
 
 [[binaries]]
 name = "php-fpm-8.3"
-version = "8.3.15"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.3.15-fpm-linux-x86_64.tar.gz"
+version = "8.3.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.3.32-fpm-linux-x86_64.tar.gz"
 sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.3"]
 
 [[binaries]]
 name = "php-fpm-8.4"
 version = "8.4.23"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.4.23-fpm-linux-x86_64.tar.gz"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.4.23-fpm-linux-x86_64.tar.gz"
 sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.4"]
+
+[[binaries]]
+name = "php-8.1"
+version = "8.1.34"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.1.34-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.1"]
+
+[[binaries]]
+name = "php-8.2"
+version = "8.2.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.2.32-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.2"]
+
+[[binaries]]
+name = "php-8.3"
+version = "8.3.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.3.32-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.3"]
+
+[[binaries]]
+name = "php-8.4"
+version = "8.4.23"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.4.23-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.4"]
 
 # ─── Node.js ────────────────────────────────────────────────────────────────
 # Tarballs have a top-level wrapper dir (node-v22.11.0-linux-x64/), so strip_components=1.

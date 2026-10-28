@@ -284,6 +284,24 @@ pub fn start_service<R: Runner + Clone>(
     php_version: &str,
     name: &str,
 ) -> Result<crate::service::ServiceStatus> {
+    if name == MARIADB {
+        let sup = Supervisor {
+            env: env.clone(),
+            ports: ports.clone(),
+            runner: runner.clone(),
+        };
+        if sup.status(MARIADB).state == crate::service::ServiceState::Running {
+            return Ok(sup.status(MARIADB));
+        }
+        let cnf = env.paths.etc().join("my.cnf");
+        let datadir = env.paths.data().join("mariadb");
+        let cmd = mariadb_config(env, &cnf, &datadir, &env.paths.pids(), ports.mariadb)?
+            .ok_or_else(|| Error::Other("MariaDB binary was not resolved".into()))?;
+        let wrapped = with_log_append(&cmd, &env.paths.logs().join("mariadb.log"))?;
+        let pid = sup.runner.spawn(&wrapped)?;
+        sup.write_pid(MARIADB, pid)?;
+        return Ok(sup.status(MARIADB));
+    }
     generate_configs(env, ports, php_version)?;
     let sup = Supervisor {
         env: env.clone(),
@@ -849,6 +867,24 @@ mod tests {
     }
 
     #[test]
+    fn start_service_runs_managed_mariadb_without_php_or_web_binaries() {
+        let (env, _t) = env();
+        let basedir = env.paths.runtimes().join("mariadb/11.4.13");
+        let server = basedir.join("bin/mariadbd");
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::write(&server, "managed mariadbd").unwrap();
+        std::fs::create_dir_all(env.paths.data().join("mariadb/mysql")).unwrap();
+
+        let runner = FakeRunner::default();
+        let status = start_service(&env, &PortPlan::default(), &runner, "8.4", MARIADB).unwrap();
+        assert_eq!(status.name, MARIADB);
+        assert_eq!(status.state, crate::service::ServiceState::Running);
+        let config = std::fs::read_to_string(env.paths.etc().join("my.cnf")).unwrap();
+        assert!(config.contains(&format!("basedir = {}", basedir.display())));
+        assert!(config.contains("socket = "));
+    }
+
+    #[test]
     fn status_all_shows_chosen_web_only() {
         // apache binary is absent in the temp env, yet the chosen one is listed
         let (env, _t) = env();
@@ -943,7 +979,7 @@ mod tests {
     }
 }
 
-/// Add mariadb config + start command if the system mariadbd is usable.
+/// Add MariaDB config + start command when a managed or system server is usable.
 pub fn mariadb_config(
     env: &Env,
     cnf_path: &Path,
@@ -952,13 +988,14 @@ pub fn mariadb_config(
     port: u16,
 ) -> Result<Option<Vec<String>>> {
     env.ensure_dirs()?;
-    let bin = find_mariadbd().ok_or_else(|| Error::Other(
-        "mariadb not found in PATH; install via apt/dnf/pacman, or add a `mariadb` tarball source in the manifest".into(),
-    ))?;
+    let (bin, basedir) = resolve_mariadb(env).ok_or_else(|| {
+        Error::Other("MariaDB not found; install with `fidim install mariadb`".into())
+    })?;
     std::fs::create_dir_all(socket_dir)?;
     let socket = socket_dir.join("db.sock");
     let log = env.paths.logs().join("mariadb.log");
     let cnf = generate_mariadb_cnf(
+        basedir.display().to_string().trim_end_matches('/'),
         datadir.display().to_string().trim_end_matches('/'),
         socket.display().to_string().trim_end_matches('/'),
         port,
@@ -968,49 +1005,98 @@ pub fn mariadb_config(
     )?;
     std::fs::write(cnf_path, &cnf)?;
     if datadir_missing(datadir) {
-        // first run: initialise the system tables
-        init_datadir(&bin, datadir)?;
+        init_datadir(env, &basedir, datadir)?;
     }
-    Ok(Some(mariadb_start_cmd(&bin, cnf_path)))
+    Ok(Some(mariadb_start_cmd(&bin, &basedir, cnf_path)))
 }
 
-/// Locate a `mariadbd` binary in PATH (no network, no install).
-pub fn find_mariadbd() -> Option<PathBuf> {
+/// Resolve a FIDIM-managed MariaDB first, then retain support for system installs.
+fn resolve_mariadb(env: &Env) -> Option<(PathBuf, PathBuf)> {
+    let runtime_root = env.paths.runtimes().join("mariadb");
+    if let Ok(versions) = std::fs::read_dir(&runtime_root) {
+        let mut versions: Vec<_> = versions
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        versions.sort_by_key(|entry| entry.file_name());
+        for version in versions.into_iter().rev() {
+            let basedir = version.path();
+            let managed_bin = basedir.join("bin/mariadbd");
+            if managed_bin.is_file() {
+                return Some((managed_bin, basedir));
+            }
+        }
+    }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let p = dir.join("mariadbd");
-        if p.exists() {
-            return Some(p);
-        }
-        let p2 = dir.join("mysqld");
-        if p2.exists() {
-            return Some(p2);
+        for name in ["mariadbd", "mysqld"] {
+            let bin = dir.join(name);
+            if bin.is_file() {
+                let base = bin
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("/usr"))
+                    .to_path_buf();
+                return Some((bin, base));
+            }
         }
     }
     None
 }
 
-fn init_datadir(bin_v: &Path, datadir: &Path) -> Result<()> {
-    let init = bin_v
-        .parent()
-        .unwrap_or(Path::new("/usr/bin"))
-        .join("mariadb-install-db");
-    let init = if !init.exists() {
-        bin_v.with_file_name("mysql_install_db")
-    } else {
-        init
-    };
-    if !init.exists() {
-        return Err(Error::Other(format!(
-            "datadir init tool not found next to {}; initialise manually first",
-            bin_v.display()
-        )));
+/// Locate MariaDB in the selected data root or on PATH.
+pub fn find_mariadbd(env: &Env) -> Option<PathBuf> {
+    resolve_mariadb(env).map(|(bin, _)| bin)
+}
+fn init_datadir(env: &Env, basedir: &Path, datadir: &Path) -> Result<()> {
+    let server_bin = resolve_mariadb(env)
+        .map(|(bin, _)| bin)
+        .ok_or_else(|| Error::Other("MariaDB server binary is missing".into()))?;
+    let mut candidates = vec![
+        basedir.join("scripts/mariadb-install-db"),
+        basedir.join("bin/mariadb-install-db"),
+        basedir.join("bin/mysql_install_db"),
+        server_bin.with_file_name("mariadb-install-db"),
+        server_bin.with_file_name("mysql_install_db"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("mariadb-install-db"));
+            candidates.push(dir.join("mysql_install_db"));
+        }
     }
-    std::process::Command::new(init)
+    let init = candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "MariaDB initializer not found under {} or on PATH",
+                basedir.display()
+            ))
+        })?;
+    let lib = basedir.join("lib");
+    let mysql_lib = basedir.join("lib/mysql");
+    let mut library_paths = vec![lib];
+    if mysql_lib.is_dir() {
+        library_paths.push(mysql_lib);
+    }
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        library_paths.extend(std::env::split_paths(&existing));
+    }
+    let library_path = std::env::join_paths(library_paths)
+        .map_err(|e| Error::Other(format!("invalid MariaDB library path: {e}")))?;
+    let status = std::process::Command::new(init)
+        .arg(format!("--basedir={}", basedir.display()))
         .arg(format!("--datadir={}", datadir.display()))
         .arg("--auth-root-authentication-method=normal")
         .arg("--skip-test-db")
+        .env("LD_LIBRARY_PATH", library_path)
         .status()?;
+    if !status.success() {
+        return Err(Error::Other(
+            "MariaDB data directory initialization failed".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1018,8 +1104,8 @@ pub const MARIADB: &str = "mariadb";
 pub const MARIADB_SOCKET: &str = "db.sock";
 
 /// Is a mariadbd binary usable on this system?
-pub fn mariadb_available(_env: &Env) -> Result<bool> {
-    Ok(find_mariadbd().is_some())
+pub fn mariadb_available(env: &Env) -> Result<bool> {
+    Ok(find_mariadbd(env).is_some())
 }
 
 #[cfg(test)]
@@ -1051,6 +1137,17 @@ mod mariadb_tests {
         std::env::set_var("PATH", "");
         assert!(!mariadb_available(&env).unwrap());
         std::env::remove_var("PATH");
+    }
+
+    #[test]
+    fn managed_mariadb_binary_is_resolved_without_path_install() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let basedir = env.paths.runtimes().join("mariadb/11.4.13");
+        let bin = basedir.join("bin/mariadbd");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "binary").unwrap();
+        assert_eq!(resolve_mariadb(&env), Some((bin, basedir)));
     }
 }
 
@@ -1188,24 +1285,24 @@ fn service_cmds(env: &Env, ports: &PortPlan, php_version: &str) -> Result<Vec<Cm
         env.paths.logs().join(format!("php-{php_version}.log")),
     ));
     // mariadb (system binary) when available
-    if let Ok(true) = mariadb_available(env) {
+    if mariadb_available(env).unwrap_or(false) {
         let mariadb_cnf = env.paths.etc().join("my.cnf");
         let db_data = env.paths.data().join("mariadb");
         std::fs::create_dir_all(&db_data)?;
-        if let Ok(Some(cmd)) = mariadb_config(
+        let cmd = mariadb_config(
             env,
             &mariadb_cnf,
             &db_data,
             &env.paths.pids(),
             ports.mariadb,
-        ) {
-            cmds.push((
-                MARIADB.to_string(),
-                cmd[0].clone(),
-                cmd[1..].to_vec(),
-                env.paths.logs().join("mariadb.log"),
-            ));
-        }
+        )?
+        .ok_or_else(|| Error::Other("MariaDB binary was not resolved".into()))?;
+        cmds.push((
+            MARIADB.to_string(),
+            cmd[0].clone(),
+            cmd[1..].to_vec(),
+            env.paths.logs().join("mariadb.log"),
+        ));
     }
     Ok(cmds)
 }

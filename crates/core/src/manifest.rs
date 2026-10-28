@@ -48,9 +48,13 @@ pub struct ManifestEntry {
 }
 
 impl Manifest {
+    pub fn parse(text: &str) -> Result<Self, std::io::Error> {
+        toml::from_str(text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let s = std::fs::read_to_string(path)?;
-        toml::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        Self::parse(&s)
     }
     pub fn save(&self, path: &Path) -> Result<(), std::io::Error> {
         let s = toml::to_string_pretty(self)

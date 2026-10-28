@@ -27,10 +27,16 @@ impl CliEnv {
         };
         let env = Env::new(root, sites);
         let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+        let php_default = std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| {
+            Lock::load(&env.lock_path())
+                .ok()
+                .and_then(|l| l.php_default)
+                .unwrap_or_else(|| "8.4".into())
+        });
         CliEnv {
             env,
             ports,
-            php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
+            php_default,
         }
     }
     /// Project layout: everything under <project_root>/.fidim,
@@ -38,10 +44,16 @@ impl CliEnv {
     pub fn real() -> Result<Self> {
         let env = Env::load_real()?;
         let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+        let php_default = std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| {
+            Lock::load(&env.lock_path())
+                .ok()
+                .and_then(|l| l.php_default)
+                .unwrap_or_else(|| "8.4".into())
+        });
         Ok(CliEnv {
             env,
             ports,
-            php_default: std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| "8.4".into()),
+            php_default,
         })
     }
 }
@@ -98,15 +110,33 @@ pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
 
 pub fn load_or_default_manifest(cli: &CliEnv) -> Result<Manifest> {
     let path = cli.env.manifest_path();
+    let defaults = fine_ill_do_it_myself::installer_defaults();
     if !path.exists() {
-        std::fs::write(&path, fine_ill_do_it_myself::installer_defaults())?;
+        std::fs::write(&path, defaults)?;
+        return Manifest::load(&path).map_err(fine_ill_do_it_myself::Error::Io);
     }
-    Manifest::load(&path).map_err(fine_ill_do_it_myself::Error::Io)
+
+    let mut manifest = Manifest::load(&path).map_err(fine_ill_do_it_myself::Error::Io)?;
+    let bundled = Manifest::parse(defaults)?;
+    for source in bundled.binaries {
+        if !manifest
+            .binaries
+            .iter()
+            .any(|existing| existing.name == source.name)
+        {
+            manifest.binaries.push(source);
+        }
+    }
+    Ok(manifest)
 }
 
 /// Install a php version from the manifest (download static build).
 pub fn php_install(cli: &CliEnv, version: &str) -> Result<()> {
     install(cli, &format!("php-fpm-{version}"))?;
+    let manifest = load_or_default_manifest(cli)?;
+    if manifest.find(&format!("php-{version}")).is_some() {
+        let _ = install(cli, &format!("php-{version}"));
+    }
     let mut lock = Lock::load(&cli.env.lock_path())?;
     lock.php.push(version.to_string());
     lock.php.sort();

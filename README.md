@@ -10,9 +10,9 @@ Caddy + PHP-FPM + (optional system) MariaDB, one folder per project under
 - A local certificate authority (one root, one leaf per project) generated with
   openssl — real TLS, no `tls internal` surprises
 - php-fpm pool + caddy config auto-generated per start
-- Download manager with retries + sha256 pinning (tarballs in
-  `sources.toml`), so caddy and static php binaries are reproducible
-- Optional MariaDB via the system package (`mariadbd` found on PATH)
+- Download manager with sha256 verification for managed binaries and runtimes
+- Optional MariaDB 11.4.13 Linux x86_64 runtime, downloaded with curl into the
+  project data root; a system `mariadbd` on `PATH` remains supported
 - A TUI (`fidim` default command), status CLI, unix-socket daemon
 
 ## Install
@@ -26,6 +26,7 @@ Bootstrap binaries from the manifest (defaults ship inside the binary):
 
 ```sh
 fidim install caddy
+fidim install mariadb   # optional, portable Linux x86_64 runtime (downloaded with curl)
 fidim php install 8.4
 fidim php use 8.4
 ```
