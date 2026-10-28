@@ -142,10 +142,71 @@ pub fn is_language(name: &str) -> bool {
         || name == "java"
 }
 
+/// Language family for a service row: `php-8.4` -> `php`, `node-24` -> `node`.
+fn language_family(name: &str) -> &str {
+    name.split('-').next().unwrap_or(name)
+}
+
+/// First service index of every language family. Used before the first refresh
+/// (which replaces this with the active version of each language).
+fn first_language_reps(services: &[ServiceStatus]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut reps: Vec<usize> = services
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| is_language(&s.name))
+        .filter(|(_, s)| seen.insert(language_family(&s.name).to_string()))
+        .map(|(i, _)| i)
+        .collect();
+    reps.sort_unstable();
+    reps
+}
+
+/// Representative row per language family using the active version from
+/// lock.toml, matching the collapsed rows rendered in the left panel.
+fn language_representatives(
+    env: &fine_ill_do_it_myself::Env,
+    services: &[ServiceStatus],
+) -> Vec<usize> {
+    let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+    let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+    let mut seen = std::collections::HashSet::new();
+    let mut reps = Vec::new();
+    for (idx, s) in services.iter().enumerate() {
+        if !is_language(&s.name) {
+            continue;
+        }
+        let base = language_family(&s.name);
+        if !seen.insert(base.to_string()) {
+            continue;
+        }
+        let target = if base == "php" {
+            format!("php-{php_row}")
+        } else {
+            match fine_ill_do_it_myself::lang::active_lang_version(env, base) {
+                Some(v) => format!("{base}-{v}"),
+                None => base.to_string(),
+            }
+        };
+        let rep = services
+            .iter()
+            .position(|x| x.name == target)
+            .unwrap_or(idx);
+        reps.push(rep);
+    }
+    reps.sort_unstable();
+    reps.dedup();
+    reps
+}
+
 pub struct App {
     pub services: Vec<ServiceStatus>,
     pub projects: Vec<String>,
     pub config_rows: Vec<ConfigRow>,
+    /// One representative service index per language family (php, node, ...).
+    /// The left panel collapses all installed versions into these rows, so
+    /// navigation must walk them instead of every hidden version.
+    language_reps: Vec<usize>,
     pub cursor_left: usize,
     pub cursor_right: usize,
     pub panel_right: bool, // false = left panel, true = right panel
@@ -170,10 +231,12 @@ pub struct App {
 impl App {
     pub fn new(mut services: Vec<ServiceStatus>, projects: Vec<String>) -> Self {
         services.sort_by_key(|s| is_language(&s.name));
+        let language_reps = first_language_reps(&services);
         Self {
             services,
             projects,
             config_rows: Vec::new(),
+            language_reps,
             cursor_left: 0,
             cursor_right: 0,
             panel_right: false,
@@ -405,13 +468,67 @@ impl App {
         }
     }
 
+    /// Service/project indices that actually have a visible row in the left
+    /// panel: non-language services, one row per language family, projects.
+    fn visible_left_rows(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..self.services.len())
+            .filter(|&i| !is_language(&self.services[i].name))
+            .collect();
+        rows.extend(
+            self.language_reps
+                .iter()
+                .copied()
+                .filter(|&i| i < self.services.len()),
+        );
+        rows.extend(self.services.len()..self.services.len() + self.projects.len());
+        rows
+    }
+
+    /// Move a cursor that landed on a hidden language version to that family's
+    /// visible representative row.
+    fn normalize_left_cursor(&mut self) {
+        if self.panel_right
+            || self.cursor_left >= self.services.len()
+            || !is_language(&self.services[self.cursor_left].name)
+            || self.language_reps.contains(&self.cursor_left)
+        {
+            return;
+        }
+        let family = language_family(&self.services[self.cursor_left].name).to_string();
+        if let Some(rep) = self.language_reps.iter().copied().find(|&i| {
+            self.services
+                .get(i)
+                .map(|s| language_family(&s.name) == family.as_str())
+                .unwrap_or(false)
+        }) {
+            self.cursor_left = rep;
+        }
+    }
+
     fn cursor_move(&mut self, by: i32) {
+        if !self.panel_right {
+            let rows = self.visible_left_rows();
+            if rows.is_empty() {
+                self.cursor_left = 0;
+                return;
+            }
+            let cur = self.cursor_left;
+            let next = match rows.iter().position(|&r| r == cur) {
+                Some(pos) => (pos as i32 + by).clamp(0, rows.len() as i32 - 1) as usize,
+                // cursor on a hidden version: land on the next visible row in
+                // the direction of travel instead of stepping through it
+                None if by >= 0 => rows.iter().position(|&r| r > cur).unwrap_or(rows.len() - 1),
+                None => rows.iter().rposition(|&r| r < cur).unwrap_or(0),
+            };
+            self.cursor_left = rows[next];
+            return;
+        }
         let cur = self.cursor_mut();
         let c = *cur as i32 + by;
         *cur = c.max(0) as usize;
         self.clamp_cursor();
         // On the right panel, skip non-selectable lines (empty / header).
-        if self.panel_right && self.detail.is_some() {
+        if self.detail.is_some() {
             self.skip_unselectable(by);
         }
     }
@@ -898,41 +1015,19 @@ pub fn run_tui(
                     .map(|(i, _)| i)
                     .collect();
 
-                let lang_indices: Vec<usize> = app
-                    .services
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| is_language(&s.name))
-                    .map(|(i, _)| i)
-                    .collect();
-
                 // Collapse language versions: show only one row per language
-                // family (php, node, python, go, java). The active version is
-                // displayed; the user switches versions via the right mgmt panel.
-                let mut collapsed_lang: Vec<(usize, String)> = Vec::new();
-                let mut seen_langs = std::collections::HashSet::new();
-                for &idx in &lang_indices {
-                    let s = &app.services[idx];
-                    let base = s.name.split('-').next().unwrap_or(&s.name);
-                    if !seen_langs.contains(base) {
-                        seen_langs.insert(base.to_string());
-                        let target = if base == "php" {
-                            format!("php-{php_row}")
-                        } else if let Some(v) =
-                            fine_ill_do_it_myself::lang::active_lang_version(env, base)
-                        {
-                            format!("{base}-{v}")
-                        } else {
-                            base.to_string()
-                        };
-                        let default_idx = lang_indices
-                            .iter()
-                            .find(|&&i| app.services[i].name == target)
-                            .copied()
-                            .unwrap_or(idx);
-                        collapsed_lang.push((default_idx, base.to_string()));
-                    }
-                }
+                // family (php, node, python, go, java). `language_reps` holds
+                // the active version row for each family and is what navigation
+                // walks, so the highlight never lands on a hidden version.
+                let collapsed_lang: Vec<(usize, String)> = app
+                    .language_reps
+                    .iter()
+                    .filter_map(|&idx| {
+                        app.services
+                            .get(idx)
+                            .map(|s| (idx, language_family(&s.name).to_string()))
+                    })
+                    .collect();
 
                 let svc_height = if non_lang_indices.is_empty() {
                     0
@@ -956,7 +1051,7 @@ pub fn run_tui(
 
                 let left_cursor = app.cursor_left;
                 let svc_focus = !app.panel_right && non_lang_indices.contains(&left_cursor);
-                let lang_focus = !app.panel_right && lang_indices.contains(&left_cursor);
+                let lang_focus = !app.panel_right && app.language_reps.contains(&left_cursor);
                 let proj_focus = !app.panel_right && left_cursor >= app.services.len();
 
                 // 1. Services panel (web servers, databases, etc.)
@@ -1057,10 +1152,6 @@ pub fn run_tui(
                     let mut lang_lst = ListState::default();
                     if let Some(pos) = collapsed_lang.iter().position(|(i, _)| *i == left_cursor) {
                         lang_lst.select(Some(pos));
-                    } else if lang_focus {
-                        // Cursor is on a non-default PHP version; map to the
-                        // collapsed row so it still highlights.
-                        lang_lst.select(Some(0));
                     }
                     let lang_marker = if lang_focus { "▶ " } else { "  " };
                     let lang_list = List::new(lang_items)
@@ -1259,6 +1350,7 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
         );
         statuses.sort_by_key(|s| is_language(&s.name));
         app.services = statuses;
+        app.language_reps = language_representatives(&env, &app.services);
 
         // build config rows
         let mut rows: Vec<ConfigRow> = Vec::new();
@@ -1302,6 +1394,7 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
 
         app.config_rows = rows;
         app.clamp_now();
+        app.normalize_left_cursor();
     }
 }
 
@@ -1649,6 +1742,76 @@ mod tests {
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Char('r'));
         assert_eq!(a.actions[0], Action::RestartAll);
+    }
+
+    #[test]
+    fn language_panel_navigation_skips_hidden_versions() {
+        let mut a = App::new(
+            vec![
+                svc("caddy", false),
+                svc("mariadb", false),
+                svc("php-8.1", false),
+                svc("php-8.2", false),
+                svc("node-20", false),
+                svc("node-24", false),
+                svc("python-3.13", false),
+                svc("go-1.27", false),
+                svc("java-25", false),
+            ],
+            vec!["blog".into()],
+        );
+
+        // one step per visible row: services, one row per language family,
+        // then projects. Hidden versions must not consume key presses.
+        let mut down = vec![a.cursor_left];
+        for _ in 0..7 {
+            a.on_key(KeyCode::Down);
+            down.push(a.cursor_left);
+        }
+        assert_eq!(down, vec![0, 1, 2, 4, 6, 7, 8, 9], "down path");
+
+        let mut up = Vec::new();
+        for _ in 0..7 {
+            a.on_key(KeyCode::Up);
+            up.push(a.cursor_left);
+        }
+        assert_eq!(up, vec![8, 7, 6, 4, 2, 1, 0], "up path");
+    }
+
+    #[test]
+    fn language_representatives_follow_active_versions() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mut language_defaults = std::collections::BTreeMap::new();
+        language_defaults.insert("node".into(), "24".into());
+        let lock = fine_ill_do_it_myself::Lock {
+            php_default: Some("8.2".into()),
+            language_defaults,
+            ..Default::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+
+        let services = vec![
+            svc("php-8.1", false),
+            svc("php-8.2", false),
+            svc("node-20", false),
+            svc("node-24", false),
+        ];
+        assert_eq!(
+            language_representatives(&env, &services),
+            vec![1, 3],
+            "php 8.2 and node 24 are the active rows"
+        );
+    }
+
+    #[test]
+    fn hidden_language_cursor_normalizes_to_the_representative() {
+        let mut a = App::new(vec![svc("php-8.1", false), svc("php-8.2", false)], vec![]);
+        a.language_reps = vec![1];
+        a.cursor_left = 0;
+        a.normalize_left_cursor();
+        assert_eq!(a.cursor_left, 1);
     }
 
     #[test]
