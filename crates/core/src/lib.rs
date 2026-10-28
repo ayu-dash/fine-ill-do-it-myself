@@ -3,6 +3,7 @@ pub mod manifest;
 pub mod paths;
 pub mod proc;
 pub mod service;
+pub mod shell;
 
 pub use error::{Error, Result};
 pub use manifest::{Lock, Manifest, PhpManager};
@@ -15,6 +16,7 @@ pub fn app_display_name() -> &'static str {
 }
 pub mod orchestrator;
 pub mod php;
+pub mod phpmyadmin;
 pub mod supervisor;
 pub mod web;
 pub use orchestrator::{hosts_entries, list_projects};
@@ -26,3 +28,5 @@ pub fn installer_defaults() -> &'static str {
     include_str!("default_manifest.toml")
 }
 pub mod database;
+pub mod dns;
+pub mod lang;

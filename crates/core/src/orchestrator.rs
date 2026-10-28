@@ -65,14 +65,50 @@ pub fn ensure_installed(env: &Env, manifest: &Manifest, lock: &mut Lock, name: &
     Ok(())
 }
 
+pub fn binary_subdir_for(name: &str) -> &'static str {
+    if name.starts_with("php") {
+        "php"
+    } else if name.starts_with("caddy") {
+        "caddy"
+    } else if name.starts_with("nginx") {
+        "nginx"
+    } else if name.starts_with("httpd") || name.starts_with("apache") {
+        "httpd"
+    } else if name.starts_with("lighttpd") {
+        "lighttpd"
+    } else {
+        ""
+    }
+}
+
 fn dest_dir(env: &Env, name: &str) -> std::path::PathBuf {
-    let p = env.paths.bin().join(format!(".{name}-staging"));
+    let sub = binary_subdir_for(name);
+    let p = if !sub.is_empty() && env.paths.bin().join(sub).is_dir() {
+        env.paths.bin().join(sub).join(format!(".{name}-staging"))
+    } else {
+        env.paths.bin().join(format!(".{name}-staging"))
+    };
     std::fs::create_dir_all(&p).ok();
     p
 }
 
 fn target_path_for(env: &Env, name: &str) -> std::path::PathBuf {
-    env.paths.bin().join(name)
+    let sub = binary_subdir_for(name);
+    if !sub.is_empty() {
+        let nested = env.paths.bin().join(sub).join(name);
+        if nested.exists() || env.paths.bin().join(sub).is_dir() {
+            return nested;
+        }
+    }
+    let flat = env.paths.bin().join(name);
+    if flat.is_file() {
+        return flat;
+    }
+    if !sub.is_empty() {
+        env.paths.bin().join(sub).join(name)
+    } else {
+        flat
+    }
 }
 
 /// Generate Caddyfile + php-fpm pool configs for the default PHP version.
@@ -92,6 +128,11 @@ pub fn generate_web_configs(
     env.ensure_dirs()?;
     let sites = env.paths.sites().display().to_string();
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
+    // phpMyAdmin is a normal site once installed: link it into Sites before
+    // the project list is read so vhosts/certs/hosts pick it up.
+    if let Err(e) = crate::phpmyadmin::ensure_site(env, ports) {
+        eprintln!("warn: phpMyAdmin site skipped: {e}");
+    }
     let projects = list_projects(env);
     // local CA + per-project leaf certs (silent no-op without openssl)
     if let Err(e) = crate::web::certs::regenerate(&env.paths.etc(), &projects) {
@@ -111,6 +152,7 @@ pub fn generate_web_configs(
         LIGHTTPD => {
             crate::web::lighttpd::regenerate(
                 &env.paths.etc(),
+                &env.paths.root().join("lighttpd/default"),
                 &env.paths.pids().join("lighttpd.pid").display().to_string(),
                 &env.paths.logs().join("lighttpd.log").display().to_string(),
                 &env.paths
@@ -176,6 +218,8 @@ pub fn generate_web_configs(
         }
     }
     let _ = certs_pair;
+    let php_etc = env.php_etc_dir(php_version);
+    std::fs::create_dir_all(&php_etc)?;
     std::fs::write(
         env.fpm_conf_path(php_version),
         generate_fpm_conf(
@@ -193,6 +237,15 @@ pub fn generate_web_configs(
             &env.paths.logs().join("php-slow.log").display().to_string(),
         )?,
     )?;
+    let ini_path = env.php_ini_path(php_version);
+    let socket = env.paths.pids().join(crate::orchestrator::MARIADB_SOCKET);
+    // Always regenerate: this file is fidim-owned and must track the current
+    // socket (e.g. after moving the data root), so `mysqli_connect('localhost')`
+    // finds the managed MariaDB instead of a system socket.
+    let _ = std::fs::write(
+        &ini_path,
+        crate::php::fpm::generate_php_ini(&[], Some(&socket)),
+    );
     Ok(())
 }
 
@@ -242,6 +295,24 @@ pub fn start_service<R: Runner + Clone>(
     php_version: &str,
     name: &str,
 ) -> Result<crate::service::ServiceStatus> {
+    if name == MARIADB {
+        let sup = Supervisor {
+            env: env.clone(),
+            ports: ports.clone(),
+            runner: runner.clone(),
+        };
+        if sup.status(MARIADB).state == crate::service::ServiceState::Running {
+            return Ok(sup.status(MARIADB));
+        }
+        let cnf = env.paths.etc().join("my.cnf");
+        let datadir = env.paths.data().join("mariadb");
+        let cmd = mariadb_config(env, &cnf, &datadir, &env.paths.pids(), ports.mariadb)?
+            .ok_or_else(|| Error::Other("MariaDB binary was not resolved".into()))?;
+        let wrapped = with_log_append(&cmd, &env.paths.logs().join("mariadb.log"))?;
+        let pid = sup.runner.spawn(&wrapped)?;
+        sup.write_pid(MARIADB, pid)?;
+        return Ok(sup.status(MARIADB));
+    }
     generate_configs(env, ports, php_version)?;
     let sup = Supervisor {
         env: env.clone(),
@@ -280,6 +351,34 @@ pub fn start_service<R: Runner + Clone>(
     let wrapped = with_log_append(&full, &log)?;
     let pid = sup.runner.spawn(&wrapped)?;
     sup.write_pid(&name, pid)?;
+
+    // If starting a web server, ensure php-fpm is also running so PHP requests succeed
+    if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str()) {
+        let php_service = format!("php-{php_version}");
+        if sup.status(&php_service).state != crate::service::ServiceState::Running {
+            if let Ok(php_specs) = service_cmds(env, ports, php_version) {
+                if let Some((_, pbin, pargs, plog)) =
+                    php_specs.into_iter().find(|(n, ..)| n == &php_service)
+                {
+                    if let Ok(pids) = crate::proc::listening_pids(fpm_port) {
+                        for p in pids {
+                            let _ = crate::proc::RealRunner.kill(p);
+                        }
+                    }
+                    if check_port(fpm_port, &pbin).is_ok() {
+                        let mut pfull = vec![pbin];
+                        pfull.extend(pargs);
+                        if let Ok(pwrapped) = with_log_append(&pfull, &plog) {
+                            if let Ok(ppid) = sup.runner.spawn(&pwrapped) {
+                                let _ = sup.write_pid(&php_service, ppid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(sup.status(&name))
 }
 
@@ -294,12 +393,27 @@ fn regenerate_ghosts(env: &Env, ports: &PortPlan, php_version: &str) -> Result<(
     Ok(())
 }
 
+pub fn server_bin_path(env: &Env, server: &str) -> std::path::PathBuf {
+    let nested = env.paths.bin().join(server).join(server);
+    if nested.exists() {
+        return nested;
+    }
+    let flat = env.paths.bin().join(server);
+    if flat.is_file() {
+        return flat;
+    }
+    if env.paths.bin().join(server).is_dir() {
+        return nested;
+    }
+    flat
+}
+
 /// Binary path and CLI args per web server choice.
 pub fn web_bin_path(env: &Env, web: &str) -> std::path::PathBuf {
     match web {
-        NGINX => env.paths.bin().join("nginx"),
-        APACHE => env.paths.bin().join("httpd"),
-        LIGHTTPD => env.paths.bin().join("lighttpd"),
+        NGINX => server_bin_path(env, "nginx"),
+        APACHE => server_bin_path(env, "httpd"),
+        LIGHTTPD => server_bin_path(env, "lighttpd"),
         _ => env.caddy_bin(),
     }
 }
@@ -321,6 +435,16 @@ pub fn installed_php_versions(env: &Env) -> Vec<String> {
 /// `"<name> v<version>"`-style version probe of an installed web server.
 pub fn web_version(env: &Env, web: &str) -> Option<String> {
     let bin = web_bin_path(env, web);
+    let bin = if bin.exists() {
+        bin
+    } else {
+        let flat = env.paths.bin().join(web);
+        if flat.exists() {
+            flat
+        } else {
+            bin
+        }
+    };
     let out = match web {
         NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
         _ => std::process::Command::new(&bin)
@@ -353,6 +477,10 @@ pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
     if local.exists() {
         return Ok(local);
     }
+    let flat = env.paths.bin().join(web);
+    if flat.exists() {
+        return Ok(flat);
+    }
     if let Some(sys) = which_system(web) {
         return Ok(sys);
     }
@@ -363,15 +491,17 @@ pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
 
 /// Absolute `PATH`-resolved binary name (httpd/nginx/caddy); None when absent
 /// from PATH or data/bin.
-/// php-fpm binary for `version`: `bin/php-fpm-<v>` first, then a drop-in
-/// folder under `data/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
+/// php-fpm binary for `version`: `bin/php/php-fpm-<v>` or `bin/php-fpm-<v>` first,
+/// then a drop-in folder under `data/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
 pub fn php_binary_for(env: &Env, version: &str) -> Option<std::path::PathBuf> {
-    if let Ok(rd) = std::fs::read_dir(env.paths.bin()) {
-        for e in rd.flatten() {
-            let n = e.file_name().to_string_lossy().to_string();
-            if let Some(v) = n.strip_prefix("php-fpm-") {
-                if crate::manifest::short_version(v) == version {
-                    return Some(e.path());
+    for dir in [env.paths.bin().join("php"), env.paths.bin()] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if let Some(v) = n.strip_prefix("php-fpm-") {
+                    if crate::manifest::short_version(v) == version {
+                        return Some(e.path());
+                    }
                 }
             }
         }
@@ -402,17 +532,20 @@ pub fn web_config_path(env: &Env, web: &str) -> std::path::PathBuf {
     }
 }
 
-/// Directory that contains `modules/` next to an httpd binary:
-/// `<bin>/../..` when a `modules` dir sits there (XAMPP layout), else bin dir.
+/// Directory that contains `modules/` next to an httpd binary.
+/// Searches up to 3 levels above the binary so it works with multiple layouts:
+/// - XAMPP: `<prefix>/bin/httpd` → `<prefix>/modules/`  (2 levels up)
+/// - fidim project-local: `.fidim/bin/httpd/httpd` → `.fidim/modules/`  (3 levels up)
+/// - Simple flat install: `<prefix>/httpd` → `<prefix>/modules/`  (1 level up)
 pub fn apache_server_root(bin: &std::path::Path) -> std::path::PathBuf {
-    for cand in [
-        bin.parent().unwrap_or(Path::new(".")),
-        bin.parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(Path::new(".")),
-    ] {
-        if cand.join("modules").is_dir() {
-            return cand.to_path_buf();
+    let mut cur = bin.parent().unwrap_or(Path::new("."));
+    for _ in 0..3 {
+        if cur.join("modules").is_dir() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
         }
     }
     bin.parent().unwrap_or(Path::new(".")).to_path_buf()
@@ -421,9 +554,22 @@ pub fn apache_server_root(bin: &std::path::Path) -> std::path::PathBuf {
 pub fn web_args(env: &Env, web: &str) -> Vec<String> {
     let conf = web_config_path(env, web).display().to_string();
     match web {
-        NGINX => vec!["-c".into(), conf],
+        // The downloaded nginx/lighttpd binaries are built with the old data
+        // root compiled in, so point them at this root's prefix/module dir.
+        NGINX => vec![
+            "-c".into(),
+            conf,
+            "-p".into(),
+            env.paths.root().join("nginx").display().to_string(),
+        ],
         APACHE => vec!["-f".into(), conf, "-DFOREGROUND".into()],
-        LIGHTTPD => vec!["-D".into(), "-f".into(), conf],
+        LIGHTTPD => vec![
+            "-D".into(),
+            "-f".into(),
+            conf,
+            "-m".into(),
+            env.paths.root().join("lighttpd/lib").display().to_string(),
+        ],
         _ => vec!["run".into(), "--config".into(), conf],
     }
 }
@@ -483,14 +629,38 @@ pub fn status_all<R: Runner + Clone>(
             names.push(w.to_string());
         }
     }
+    for v in installed_php_versions(env) {
+        let n = format!("php-{v}");
+        if !names.iter().any(|e| e == &n) {
+            names.push(n);
+        }
+    }
     let web = web_server(env);
-    let phps: Vec<String> = (0..90).map(|i| format!("php-{i}")).collect();
-    let _ = phps;
     let lock = Lock::load(&env.lock_path()).unwrap_or_default();
     let php = format!("php-{}", default_php(&lock));
     for n in [web.as_str(), php.as_str(), MARIADB] {
         if !names.iter().any(|e| e == n) {
             names.push(n.to_string());
+        }
+    }
+    for &l in crate::lang::SUPPORTED_LANGUAGES {
+        if l == "php" {
+            continue;
+        }
+        let installed = crate::lang::installed_lang_versions(env, l);
+        if !installed.is_empty() {
+            for v in installed {
+                let n = format!("{l}-{v}");
+                if !names.iter().any(|e| e == &n) {
+                    names.push(n);
+                }
+            }
+        }
+        if !names
+            .iter()
+            .any(|e| e == l || e.starts_with(&format!("{l}-")))
+        {
+            names.push(l.to_string());
         }
     }
     names.iter().map(|n| sup.status(n)).collect()
@@ -546,7 +716,23 @@ mod webchoice_tests {
         );
         assert_eq!(
             web_args(&env, NGINX),
-            vec!["-c".to_string(), nginx.display().to_string()]
+            vec![
+                "-c".to_string(),
+                nginx.display().to_string(),
+                "-p".to_string(),
+                env.paths.root().join("nginx").display().to_string(),
+            ]
+        );
+        let lighttpd = web_config_path(&env, LIGHTTPD);
+        assert_eq!(
+            web_args(&env, LIGHTTPD),
+            vec![
+                "-D".to_string(),
+                "-f".to_string(),
+                lighttpd.display().to_string(),
+                "-m".to_string(),
+                env.paths.root().join("lighttpd/lib").display().to_string(),
+            ]
         );
         assert_eq!(
             web_args(&env, CADDY),
@@ -566,6 +752,17 @@ mod webchoice_tests {
         std::fs::create_dir_all(t.path().join("opt/httpd/modules")).unwrap();
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         assert_eq!(apache_server_root(&bin), t.path().join("opt/httpd"));
+    }
+
+    #[test]
+    fn apache_server_root_finds_modules_three_levels_up() {
+        // fidim project-local layout: .fidim/bin/httpd/httpd → .fidim/modules/
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join(".fidim/bin/httpd/httpd");
+        std::fs::create_dir_all(t.path().join(".fidim/bin/httpd")).unwrap();
+        std::fs::create_dir_all(t.path().join(".fidim/modules")).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        assert_eq!(apache_server_root(&bin), t.path().join(".fidim"));
     }
 }
 #[cfg(test)]
@@ -666,6 +863,24 @@ mod tests {
     }
 
     #[test]
+    fn generate_configs_serves_phpmyadmin_when_installed() {
+        let (env, _t) = env();
+        let pma = env.paths.runtimes().join("phpmyadmin/5.2.3");
+        std::fs::create_dir_all(&pma).unwrap();
+        std::fs::write(pma.join("index.php"), "<?php").unwrap();
+
+        generate_configs(&env, &PortPlan::default(), "8.4").unwrap();
+
+        let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
+        assert!(cf.contains("phpmyadmin.test"), "vhost missing\n{cf}");
+        assert!(
+            env.paths.sites().join("phpmyadmin").exists(),
+            "site link missing"
+        );
+        assert!(pma.join("config.inc.php").exists(), "config missing");
+    }
+
+    #[test]
     fn start_service_for_non_chosen_web_binds_its_own_ports() {
         let (env, _t) = env();
         std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
@@ -707,6 +922,24 @@ mod tests {
         assert!(st
             .iter()
             .all(|s| s.state == crate::service::ServiceState::Stopped));
+    }
+
+    #[test]
+    fn start_service_runs_managed_mariadb_without_php_or_web_binaries() {
+        let (env, _t) = env();
+        let basedir = env.paths.runtimes().join("mariadb/11.4.13");
+        let server = basedir.join("bin/mariadbd");
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::write(&server, "managed mariadbd").unwrap();
+        std::fs::create_dir_all(env.paths.data().join("mariadb/mysql")).unwrap();
+
+        let runner = FakeRunner::default();
+        let status = start_service(&env, &PortPlan::default(), &runner, "8.4", MARIADB).unwrap();
+        assert_eq!(status.name, MARIADB);
+        assert_eq!(status.state, crate::service::ServiceState::Running);
+        let config = std::fs::read_to_string(env.paths.etc().join("my.cnf")).unwrap();
+        assert!(config.contains(&format!("basedir = {}", basedir.display())));
+        assert!(config.contains("socket = "));
     }
 
     #[test]
@@ -758,6 +991,9 @@ mod tests {
         assert!(std::fs::read_to_string(env.fpm_conf_path(php_version))
             .unwrap()
             .contains("listen = 127.0.0.1:9004"));
+        assert!(env.php_ini_path(php_version).exists());
+        let ini = std::fs::read_to_string(env.php_ini_path(php_version)).unwrap();
+        assert!(ini.contains("memory_limit = 512M"));
     }
 
     #[test]
@@ -801,7 +1037,7 @@ mod tests {
     }
 }
 
-/// Add mariadb config + start command if the system mariadbd is usable.
+/// Add MariaDB config + start command when a managed or system server is usable.
 pub fn mariadb_config(
     env: &Env,
     cnf_path: &Path,
@@ -810,13 +1046,14 @@ pub fn mariadb_config(
     port: u16,
 ) -> Result<Option<Vec<String>>> {
     env.ensure_dirs()?;
-    let bin = find_mariadbd().ok_or_else(|| Error::Other(
-        "mariadb not found in PATH; install via apt/dnf/pacman, or add a `mariadb` tarball source in the manifest".into(),
-    ))?;
+    let (bin, basedir) = resolve_mariadb(env).ok_or_else(|| {
+        Error::Other("MariaDB not found; install with `fidim install mariadb`".into())
+    })?;
     std::fs::create_dir_all(socket_dir)?;
     let socket = socket_dir.join("db.sock");
     let log = env.paths.logs().join("mariadb.log");
     let cnf = generate_mariadb_cnf(
+        basedir.display().to_string().trim_end_matches('/'),
         datadir.display().to_string().trim_end_matches('/'),
         socket.display().to_string().trim_end_matches('/'),
         port,
@@ -826,49 +1063,110 @@ pub fn mariadb_config(
     )?;
     std::fs::write(cnf_path, &cnf)?;
     if datadir_missing(datadir) {
-        // first run: initialise the system tables
-        init_datadir(&bin, datadir)?;
+        init_datadir(env, &basedir, datadir)?;
     }
-    Ok(Some(mariadb_start_cmd(&bin, cnf_path)))
+    Ok(Some(mariadb_start_cmd(&bin, &basedir, cnf_path)))
 }
 
-/// Locate a `mariadbd` binary in PATH (no network, no install).
-pub fn find_mariadbd() -> Option<PathBuf> {
+/// Order MariaDB runtime directory names (`11.4.13`, `9.11.2`, ...) by numeric
+/// version components instead of lexically, so `11.4` beats `9.11`.
+fn version_key(name: &std::ffi::OsStr) -> Vec<u64> {
+    name.to_string_lossy()
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+/// Resolve a FIDIM-managed MariaDB first, then retain support for system installs.
+fn resolve_mariadb(env: &Env) -> Option<(PathBuf, PathBuf)> {
+    let runtime_root = env.paths.runtimes().join("mariadb");
+    if let Ok(versions) = std::fs::read_dir(&runtime_root) {
+        let mut versions: Vec<_> = versions
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        versions.sort_by_key(|entry| version_key(&entry.file_name()));
+        for version in versions.into_iter().rev() {
+            let basedir = version.path();
+            let managed_bin = basedir.join("bin/mariadbd");
+            if managed_bin.is_file() {
+                return Some((managed_bin, basedir));
+            }
+        }
+    }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let p = dir.join("mariadbd");
-        if p.exists() {
-            return Some(p);
-        }
-        let p2 = dir.join("mysqld");
-        if p2.exists() {
-            return Some(p2);
+        for name in ["mariadbd", "mysqld"] {
+            let bin = dir.join(name);
+            if bin.is_file() {
+                let base = bin
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("/usr"))
+                    .to_path_buf();
+                return Some((bin, base));
+            }
         }
     }
     None
 }
 
-fn init_datadir(bin_v: &Path, datadir: &Path) -> Result<()> {
-    let init = bin_v
-        .parent()
-        .unwrap_or(Path::new("/usr/bin"))
-        .join("mariadb-install-db");
-    let init = if !init.exists() {
-        bin_v.with_file_name("mysql_install_db")
-    } else {
-        init
-    };
-    if !init.exists() {
-        return Err(Error::Other(format!(
-            "datadir init tool not found next to {}; initialise manually first",
-            bin_v.display()
-        )));
+/// Locate MariaDB in the selected data root or on PATH.
+pub fn find_mariadbd(env: &Env) -> Option<PathBuf> {
+    resolve_mariadb(env).map(|(bin, _)| bin)
+}
+fn init_datadir(env: &Env, basedir: &Path, datadir: &Path) -> Result<()> {
+    let server_bin = resolve_mariadb(env)
+        .map(|(bin, _)| bin)
+        .ok_or_else(|| Error::Other("MariaDB server binary is missing".into()))?;
+    let mut candidates = vec![
+        basedir.join("scripts/mariadb-install-db"),
+        basedir.join("bin/mariadb-install-db"),
+        basedir.join("bin/mysql_install_db"),
+        server_bin.with_file_name("mariadb-install-db"),
+        server_bin.with_file_name("mysql_install_db"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("mariadb-install-db"));
+            candidates.push(dir.join("mysql_install_db"));
+        }
     }
-    std::process::Command::new(init)
+    let init = candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "MariaDB initializer not found under {} or on PATH",
+                basedir.display()
+            ))
+        })?;
+    let lib = basedir.join("lib");
+    let mysql_lib = basedir.join("lib/mysql");
+    let mut library_paths = vec![lib];
+    if mysql_lib.is_dir() {
+        library_paths.push(mysql_lib);
+    }
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        library_paths.extend(std::env::split_paths(&existing));
+    }
+    let library_path = std::env::join_paths(library_paths)
+        .map_err(|e| Error::Other(format!("invalid MariaDB library path: {e}")))?;
+    let status = std::process::Command::new(init)
+        .arg(format!("--basedir={}", basedir.display()))
         .arg(format!("--datadir={}", datadir.display()))
         .arg("--auth-root-authentication-method=normal")
         .arg("--skip-test-db")
+        .env("LD_LIBRARY_PATH", library_path)
         .status()?;
+    if !status.success() {
+        // A half-written datadir looks initialized to `datadir_missing`, which
+        // would make every later start fail with a confusing server error.
+        let _ = std::fs::remove_dir_all(datadir);
+        return Err(Error::Other(
+            "MariaDB data directory initialization failed".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -876,8 +1174,8 @@ pub const MARIADB: &str = "mariadb";
 pub const MARIADB_SOCKET: &str = "db.sock";
 
 /// Is a mariadbd binary usable on this system?
-pub fn mariadb_available(_env: &Env) -> Result<bool> {
-    Ok(find_mariadbd().is_some())
+pub fn mariadb_available(env: &Env) -> Result<bool> {
+    Ok(find_mariadbd(env).is_some())
 }
 
 #[cfg(test)]
@@ -909,6 +1207,63 @@ mod mariadb_tests {
         std::env::set_var("PATH", "");
         assert!(!mariadb_available(&env).unwrap());
         std::env::remove_var("PATH");
+    }
+
+    #[test]
+    fn managed_mariadb_binary_is_resolved_without_path_install() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let basedir = env.paths.runtimes().join("mariadb/11.4.13");
+        let bin = basedir.join("bin/mariadbd");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "binary").unwrap();
+        assert_eq!(resolve_mariadb(&env), Some((bin, basedir)));
+    }
+
+    #[test]
+    fn managed_mariadb_prefers_highest_numeric_version() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        for version in ["9.11.2", "11.4.13", "11.4.9"] {
+            let bin = env
+                .paths
+                .runtimes()
+                .join(format!("mariadb/{version}/bin/mariadbd"));
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "binary").unwrap();
+        }
+        let (bin, basedir) = resolve_mariadb(&env).unwrap();
+        assert_eq!(basedir, env.paths.runtimes().join("mariadb/11.4.13"));
+        assert_eq!(bin, basedir.join("bin/mariadbd"));
+    }
+
+    #[test]
+    fn failed_init_removes_partial_datadir_before_returning_error() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let basedir = env.paths.runtimes().join("mariadb/11.4.13");
+        std::fs::create_dir_all(basedir.join("bin")).unwrap();
+        std::fs::write(basedir.join("bin/mariadbd"), "fake").unwrap();
+        std::fs::create_dir_all(basedir.join("scripts")).unwrap();
+        let init = basedir.join("scripts/mariadb-install-db");
+        // mimic a failed initializer: it creates the schema dir, then bails out
+        std::fs::write(
+            &init,
+            "#!/bin/sh\nd=\"${2#--datadir=}\"\n/bin/mkdir -p \"$d/mysql\"\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let datadir = env.paths.data().join("mariadb");
+        let err = init_datadir(&env, &basedir, &datadir).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Other(_)), "{err:?}");
+        assert!(
+            datadir_missing(&datadir),
+            "partial datadir must be removed so the next start retries init"
+        );
     }
 }
 
@@ -1029,35 +1384,41 @@ fn service_cmds(env: &Env, ports: &PortPlan, php_version: &str) -> Result<Vec<Cm
             "php {php_version} not installed (fidim install php-fpm-{php_version}              or drop an extracted build into data/php/{php_version})"
         ))
     })?;
+    let mut fpm_args = vec![
+        "-F".to_string(),
+        "-y".to_string(),
+        env.fpm_conf_path(php_version).display().to_string(),
+    ];
+    let ini_path = env.php_ini_path(php_version);
+    if ini_path.exists() {
+        fpm_args.push("-c".to_string());
+        fpm_args.push(ini_path.display().to_string());
+    }
     cmds.push((
         format!("php-{php_version}"),
         php_bin.display().to_string(),
-        vec![
-            "-F".to_string(),
-            "-y".to_string(),
-            env.fpm_conf_path(php_version).display().to_string(),
-        ],
+        fpm_args,
         env.paths.logs().join(format!("php-{php_version}.log")),
     ));
     // mariadb (system binary) when available
-    if let Ok(true) = mariadb_available(env) {
+    if mariadb_available(env).unwrap_or(false) {
         let mariadb_cnf = env.paths.etc().join("my.cnf");
         let db_data = env.paths.data().join("mariadb");
         std::fs::create_dir_all(&db_data)?;
-        if let Ok(Some(cmd)) = mariadb_config(
+        let cmd = mariadb_config(
             env,
             &mariadb_cnf,
             &db_data,
             &env.paths.pids(),
             ports.mariadb,
-        ) {
-            cmds.push((
-                MARIADB.to_string(),
-                cmd[0].clone(),
-                cmd[1..].to_vec(),
-                env.paths.logs().join("mariadb.log"),
-            ));
-        }
+        )?
+        .ok_or_else(|| Error::Other("MariaDB binary was not resolved".into()))?;
+        cmds.push((
+            MARIADB.to_string(),
+            cmd[0].clone(),
+            cmd[1..].to_vec(),
+            env.paths.logs().join("mariadb.log"),
+        ));
     }
     Ok(cmds)
 }

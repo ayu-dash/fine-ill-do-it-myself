@@ -15,9 +15,42 @@ pub struct Env {
 }
 
 impl Env {
-    /// Load from the real system locations (`$XDG_DATA_HOME`, `$HOME`).
-    /// Used by the binary crate; tests construct [`Env::new`] with temp dirs.
+    /// Load the environment. Prefers a project-local `.fidim` root within the current
+    /// project directory so all configs, binaries, and logs stay strictly inside the project.
     pub fn load_real() -> Result<Self> {
+        if let Ok(dir) = std::env::var("FIDIM_DATA_ROOT") {
+            let root = PathBuf::from(dir);
+            let sites = if root
+                .parent()
+                .map(|p| p.join("sites").is_dir())
+                .unwrap_or(false)
+            {
+                root.parent().unwrap().join("sites")
+            } else {
+                root.join("sites")
+            };
+            return Ok(Env::new(root, sites));
+        }
+        if let Some(proj) = crate::paths::find_project_root() {
+            let root = proj.join(".fidim");
+            let home_sites = std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join("Sites"))
+                .ok();
+            let sites = if proj.join("sites").is_dir() {
+                proj.join("sites")
+            } else if root.join("sites").is_dir() {
+                root.join("sites")
+            } else if let Some(ref hs) = home_sites {
+                if hs.is_dir() {
+                    hs.clone()
+                } else {
+                    root.join("sites")
+                }
+            } else {
+                root.join("sites")
+            };
+            return Ok(Env::new(root, sites));
+        }
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| Error::Other("cannot resolve home (set $HOME)".into()))?;
@@ -47,7 +80,18 @@ impl Env {
         self.paths.etc().join("Caddyfile")
     }
     pub fn caddy_bin(&self) -> PathBuf {
-        self.paths.bin().join("caddy")
+        let nested = self.paths.bin().join("caddy").join("caddy");
+        if nested.exists() {
+            return nested;
+        }
+        let flat = self.paths.bin().join("caddy");
+        if flat.is_file() {
+            return flat;
+        }
+        if self.paths.bin().join("caddy").is_dir() {
+            return nested;
+        }
+        flat
     }
     pub fn caddy_pid(&self) -> PathBuf {
         self.paths.pids().join("caddy.pid")
@@ -55,11 +99,32 @@ impl Env {
     pub fn caddy_log(&self) -> PathBuf {
         self.paths.logs().join("caddy.log")
     }
+    pub fn php_etc_dir(&self, version: &str) -> PathBuf {
+        self.paths.etc().join("php").join(version)
+    }
     pub fn fpm_conf_path(&self, version: &str) -> PathBuf {
-        self.paths.etc().join(format!("php-{version}-fpm.conf"))
+        self.php_etc_dir(version).join("fpm.conf")
+    }
+    pub fn php_ini_path(&self, version: &str) -> PathBuf {
+        self.php_etc_dir(version).join("php.ini")
     }
     pub fn fpm_bin(&self, version: &str) -> PathBuf {
-        self.paths.bin().join(format!("php-fpm-{version}"))
+        let nested = self
+            .paths
+            .bin()
+            .join("php")
+            .join(format!("php-fpm-{version}"));
+        if nested.exists() {
+            return nested;
+        }
+        let flat = self.paths.bin().join(format!("php-fpm-{version}"));
+        if flat.is_file() {
+            return flat;
+        }
+        if self.paths.bin().join("php").is_dir() {
+            return nested;
+        }
+        flat
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
@@ -223,12 +288,19 @@ impl<R: Runner> Supervisor<R> {
             self.runner.kill(pid)?;
             remove_pid_file(&self.env.paths.pids(), name);
         }
-        // reap any orphan still holding the service port (workers outlive the master)
+        // reap any orphan still holding the service port (workers outlive the master).
+        // For mariadb only touch processes started with OUR my.cnf: a system
+        // MySQL/MariaDB that happens to listen on the same port must survive.
         if let Some(port) = self.orphan_reaping_port(name) {
             if port != 0 {
+                let our_cnf = self.env.paths.etc().join("my.cnf");
                 if let Ok(pids) = crate::proc::listening_pids(port) {
                     for pid in pids {
-                        let _ = self.runner.kill(pid);
+                        let ours = name != crate::orchestrator::MARIADB
+                            || crate::proc::pid_cmdline_has(pid, our_cnf.as_os_str());
+                        if ours {
+                            let _ = self.runner.kill(pid);
+                        }
                     }
                 }
             }
@@ -246,7 +318,19 @@ impl<R: Runner> Supervisor<R> {
             // we launched it at some point but the process is gone
             ServiceState::Error("process exited; see logs".into())
         } else {
-            ServiceState::Stopped
+            let is_lang = crate::lang::SUPPORTED_LANGUAGES
+                .iter()
+                .any(|&l| name == l || name.starts_with(&format!("{l}-")));
+            if is_lang && !name.starts_with("php") {
+                let base = name.split('-').next().unwrap_or(name);
+                if crate::lang::active_lang_version(&self.env, base).is_some() {
+                    ServiceState::Running
+                } else {
+                    ServiceState::Stopped
+                }
+            } else {
+                ServiceState::Stopped
+            }
         };
         ServiceStatus {
             name: name.into(),
@@ -255,13 +339,18 @@ impl<R: Runner> Supervisor<R> {
         }
     }
 
-    /// Parse a list of `*.pid` files present in the pid dir.
+    /// Parse a list of `*.pid` files present in the pid dir. Pid files that
+    /// mariadbd writes next to its socket (`db.sock.pid` on older installs) are
+    /// not services and are skipped.
     pub fn known_services(&self) -> Vec<String> {
         let mut v = Vec::new();
         if let Ok(rd) = std::fs::read_dir(self.env.paths.pids()) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
                 if let Some(base) = n.strip_suffix(".pid") {
+                    if base.ends_with(".sock") {
+                        continue;
+                    }
                     v.push(base.to_string());
                 }
             }
@@ -330,6 +419,22 @@ mod tests {
             ports: PortPlan::default(),
             runner: FakeRunner::default(),
         }
+    }
+
+    #[test]
+    fn known_services_ignores_the_mariadb_socket_pid_file() {
+        let t = tempfile::tempdir().unwrap();
+        let s = Supervisor {
+            env: Env::new(t.path().join("app"), t.path().join("Sites")),
+            ports: PortPlan::default(),
+            runner: FakeRunner::default(),
+        };
+        s.env.ensure_dirs().unwrap();
+        std::fs::write(s.env.paths.pids().join("mariadb.pid"), "1").unwrap();
+        // mariadbd writes <socket>.pid next to the socket; it is not a service
+        std::fs::write(s.env.paths.pids().join("db.sock.pid"), "1").unwrap();
+
+        assert_eq!(s.known_services(), vec!["mariadb".to_string()]);
     }
 
     #[test]

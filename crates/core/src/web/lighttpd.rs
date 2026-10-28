@@ -78,6 +78,7 @@ pub fn lighttpd_site_conf(
 #[allow(clippy::too_many_arguments)]
 pub fn regenerate(
     etc: &std::path::Path,
+    default_root: &std::path::Path,
     pid: &str,
     error_log: &str,
     access_log: &str,
@@ -90,7 +91,10 @@ pub fn regenerate(
 ) -> Result<()> {
     let conf_dir = etc.join("lighttpd");
     let sites_dir = conf_dir.join("sites");
-    let _ = std::fs::create_dir_all(format!("{sites_root}/_default"));
+    // The fallback document root lives in the data root, never in the user's
+    // Sites folder (otherwise it shows up as a `_default.test` project).
+    std::fs::create_dir_all(default_root)?;
+    let default_docroot = default_root.display().to_string();
     let certs_out = conf_dir.join("certs");
     std::fs::create_dir_all(&sites_dir)?;
     if let Ok(rd) = std::fs::read_dir(&sites_dir) {
@@ -136,7 +140,7 @@ pub fn regenerate(
         pid,
         error_log,
         access_log,
-        &format!("{sites_root}/_default"),
+        &default_docroot,
     )?;
     std::fs::write(conf_dir.join("lighttpd.conf"), conf)
         .map_err(|e| Error::Other(format!("write lighttpd.conf: {e}")))
@@ -184,6 +188,41 @@ mod tests {
     }
 
     #[test]
+    fn regenerate_keeps_the_fallback_site_out_of_the_sites_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let etc = t.path().join("etc");
+        let sites = t.path().join("Sites");
+        std::fs::create_dir_all(&sites).unwrap();
+        let default_root = t.path().join("lighttpd/default");
+
+        regenerate(
+            &etc,
+            &default_root,
+            "/run/lighttpd.pid",
+            "/logs/error.log",
+            "/logs/access.log",
+            &sites.display().to_string(),
+            &["blog".to_string()],
+            9004,
+            8080,
+            8443,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !sites.join("_default").exists(),
+            "the sites folder must stay project-only"
+        );
+        assert!(default_root.is_dir(), "fallback document root missing");
+        let conf = std::fs::read_to_string(etc.join("lighttpd/lighttpd.conf")).unwrap();
+        assert!(
+            conf.contains(&default_root.display().to_string()),
+            "fallback docroot must be inside the data root\n{conf}"
+        );
+    }
+
+    #[test]
     fn regenerate_builds_pem_and_clears_stale() {
         let t = tempfile::tempdir().unwrap();
         let etc = t.path().join("etc");
@@ -196,6 +235,7 @@ mod tests {
         std::fs::write(sites_dir.join("old.conf"), "x").unwrap();
         regenerate(
             &etc,
+            &t.path().join("lighttpd/default"),
             "/run/lighttpd.pid",
             "/logs/error.log",
             "/logs/access.log",

@@ -18,6 +18,12 @@ pub enum Action {
     SetPort { key: String, value: u16 },
     /// Show detail view for a service.
     ShowDetail(String),
+    /// Switch a web server's active binary version (e.g. caddy -> caddy-2.9.1).
+    UseServerVersion { server: String, version: String },
+    /// Switch a programming language version (e.g. node -> node-22).
+    UseLang { lang: String, version: String },
+    /// Open a project in the default browser.
+    OpenProject(String),
 }
 
 /// One row of the config panel.
@@ -111,19 +117,106 @@ pub fn progress_bar(done: u64, total: u64, width: usize) -> String {
     s
 }
 
-/// True when the cursor sits on a service row and the key matches the binding.
+/// True when the cursor sits on a service row (not a language runtime) and the
+/// key matches the binding. `node`/`python`/`go`/`java` are runtimes, not
+/// long-running services, so they have nothing to start or stop.
 pub fn cursor_is_service_row(
     app: &App,
     want: crossterm::event::KeyCode,
     recv: crossterm::event::KeyCode,
 ) -> bool {
-    !app.panel_right && app.cursor() < app.services.len() && want == recv
+    !app.panel_right
+        && app.cursor() < app.services.len()
+        && !is_runtime_only(&app.services[app.cursor()].name)
+        && want == recv
+}
+
+/// Language runtimes that are not services: everything except php-fpm.
+fn is_runtime_only(name: &str) -> bool {
+    is_language(name) && !name.starts_with("php")
+}
+
+/// True if a service is a programming language runtime (e.g. php-8.4).
+pub fn is_language(name: &str) -> bool {
+    name.starts_with("php-")
+        || name == "php"
+        || name.starts_with("node-")
+        || name == "node"
+        || name.starts_with("python-")
+        || name == "python"
+        || name.starts_with("ruby-")
+        || name == "ruby"
+        || name.starts_with("go-")
+        || name == "go"
+        || name.starts_with("java-")
+        || name == "java"
+}
+
+/// Language family for a service row: `php-8.4` -> `php`, `node-24` -> `node`.
+fn language_family(name: &str) -> &str {
+    name.split('-').next().unwrap_or(name)
+}
+
+/// First service index of every language family. Used before the first refresh
+/// (which replaces this with the active version of each language).
+fn first_language_reps(services: &[ServiceStatus]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut reps: Vec<usize> = services
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| is_language(&s.name))
+        .filter(|(_, s)| seen.insert(language_family(&s.name).to_string()))
+        .map(|(i, _)| i)
+        .collect();
+    reps.sort_unstable();
+    reps
+}
+
+/// Representative row per language family using the active version from
+/// lock.toml, matching the collapsed rows rendered in the left panel.
+fn language_representatives(
+    env: &fine_ill_do_it_myself::Env,
+    services: &[ServiceStatus],
+) -> Vec<usize> {
+    let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+    let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+    let mut seen = std::collections::HashSet::new();
+    let mut reps = Vec::new();
+    for (idx, s) in services.iter().enumerate() {
+        if !is_language(&s.name) {
+            continue;
+        }
+        let base = language_family(&s.name);
+        if !seen.insert(base.to_string()) {
+            continue;
+        }
+        let target = if base == "php" {
+            format!("php-{php_row}")
+        } else {
+            match fine_ill_do_it_myself::lang::active_lang_version(env, base) {
+                Some(v) => format!("{base}-{v}"),
+                None => base.to_string(),
+            }
+        };
+        let rep = services
+            .iter()
+            .position(|x| x.name == target)
+            .unwrap_or(idx);
+        reps.push(rep);
+    }
+    reps.sort_unstable();
+    reps.dedup();
+    reps
 }
 
 pub struct App {
     pub services: Vec<ServiceStatus>,
     pub projects: Vec<String>,
     pub config_rows: Vec<ConfigRow>,
+    /// One representative service index per language family (php, node, ...).
+    /// The left panel collapses all installed versions into these rows, so
+    /// navigation must walk them instead of every hidden version.
+    language_reps: Vec<usize>,
     pub cursor_left: usize,
     pub cursor_right: usize,
     pub panel_right: bool, // false = left panel, true = right panel
@@ -138,14 +231,22 @@ pub struct App {
     pub detail: Option<String>, // detail view content
     #[allow(dead_code)]
     pub progress: Option<(u64, u64)>,
+    /// Cached line count of the right management panel (updated each render
+    /// cycle and before Enter dispatch so the cursor clamp is accurate).
+    pub mgmt_line_count: usize,
+    /// Cached management panel lines for cursor-skip logic.
+    pub mgmt_lines: Vec<String>,
 }
 
 impl App {
-    pub fn new(services: Vec<ServiceStatus>, projects: Vec<String>) -> Self {
+    pub fn new(mut services: Vec<ServiceStatus>, projects: Vec<String>) -> Self {
+        services.sort_by_key(|s| is_language(&s.name));
+        let language_reps = first_language_reps(&services);
         Self {
             services,
             projects,
             config_rows: Vec::new(),
+            language_reps,
             cursor_left: 0,
             cursor_right: 0,
             panel_right: false,
@@ -158,6 +259,8 @@ impl App {
             edit_dirty: false,
             detail: None,
             progress: None,
+            mgmt_line_count: 0,
+            mgmt_lines: Vec::new(),
         }
     }
 
@@ -273,10 +376,48 @@ impl App {
                         self.actions.push(Action::StartService(i));
                     }
                 }
+                // languages: php-fpm is a service and toggles; the other
+                // runtimes have no process to stop, so Enter opens their
+                // version list instead.
+                "languages" => {
+                    let i = self.cursor();
+                    let name = self.services[i].name.clone();
+                    if is_runtime_only(&name) {
+                        self.detail = Some(format!("detail: {name}"));
+                        self.panel_right = true;
+                        self.cursor_right = 0;
+                        self.message = "select a version, Enter to activate".into();
+                    } else if self.services[i].state == ServiceState::Running {
+                        self.message = "stop requested".into();
+                        self.actions.push(Action::StopService(i));
+                    } else {
+                        self.message = "start requested".into();
+                        self.actions.push(Action::StartService(i));
+                    }
+                }
+                "projects" => {
+                    let proj_idx = self.cursor().saturating_sub(self.services.len());
+                    if let Some(p) = self.projects.get(proj_idx).cloned() {
+                        self.message = format!("opening {p}.test in browser...");
+                        self.actions.push(Action::OpenProject(p));
+                    }
+                }
                 _ => {
-                    self.message = "projects enter not implemented; use compose panel keys".into();
+                    self.message = "enter not implemented; use compose panel keys".into();
                 }
             },
+            _ if !self.panel_right
+                && self.cursor() < self.services.len()
+                && is_runtime_only(&self.services[self.cursor()].name)
+                && [
+                    self.keybinds.start,
+                    self.keybinds.stop,
+                    self.keybinds.restart,
+                ]
+                .contains(&key) =>
+            {
+                self.message = "runtime selected: Enter opens its versions".into();
+            }
             _ if cursor_is_service_row(self, key, self.keybinds.start) => {
                 self.message = "start requested".into();
                 self.actions.push(Action::StartService(self.cursor()));
@@ -309,13 +450,40 @@ impl App {
     pub fn mgmt_enter(&mut self, lines: &[String]) {
         let sel = self.cursor().min(lines.len().saturating_sub(1));
         let line = lines.get(sel).cloned().unwrap_or_default();
-        let text = line.trim_start();
+        let text = line.trim().trim_start_matches("▶ ").trim();
         if let Some(v) = text.strip_prefix("php.use ") {
             self.message = format!("php.use {v} requested");
             self.actions.push(Action::UsePhp(v.to_string()));
         } else if let Some(n) = text.strip_prefix("web.use ") {
             self.message = format!("web.use {n} requested");
             self.actions.push(Action::UseWeb(n.to_string()));
+        } else if let Some((lang_or_srv, ver)) = text.split_once(".use ") {
+            let s = lang_or_srv.trim_start_matches("▶ ").trim();
+            if ["node", "python", "go", "java"].contains(&s) {
+                let target_ver = if ver.starts_with("system") {
+                    "system"
+                } else {
+                    ver
+                };
+                self.message = format!("{s}.use {target_ver} requested");
+                self.actions.push(Action::UseLang {
+                    lang: s.to_string(),
+                    version: target_ver.to_string(),
+                });
+            } else if [
+                fine_ill_do_it_myself::orchestrator::CADDY,
+                fine_ill_do_it_myself::orchestrator::APACHE,
+                fine_ill_do_it_myself::orchestrator::NGINX,
+                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+            ]
+            .contains(&s)
+            {
+                self.message = format!("{s}.use {ver} requested");
+                self.actions.push(Action::UseServerVersion {
+                    server: s.to_string(),
+                    version: ver.to_string(),
+                });
+            }
         } else if let Some(rest) = text.strip_prefix("port ") {
             if let Some((label, value)) = rest.split_once(" = ") {
                 // a web-server row applies its own pair, others the global one
@@ -341,21 +509,158 @@ impl App {
         }
     }
 
+    /// Service/project indices that actually have a visible row in the left
+    /// panel: non-language services, one row per language family, projects.
+    fn visible_left_rows(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..self.services.len())
+            .filter(|&i| !is_language(&self.services[i].name))
+            .collect();
+        rows.extend(
+            self.language_reps
+                .iter()
+                .copied()
+                .filter(|&i| i < self.services.len()),
+        );
+        rows.extend(self.services.len()..self.services.len() + self.projects.len());
+        rows
+    }
+
+    /// Move a cursor that landed on a hidden language version to that family's
+    /// visible representative row.
+    fn normalize_left_cursor(&mut self) {
+        if self.panel_right
+            || self.cursor_left >= self.services.len()
+            || !is_language(&self.services[self.cursor_left].name)
+            || self.language_reps.contains(&self.cursor_left)
+        {
+            return;
+        }
+        let family = language_family(&self.services[self.cursor_left].name).to_string();
+        if let Some(rep) = self.language_reps.iter().copied().find(|&i| {
+            self.services
+                .get(i)
+                .map(|s| language_family(&s.name) == family.as_str())
+                .unwrap_or(false)
+        }) {
+            self.cursor_left = rep;
+        }
+    }
+
     fn cursor_move(&mut self, by: i32) {
+        if !self.panel_right {
+            let rows = self.visible_left_rows();
+            if rows.is_empty() {
+                self.cursor_left = 0;
+                return;
+            }
+            let cur = self.cursor_left;
+            let next = match rows.iter().position(|&r| r == cur) {
+                Some(pos) => (pos as i32 + by).clamp(0, rows.len() as i32 - 1) as usize,
+                // cursor on a hidden version: land on the next visible row in
+                // the direction of travel instead of stepping through it
+                None if by >= 0 => rows.iter().position(|&r| r > cur).unwrap_or(rows.len() - 1),
+                None => rows.iter().rposition(|&r| r < cur).unwrap_or(0),
+            };
+            self.cursor_left = rows[next];
+            return;
+        }
         let cur = self.cursor_mut();
         let c = *cur as i32 + by;
         *cur = c.max(0) as usize;
         self.clamp_cursor();
+        // On the right panel, skip non-selectable lines (empty / header).
+        if self.detail.is_some() {
+            self.skip_unselectable(by);
+        }
+    }
+
+    /// Check whether a management panel line is selectable (non-empty and not
+    /// a header like "  caddy versions:").
+    fn is_mgmt_selectable(line: &str) -> bool {
+        let t = line.trim();
+        !t.is_empty() && !t.ends_with(':')
+    }
+
+    /// After a cursor move on the right panel, skip over non-selectable lines
+    /// (empty lines and headers).  `direction` is the original move (+1 / -1).
+    fn skip_unselectable(&mut self, direction: i32) {
+        let len = self.right_panel_len();
+        if len == 0 {
+            return;
+        }
+        let forward = direction >= 0;
+        let mut pos = self.cursor_right;
+        // Check cached lines; if unavailable, bail.
+        if self.mgmt_lines.is_empty() {
+            return;
+        }
+        // Try to find the next selectable line in the given direction.
+        let mut attempts = 0;
+        while pos < len && attempts < len {
+            if let Some(line) = self.mgmt_lines.get(pos) {
+                if Self::is_mgmt_selectable(line) {
+                    break;
+                }
+            } else {
+                break;
+            }
+            if forward {
+                if pos + 1 < len {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            } else if pos > 0 {
+                pos -= 1;
+            } else {
+                break;
+            }
+            attempts += 1;
+        }
+        self.cursor_right = pos;
     }
 
     pub fn clamp_now(&mut self) {
         self.clamp_cursor()
     }
 
+    /// Dynamic number of rows currently in the right management panel based on
+    /// the currently selected service and detail state.
+    pub fn right_panel_len(&self) -> usize {
+        if self.detail.is_none() {
+            return self.config_rows.len().max(1);
+        }
+        if let Some(svc) = self.services.get(self.cursor_left) {
+            if [
+                fine_ill_do_it_myself::orchestrator::CADDY,
+                fine_ill_do_it_myself::orchestrator::APACHE,
+                fine_ill_do_it_myself::orchestrator::NGINX,
+                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+            ]
+            .contains(&svc.name.as_str())
+            {
+                // Use the cached line count so the cursor can reach
+                // all rows including dynamically discovered versions.
+                return self.mgmt_line_count.max(4);
+            }
+            if svc.name == "mariadb" {
+                return 4;
+            }
+            if svc.name.starts_with("php-") {
+                let n = self
+                    .config_rows
+                    .iter()
+                    .filter(|r| matches!(r, ConfigRow::UsePhp(_)))
+                    .count();
+                return n.max(1);
+            }
+        }
+        self.config_rows.len().max(1)
+    }
+
     fn clamp_cursor(&mut self) {
-        // cursor walks only within current panel
         let len = if self.panel_right {
-            self.config_rows.len().max(1)
+            self.right_panel_len()
         } else {
             self.services.len() + self.projects.len()
         };
@@ -408,23 +713,34 @@ pub fn quick_create_plan(sites: &str, name: &str) -> Vec<String> {
     plan
 }
 
-/// Which panel is focused given a cursor that walks services then projects.
+/// Which panel is focused given a cursor that walks services, languages, then projects.
 pub fn focused_panel(app: &App) -> &'static str {
     if app.panel_right {
         "management"
-    } else if app.cursor() < app.services.len() {
-        "services"
-    } else if app.cursor() < app.services.len() + app.projects.len() {
-        "projects"
     } else {
-        "services"
+        let non_lang_count = app
+            .services
+            .iter()
+            .filter(|s| !is_language(&s.name))
+            .count();
+        let lang_count = app.services.iter().filter(|s| is_language(&s.name)).count();
+        let cur = app.cursor();
+        if cur < non_lang_count {
+            "services"
+        } else if cur < non_lang_count + lang_count {
+            "languages"
+        } else if cur < non_lang_count + lang_count + app.projects.len() {
+            "projects"
+        } else {
+            "services"
+        }
     }
 }
 
 /// Port label per service row, shown beside its name.
 pub fn ports_label(name: &str, php_row: &str, ports: &fine_ill_do_it_myself::PortPlan) -> String {
     if name == "mariadb" {
-        "3306".to_string()
+        ports.mariadb.to_string()
     } else if let Some(ver) = name.strip_prefix("php-") {
         if php_row != ver {
             return String::new();
@@ -503,6 +819,60 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
     out
 }
 
+/// Discovered alternate versions of a web server in `bin/` or `bin/<server>/` (e.g. caddy-2.9.1).
+pub fn installed_server_versions(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
+    let mut vers = Vec::new();
+    let prefix = format!("{server}-");
+    // 1. Check in server-specific subdirectory bin/<server>/
+    let server_dir = env.paths.bin().join(server);
+    if let Ok(rd) = std::fs::read_dir(&server_dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(v) = n.strip_prefix(&prefix) {
+                if !v.ends_with(".old")
+                    && !v.ends_with("-bin")
+                    && !v.starts_with('.')
+                    && !vers.contains(&v.to_string())
+                {
+                    vers.push(v.to_string());
+                }
+            } else if n != server
+                && !n.ends_with(".old")
+                && !n.ends_with("-bin")
+                && !n.starts_with('.')
+                && n.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && !vers.contains(&n)
+            {
+                vers.push(n);
+            }
+        }
+    }
+    // 2. Also check flat bin/ for backward compatibility
+    if let Ok(rd) = std::fs::read_dir(env.paths.bin()) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(v) = n.strip_prefix(&prefix) {
+                if !v.ends_with(".old")
+                    && !v.ends_with("-bin")
+                    && !v.starts_with('.')
+                    && !vers.contains(&v.to_string())
+                {
+                    vers.push(v.to_string());
+                }
+            }
+        }
+    }
+    vers.sort_by(|a, b| {
+        let parse = |s: &str| {
+            s.split('.')
+                .map(|p| p.parse::<u32>().unwrap_or(0))
+                .collect::<Vec<_>>()
+        };
+        parse(b).cmp(&parse(a))
+    });
+    vers
+}
+
 /// Title + exact text of the management panel's items for `app`'s current
 /// state. Shared by the renderer and by `App::mgmt_enter` so Enter always
 /// acts on precisely the line that is displayed.
@@ -514,7 +884,7 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
         fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
 
     if let Some(svc) = app.services.get(app.cursor_left) {
-        if svc.name.starts_with("php-") {
+        if svc.name.starts_with("php-") || svc.name == "php" {
             return (
                 format!(" php versions (current: {cur_php}) "),
                 fine_ill_do_it_myself::orchestrator::installed_php_versions(env)
@@ -526,6 +896,42 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
                     .collect(),
             );
         }
+        for lang in ["node", "python", "go", "java"] {
+            if svc.name == lang || svc.name.starts_with(&format!("{lang}-")) {
+                let cur = fine_ill_do_it_myself::lang::active_lang_version(env, lang)
+                    .unwrap_or_else(|| "none".into());
+                let versions = fine_ill_do_it_myself::lang::installed_lang_versions(env, lang);
+                let mut lines = Vec::new();
+                if versions.is_empty() {
+                    lines.push("  no versions installed:".to_string());
+                    lines.push(format!("  install with: fidim {lang} install <v>:"));
+                } else {
+                    for v in &versions {
+                        let is_active = v == &cur
+                            || (v == "system" && (cur == "system" || cur.starts_with("system")));
+                        let mark = if is_active { "▶ " } else { "  " };
+                        let label = if v == "system" {
+                            if let Some(sys) = fine_ill_do_it_myself::lang::which_system_lang(lang)
+                            {
+                                if let Some(sys_ver) =
+                                    fine_ill_do_it_myself::lang::probe_version(&sys)
+                                {
+                                    format!("system ({sys_ver})")
+                                } else {
+                                    "system".to_string()
+                                }
+                            } else {
+                                "system".to_string()
+                            }
+                        } else {
+                            v.clone()
+                        };
+                        lines.push(format!("{mark}{lang}.use {label}"));
+                    }
+                }
+                return (format!(" {lang} versions (current: {cur}) "), lines);
+            }
+        }
         if [
             fine_ill_do_it_myself::orchestrator::CADDY,
             fine_ill_do_it_myself::orchestrator::APACHE,
@@ -535,10 +941,22 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
         .contains(&svc.name.as_str())
         {
             let ver = fine_ill_do_it_myself::orchestrator::web_version(env, &svc.name);
-            return (
-                format!(" {} management ", svc.name),
-                web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports),
-            );
+            let mut lines = web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports);
+            let vers = installed_server_versions(env, &svc.name);
+            if !vers.is_empty() {
+                lines.push(String::new());
+                lines.push(format!("  {} versions:", svc.name));
+                let cur_v = ver.unwrap_or_default();
+                for v in vers {
+                    let mark = if cur_v.starts_with(&v) || v.starts_with(&cur_v) {
+                        "▶ "
+                    } else {
+                        "  "
+                    };
+                    lines.push(format!("{mark}{}.use {v}", svc.name));
+                }
+            }
+            return (format!(" {} management ", svc.name), lines);
         }
         if svc.name == "mariadb" {
             return (
@@ -576,7 +994,7 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
 /// Terminal entry: raw mode loop with ratatui rendering of status + logs.
 pub fn run_tui(
     env: &fine_ill_do_it_myself::Env,
-    ports: fine_ill_do_it_myself::PortPlan,
+    _ports: fine_ill_do_it_myself::PortPlan,
 ) -> Result<(), fine_ill_do_it_myself::Error> {
     use crossterm::event::{Event, KeyEventKind};
     use crossterm::terminal;
@@ -602,6 +1020,8 @@ pub fn run_tui(
     let mut term = Terminal::new(backend).ok();
     refresh(&mut app);
     loop {
+        let ports =
+            fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         if let Some(t) = term.as_mut() {
             let _ = t.draw(|f| {
                 use ratatui::layout::{Constraint, Layout};
@@ -616,8 +1036,8 @@ pub fn run_tui(
                 // Only show detail panel if app.detail is Some
                 let (main_area, detail_area) = if app.detail.is_some() {
                     let [left, right] = Layout::horizontal([
-                        Constraint::Percentage(50),
-                        Constraint::Percentage(50),
+                        Constraint::Percentage(65),
+                        Constraint::Percentage(35),
                     ])
                     .areas(area);
                     (left, Some(right))
@@ -625,71 +1045,177 @@ pub fn run_tui(
                     (area, None)
                 };
 
-                let [services, projects, footer] = Layout::vertical([
-                    Constraint::Length(app.services.len() as u16 + 2),
+                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+
+                let non_lang_indices: Vec<usize> = app
+                    .services
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !is_language(&s.name))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Collapse language versions: show only one row per language
+                // family (php, node, python, go, java). `language_reps` holds
+                // the active version row for each family and is what navigation
+                // walks, so the highlight never lands on a hidden version.
+                let collapsed_lang: Vec<(usize, String)> = app
+                    .language_reps
+                    .iter()
+                    .filter_map(|&idx| {
+                        app.services
+                            .get(idx)
+                            .map(|s| (idx, language_family(&s.name).to_string()))
+                    })
+                    .collect();
+
+                let svc_height = if non_lang_indices.is_empty() {
+                    0
+                } else {
+                    non_lang_indices.len() as u16 + 2
+                };
+
+                let lang_height = if collapsed_lang.is_empty() {
+                    0
+                } else {
+                    collapsed_lang.len() as u16 + 2
+                };
+
+                let [services, languages, projects, footer] = Layout::vertical([
+                    Constraint::Length(svc_height),
+                    Constraint::Length(lang_height),
                     Constraint::Min(1),
                     Constraint::Length(1),
                 ])
                 .areas(main_area);
 
-                // services panel
-                let items: Vec<ListItem> = app
-                    .services
-                    .iter()
-                    .map(|s| {
-                        let (name, mark, color) = match &s.state {
-                            ServiceState::Running => {
-                                ("● ".to_string(), s.name.clone(), Color::Green)
+                let left_cursor = app.cursor_left;
+                let svc_focus = !app.panel_right && non_lang_indices.contains(&left_cursor);
+                let lang_focus = !app.panel_right && app.language_reps.contains(&left_cursor);
+                let proj_focus = !app.panel_right && left_cursor >= app.services.len();
+
+                // 1. Services panel (web servers, databases, etc.)
+                if svc_height > 0 {
+                    let items: Vec<ListItem> = non_lang_indices
+                        .iter()
+                        .map(|&idx| {
+                            let s = &app.services[idx];
+                            let (mark, name, color) = match &s.state {
+                                ServiceState::Running => {
+                                    ("● ".to_string(), s.name.clone(), Color::Green)
+                                }
+                                ServiceState::Error(msg) => {
+                                    ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                                }
+                                _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
+                            };
+                            let p = ports_label(&s.name, &php_row, &ports);
+                            let (p1, p2) = if let Some((http, https)) = p.split_once(' ') {
+                                (http.to_string(), https.to_string())
+                            } else if s.name == "mariadb" && !p.is_empty() {
+                                (format!("port:{p}"), String::new())
+                            } else {
+                                (p, String::new())
+                            };
+                            let mut spans = vec![
+                                Span::styled(mark, Style::default().fg(color)),
+                                Span::styled(
+                                    format!("{:<11}", name),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ];
+                            if !p1.is_empty() {
+                                spans.push(Span::styled(
+                                    format!("{:<12}", p1),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
                             }
-                            ServiceState::Error(msg) => {
-                                ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                            if !p2.is_empty() {
+                                spans.push(Span::styled(p2, Style::default().fg(Color::DarkGray)));
                             }
-                            _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
-                        };
-                        let lock =
-                            fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-                        let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                        let p = ports_label(&s.name, &php_row, &ports);
-                        ListItem::new(Line::from(vec![
-                            Span::styled(mark, Style::default().fg(color)),
-                            Span::styled(
-                                name.to_string(),
+                            ListItem::new(Line::from(spans))
+                        })
+                        .collect();
+
+                    let mut lst = ListState::default();
+                    if let Some(pos) = non_lang_indices.iter().position(|&i| i == left_cursor) {
+                        lst.select(Some(pos));
+                    }
+                    let svc_marker = if svc_focus { "▶ " } else { "  " };
+                    let svc_list = List::new(items)
+                        .highlight_symbol(svc_marker.to_owned())
+                        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+                        .block(
+                            Block::default()
+                                .title(format!(" services{} ", if svc_focus { " ◀" } else { "" }))
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(if svc_focus {
+                                    Color::Cyan
+                                } else {
+                                    Color::DarkGray
+                                })),
+                        );
+                    f.render_stateful_widget(svc_list, services, &mut lst);
+                }
+
+                // 2. Programming languages panel (PHP runtimes, etc.)
+                if lang_height > 0 {
+                    let lang_items: Vec<ListItem> = collapsed_lang
+                        .iter()
+                        .map(|(idx, display_name)| {
+                            let s = &app.services[*idx];
+                            let p = if display_name == "php" {
+                                ports_label(&s.name, &php_row, &ports)
+                            } else {
+                                fine_ill_do_it_myself::lang::active_lang_version(env, display_name)
+                                    .unwrap_or_else(|| "not installed".to_string())
+                            };
+                            let mut spans = vec![Span::styled(
+                                format!("{:<13}", display_name),
                                 Style::default()
                                     .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(format!("  {p}"), Style::default().fg(Color::DarkGray)),
-                        ]))
-                    })
-                    .collect();
-                let web_name = fine_ill_do_it_myself::orchestrator::web_server(env);
-                let svc_focus = !app.panel_right && app.cursor() < app.services.len();
-                let proj_focus = !app.panel_right && app.cursor() >= app.services.len();
-                let mut lst = ListState::default();
-                if svc_focus {
-                    lst.select(Some(app.cursor().min(app.services.len().saturating_sub(1))));
-                }
-                let svc_marker = if svc_focus { "▶ " } else { " " };
-                let svc_list = List::new(items)
-                    .highlight_symbol(svc_marker.to_owned())
-                    .highlight_style(Style::default().bg(Color::Cyan))
-                    .block(
-                        Block::default()
-                            .title(format!(
-                                " services ({web_name}){} ",
-                                if svc_focus { " ◀" } else { "" }
-                            ))
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if svc_focus {
-                                Color::Cyan
-                            } else {
-                                Color::DarkGray
-                            })),
-                    );
-                f.render_stateful_widget(svc_list, services, &mut lst);
+                            )];
+                            if !p.is_empty() {
+                                spans.push(Span::styled(
+                                    format!("{:<12}", p),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                            ListItem::new(Line::from(spans))
+                        })
+                        .collect();
 
-                // projects panel
+                    let mut lang_lst = ListState::default();
+                    if let Some(pos) = collapsed_lang.iter().position(|(i, _)| *i == left_cursor) {
+                        lang_lst.select(Some(pos));
+                    }
+                    let lang_marker = if lang_focus { "▶ " } else { "  " };
+                    let lang_list = List::new(lang_items)
+                        .highlight_symbol(lang_marker.to_owned())
+                        .highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
+                        .block(
+                            Block::default()
+                                .title(format!(
+                                    " programming languages (php: {php_row}){} ",
+                                    if lang_focus { " ◀" } else { "" }
+                                ))
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(if lang_focus {
+                                    Color::Green
+                                } else {
+                                    Color::DarkGray
+                                })),
+                        );
+                    f.render_stateful_widget(lang_list, languages, &mut lang_lst);
+                }
+
+                // 3. Projects panel
                 let proj_items: Vec<ListItem> = app
                     .projects
                     .iter()
@@ -704,13 +1230,13 @@ pub fn run_tui(
                 let mut plst = ListState::default();
                 if proj_focus {
                     plst.select(Some(
-                        app.cursor()
+                        left_cursor
                             .saturating_sub(app.services.len())
                             .min(app.projects.len().saturating_sub(1)),
                     ));
                 }
                 let proj_list = List::new(proj_items)
-                    .highlight_symbol(if proj_focus { "▶ " } else { " " }.to_owned())
+                    .highlight_symbol(if proj_focus { "▶ " } else { "  " }.to_owned())
                     .highlight_style(Style::default().bg(Color::Blue))
                     .block(
                         Block::default()
@@ -731,11 +1257,16 @@ pub fn run_tui(
                                                                           // mgmt_panel so Enter (mgmt_enter) acts on exactly these lines
                 if let Some(detail_area) = detail_area {
                     let (mgmt_title, lines) = mgmt_panel(env, &app);
+                    app.mgmt_line_count = lines.len();
+                    app.mgmt_lines = lines.clone();
                     let mgmt_focus = app.panel_right;
                     let mgmt_items: Vec<ListItem> = lines
                         .iter()
                         .map(|line| {
-                            let color = if line.starts_with("web.use") {
+                            let selectable = App::is_mgmt_selectable(line);
+                            let color = if !selectable {
+                                Color::DarkGray
+                            } else if line.starts_with("web.use") {
                                 Color::Cyan
                             } else {
                                 Color::Yellow
@@ -814,12 +1345,20 @@ pub fn run_tui(
             if let Ok(Event::Key(k)) = crossterm::event::read() {
                 if k.kind == KeyEventKind::Press {
                     // Enter on the right panel acts on the highlighted
-                    // management line (port editor, web.use, php.use)
+                    // management line (port editor, web.use, php.use) ONLY
+                    // when the editor is not already open.  If the editor is
+                    // active the keystroke must reach on_key so it can commit
+                    // the typed value via SetPort (the bug: without this guard
+                    // mgmt_enter would re-open the editor with the stale
+                    // prefill and silently discard the user's input).
                     if k.code == crossterm::event::KeyCode::Enter
                         && app.panel_right
                         && app.detail.is_some()
+                        && app.edit.is_none()
                     {
                         let (_, lines) = mgmt_panel(env, &app);
+                        app.mgmt_line_count = lines.len();
+                        app.mgmt_lines = lines.clone();
                         app.mgmt_enter(&lines);
                     } else {
                         app.on_key(k.code);
@@ -845,12 +1384,14 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
     move |app: &mut App| {
         let ports =
             fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
-        let statuses = fine_ill_do_it_myself::orchestrator::status_all(
+        let mut statuses = fine_ill_do_it_myself::orchestrator::status_all(
             &env,
             &ports,
             &fine_ill_do_it_myself::RealRunner,
         );
+        statuses.sort_by_key(|s| is_language(&s.name));
         app.services = statuses;
+        app.language_reps = language_representatives(&env, &app.services);
 
         // build config rows
         let mut rows: Vec<ConfigRow> = Vec::new();
@@ -894,6 +1435,7 @@ fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
 
         app.config_rows = rows;
         app.clamp_now();
+        app.normalize_left_cursor();
     }
 }
 
@@ -945,23 +1487,20 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             })
         }
         Action::UsePhp(v) => {
-            if fine_ill_do_it_myself::orchestrator::php_binary_for(env, v).is_none() {
-                Err(fine_ill_do_it_myself::Error::PhpNotInstalled(v.clone()))
-            } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
-                lock.php_default = Some(v.clone());
-                let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
-                    .save(&env.lock_path())
-                    .map_err(|e| e.into())
-                    .and_then(|_| {
-                        fine_ill_do_it_myself::orchestrator::generate_configs(env, &ports, v)
-                    })
-                    .map(|_| vec![]);
-                res
-            } else {
-                Err(fine_ill_do_it_myself::Error::Other(
-                    "failed to load lock".into(),
-                ))
-            }
+            let cli_env = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: v.clone(),
+            };
+            crate::cli::php_use(&cli_env, v).map(|_| vec![])
+        }
+        Action::UseLang { lang, version } => {
+            let cli_env = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: version.clone(),
+            };
+            crate::cli::lang_use(&cli_env, lang, version).map(|_| vec![])
         }
         Action::UseWeb(name) => {
             if fine_ill_do_it_myself::orchestrator::resolve_web_bin(env, name).is_err() {
@@ -989,6 +1528,42 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             // shared with the CLI: accepts the per-server pairs too
             // (nginx_http, ...) and rejects unknown keys with an error
             crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
+        }
+        Action::UseServerVersion { server, version } => {
+            let server_dir = env.paths.bin().join(server);
+            let (src, dest) = if server_dir.is_dir() {
+                let candidate1 = server_dir.join(format!("{server}-{version}"));
+                let candidate2 = server_dir.join(version);
+                let src = if candidate1.exists() {
+                    candidate1
+                } else if candidate2.exists() {
+                    candidate2
+                } else {
+                    candidate1
+                };
+                let dest = server_dir.join(server);
+                (src, dest)
+            } else {
+                let src = env.paths.bin().join(format!("{server}-{version}"));
+                let dest = env.paths.bin().join(server);
+                (src, dest)
+            };
+            if !src.exists() {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "version {version} for {server} not found"
+                )))
+            } else {
+                let _ = std::fs::remove_file(&dest);
+                #[cfg(unix)]
+                let res = {
+                    use std::os::unix::fs::symlink;
+                    symlink(&src, &dest).or_else(|_| std::fs::copy(&src, &dest).map(|_| ()))
+                };
+                #[cfg(not(unix))]
+                let res = std::fs::copy(&src, &dest).map(|_| ());
+                res.map(|_| vec![])
+                    .map_err(fine_ill_do_it_myself::Error::Io)
+            }
         }
         Action::ShowDetail(name) => {
             // Build detail content based on service
@@ -1026,9 +1601,46 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             app.detail = Some(detail);
             Ok(vec![])
         }
+        Action::OpenProject(project) => {
+            let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+            let web = fine_ill_do_it_myself::orchestrator::default_web(&lock);
+            let (http_port, _) = ports.web_ports(&web);
+            let url = if http_port == 80 {
+                format!("http://{project}.test")
+            } else {
+                format!("http://{project}.test:{http_port}")
+            };
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            if !hosts.contains(&format!("{project}.test")) {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "opened {url} (note: {project}.test missing in /etc/hosts, run: fidim hosts --sync)"
+                )))
+            } else {
+                Ok(vec![])
+            }
+        }
     };
     match r {
-        Ok(_) => app.message = format!("{action:?} ok").to_lowercase(),
+        Ok(_) => match action {
+            Action::OpenProject(p) => {
+                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                let web = fine_ill_do_it_myself::orchestrator::default_web(&lock);
+                let (http_port, _) = ports.web_ports(&web);
+                let port_str = if http_port == 80 {
+                    String::new()
+                } else {
+                    format!(":{http_port}")
+                };
+                app.message = format!("opened http://{p}.test{port_str} in browser");
+            }
+            _ => app.message = format!("{action:?} ok").to_lowercase(),
+        },
         Err(e) => app.message = format!("{action:?}: {e}").to_lowercase(),
     }
 }
@@ -1171,6 +1783,76 @@ mod tests {
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Char('r'));
         assert_eq!(a.actions[0], Action::RestartAll);
+    }
+
+    #[test]
+    fn language_panel_navigation_skips_hidden_versions() {
+        let mut a = App::new(
+            vec![
+                svc("caddy", false),
+                svc("mariadb", false),
+                svc("php-8.1", false),
+                svc("php-8.2", false),
+                svc("node-20", false),
+                svc("node-24", false),
+                svc("python-3.13", false),
+                svc("go-1.27", false),
+                svc("java-25", false),
+            ],
+            vec!["blog".into()],
+        );
+
+        // one step per visible row: services, one row per language family,
+        // then projects. Hidden versions must not consume key presses.
+        let mut down = vec![a.cursor_left];
+        for _ in 0..7 {
+            a.on_key(KeyCode::Down);
+            down.push(a.cursor_left);
+        }
+        assert_eq!(down, vec![0, 1, 2, 4, 6, 7, 8, 9], "down path");
+
+        let mut up = Vec::new();
+        for _ in 0..7 {
+            a.on_key(KeyCode::Up);
+            up.push(a.cursor_left);
+        }
+        assert_eq!(up, vec![8, 7, 6, 4, 2, 1, 0], "up path");
+    }
+
+    #[test]
+    fn language_representatives_follow_active_versions() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mut language_defaults = std::collections::BTreeMap::new();
+        language_defaults.insert("node".into(), "24".into());
+        let lock = fine_ill_do_it_myself::Lock {
+            php_default: Some("8.2".into()),
+            language_defaults,
+            ..Default::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+
+        let services = vec![
+            svc("php-8.1", false),
+            svc("php-8.2", false),
+            svc("node-20", false),
+            svc("node-24", false),
+        ];
+        assert_eq!(
+            language_representatives(&env, &services),
+            vec![1, 3],
+            "php 8.2 and node 24 are the active rows"
+        );
+    }
+
+    #[test]
+    fn hidden_language_cursor_normalizes_to_the_representative() {
+        let mut a = App::new(vec![svc("php-8.1", false), svc("php-8.2", false)], vec![]);
+        a.language_reps = vec![1];
+        a.cursor_left = 0;
+        a.normalize_left_cursor();
+        assert_eq!(a.cursor_left, 1);
     }
 
     #[test]
@@ -1444,5 +2126,331 @@ mod tests {
     fn quick_create_plan_covers_dir_and_hosts() {
         let plan = quick_create_plan("~/Sites", "shop");
         assert_eq!(plan, vec!["mkdir -p ~/Sites/shop", "127.0.0.1 shop.test"]);
+    }
+
+    /// Regression: when the port editor is open and the user presses Enter,
+    /// `run_tui`'s routing must hand Enter to `on_key` (which commits the
+    /// typed value) — NOT to `mgmt_enter` (which would re-open/reset the
+    /// editor with the stale value from the panel lines, causing every edit
+    /// to be silently discarded and the port to revert to the default).
+    ///
+    /// The helper `dispatch_enter` mirrors the exact `if`-branch in `run_tui`:
+    ///   • editor inactive + right panel + detail → mgmt_enter
+    ///   • everything else (including editor active) → on_key
+    #[test]
+    fn enter_while_editor_open_commits_value_not_resets_editor() {
+        // Simulates the run_tui dispatch logic:
+        //   if Enter && panel_right && detail.is_some() && edit.is_none() → mgmt_enter
+        //   else → on_key
+        fn dispatch_enter(app: &mut App, lines: &[String]) {
+            use crossterm::event::KeyCode;
+            if app.panel_right && app.detail.is_some() && app.edit.is_none() {
+                app.mgmt_enter(lines);
+            } else {
+                app.on_key(KeyCode::Enter);
+            }
+        }
+
+        let mut a = App::new(vec![svc("nginx", false)], vec![]);
+        a.detail = Some("detail".into());
+        a.panel_right = true;
+        a.cursor_right = 2; // "  port http = 8082"
+        let lines = vec![
+            "web.use nginx".to_string(),
+            "  version 1.2".to_string(),
+            "  port http = 8082".to_string(),
+            "  port https = 8445".to_string(),
+        ];
+
+        // Step 1: first Enter opens the editor (editor is not yet active)
+        dispatch_enter(&mut a, &lines);
+        assert!(a.edit.is_some(), "first Enter must open the port editor");
+        assert_eq!(a.input, "8082");
+
+        // Step 2: user types a new port
+        for c in ['9', '0', '9', '0'] {
+            a.on_key(crossterm::event::KeyCode::Char(c));
+        }
+        assert_eq!(a.input, "9090");
+
+        // Step 3: second Enter must COMMIT via on_key, NOT re-open via mgmt_enter.
+        // Without the `app.edit.is_none()` guard, mgmt_enter would run here,
+        // resetting `app.input` back to "8082" and discarding the SetPort action.
+        dispatch_enter(&mut a, &lines);
+        assert!(
+            a.edit.is_none(),
+            "editor must be closed after committing Enter"
+        );
+        assert!(
+            a.actions.contains(&Action::SetPort {
+                key: "nginx_http".into(),
+                value: 9090,
+            }),
+            "SetPort action with the typed value must be queued; got {:?}",
+            a.actions
+        );
+        // The old value must not appear in the action list
+        assert!(
+            !a.actions.contains(&Action::SetPort {
+                key: "nginx_http".into(),
+                value: 8082,
+            }),
+            "stale default value must not survive the edit"
+        );
+    }
+
+    /// End-to-end: mirrors the exact key sequence a user performs in the TUI
+    /// to change caddy's HTTP port from 8080 → 9090, including the perform_action
+    /// call that writes the value to etc/ports.toml.
+    ///
+    /// Flow:
+    ///   cursor on caddy → 'd' → right panel opens at line 0
+    ///   → Down × 2 → line 2 = "  port http = 8080"
+    ///   → Enter (edit.is_none()) → mgmt_enter → editor opens, input = "8080"
+    ///   → '9','0','9','0' → input = "9090"
+    ///   → Enter (edit.is_some()) → on_key → SetPort queued
+    ///   → perform_action writes etc/ports.toml
+    ///   → PortPlan::resolve reads the new file → caddy_http = 9090
+    #[test]
+    fn end_to_end_port_edit_writes_to_disk_and_survives_resolve() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let mut a = App::new(
+            vec![
+                svc("caddy", false),
+                svc("mariadb", false),
+                svc("php-8.4", false),
+            ],
+            vec![],
+        );
+        a.config_rows = vec![
+            ConfigRow::UsePhp("8.4".into()),
+            ConfigRow::UseWeb {
+                name: "caddy".into(),
+                ver: None,
+            },
+            ConfigRow::Port {
+                key: "http".into(),
+                value: 8080,
+            },
+            ConfigRow::Port {
+                key: "https".into(),
+                value: 8443,
+            },
+            ConfigRow::Port {
+                key: "fpm_base".into(),
+                value: 9000,
+            },
+            ConfigRow::Port {
+                key: "mariadb".into(),
+                value: 3306,
+            },
+        ];
+
+        // 'd' on caddy → detail panel, cursor_right resets to 0
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.panel_right);
+        assert!(a.detail.is_some());
+        assert_eq!(a.cursor_right, 0);
+
+        // mgmt lines as caddy web_mgmt_lines returns (default ports)
+        let caddy_lines = vec![
+            "  default web (this one)".to_string(), // 0
+            "  version not installed".to_string(),  // 1
+            "  port http = 8080".to_string(),       // 2
+            "  port https = 8443".to_string(),      // 3
+        ];
+
+        // dispatch_enter mirrors the fixed run_tui logic
+        fn dispatch_enter(app: &mut App, lines: &[String]) {
+            if app.panel_right && app.detail.is_some() && app.edit.is_none() {
+                app.mgmt_enter(lines);
+            } else {
+                app.on_key(KeyCode::Enter);
+            }
+        }
+
+        // Down × 2 → "  port http = 8080" (index 2)
+        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Down);
+        assert_eq!(a.cursor_right, 2);
+
+        // Enter 1 → editor opens
+        dispatch_enter(&mut a, &caddy_lines);
+        assert!(a.edit.is_some(), "editor must open; edit={:?}", a.edit);
+        assert_eq!(a.input, "8080");
+        match &a.edit {
+            Some(Edit::Port(k)) => assert_eq!(k, "caddy_http", "key must be caddy_http"),
+            other => panic!("expected Edit::Port, got {other:?}"),
+        }
+
+        // type new port
+        for c in ['9', '0', '9', '0'] {
+            a.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.input, "9090");
+
+        // Enter 2 → commit
+        dispatch_enter(&mut a, &caddy_lines);
+        assert!(a.edit.is_none(), "editor must close after commit");
+        assert!(
+            a.actions.contains(&Action::SetPort {
+                key: "caddy_http".into(),
+                value: 9090
+            }),
+            "SetPort must be queued; got {:?}",
+            a.actions
+        );
+
+        // perform_action writes to disk
+        let act = make_actioner(env.clone());
+        while let Some(action) = a.actions.pop() {
+            act(&mut a, &action);
+        }
+
+        // verify file
+        let text = std::fs::read_to_string(env.paths.etc().join("ports.toml")).unwrap_or_default();
+        assert!(
+            text.contains("caddy_http = 9090"),
+            "ports.toml must have new value\n{text}"
+        );
+        assert!(
+            !text.contains("caddy_http = 8080"),
+            "old value must not remain\n{text}"
+        );
+
+        // verify PortPlan::resolve reads it back
+        let resolved = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |_| None);
+        assert_eq!(resolved.caddy_http, 9090, "resolve must return saved value");
+    }
+
+    #[test]
+    fn enter_on_a_language_runtime_opens_versions_instead_of_toggling_service() {
+        let mut a = App::new(vec![svc("caddy", true), svc("node-24", true)], vec![]);
+        a.cursor_left = 1;
+        assert_eq!(focused_panel(&a), "languages");
+
+        a.on_key(KeyCode::Enter);
+
+        assert!(
+            a.actions.is_empty(),
+            "runtime rows must not start/stop anything: {:?}",
+            a.actions
+        );
+        assert!(a.panel_right, "Enter should focus the version panel");
+        assert!(a.detail.is_some(), "the version panel must be visible");
+    }
+
+    #[test]
+    fn start_stop_restart_keys_ignore_language_runtimes() {
+        let mut a = App::new(vec![svc("caddy", true), svc("python-3.13", true)], vec![]);
+        a.cursor_left = 1;
+
+        a.on_key(KeyCode::Char('s'));
+        a.on_key(KeyCode::Char('x'));
+        a.on_key(KeyCode::Char('r'));
+
+        assert!(
+            a.actions.is_empty(),
+            "runtime rows are not services: {:?}",
+            a.actions
+        );
+    }
+
+    #[test]
+    fn enter_on_php_fpm_row_still_toggles_the_service() {
+        let mut a = App::new(vec![svc("php-8.4", true)], vec![]);
+        assert_eq!(focused_panel(&a), "languages");
+
+        a.on_key(KeyCode::Enter);
+
+        assert_eq!(a.actions, vec![Action::StopService(0)]);
+        assert!(!a.panel_right);
+    }
+
+    #[test]
+    fn enter_on_a_service_row_still_toggles_the_service() {
+        let mut a = App::new(vec![svc("caddy", false)], vec![]);
+        a.on_key(KeyCode::Enter);
+
+        assert_eq!(a.actions, vec![Action::StartService(0)]);
+    }
+
+    #[test]
+    fn focused_panel_and_separation_for_languages() {
+        let mut a = App::new(
+            vec![
+                svc("caddy", true),
+                svc("php-8.4", false),
+                svc("mariadb", true),
+            ],
+            vec!["blog".into()],
+        );
+        // Non-languages (caddy, mariadb) first:
+        assert_eq!(a.services[0].name, "caddy");
+        assert_eq!(a.services[1].name, "mariadb");
+        // Programming languages (php-8.4) second:
+        assert_eq!(a.services[2].name, "php-8.4");
+
+        // Cursor at 0: services container
+        assert_eq!(focused_panel(&a), "services");
+        // Cursor at 1: services container
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "services");
+        // Cursor at 2: languages container
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "languages");
+        // Cursor at 3: projects container
+        a.on_key(KeyCode::Down);
+        assert_eq!(focused_panel(&a), "projects");
+    }
+
+    #[test]
+    fn server_versions_discovery_and_mgmt_enter() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        std::fs::create_dir_all(env.paths.bin()).unwrap();
+
+        std::fs::write(env.paths.bin().join("caddy-2.10.2"), "").unwrap();
+        std::fs::write(env.paths.bin().join("caddy-2.9.1"), "").unwrap();
+
+        let vers = installed_server_versions(&env, "caddy");
+        assert_eq!(vers, vec!["2.10.2", "2.9.1"]);
+
+        let mut a = App::new(vec![svc("caddy", true)], vec![]);
+        a.mgmt_enter(&["  caddy.use 2.9.1".to_string()]);
+        assert_eq!(
+            a.actions,
+            vec![Action::UseServerVersion {
+                server: "caddy".into(),
+                version: "2.9.1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_server_versions_discovery_and_mgmt_enter() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        let caddy_dir = env.paths.bin().join("caddy");
+        std::fs::create_dir_all(&caddy_dir).unwrap();
+
+        std::fs::write(caddy_dir.join("caddy-2.10.2"), "").unwrap();
+        std::fs::write(caddy_dir.join("caddy-2.9.1"), "").unwrap();
+
+        let vers = installed_server_versions(&env, "caddy");
+        assert_eq!(vers, vec!["2.10.2", "2.9.1"]);
+
+        let mut a = App::new(vec![svc("caddy", true)], vec![]);
+        a.mgmt_enter(&["  caddy.use 2.9.1".to_string()]);
+        assert_eq!(
+            a.actions,
+            vec![Action::UseServerVersion {
+                server: "caddy".into(),
+                version: "2.9.1".into()
+            }]
+        );
     }
 }

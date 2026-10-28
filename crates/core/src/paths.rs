@@ -35,6 +35,9 @@ impl Paths {
     pub fn data(&self) -> PathBuf {
         self.root.join("data")
     }
+    pub fn runtimes(&self) -> PathBuf {
+        self.root.join("runtimes")
+    }
 
     pub fn create_all(&self) -> std::io::Result<()> {
         for d in [
@@ -43,11 +46,35 @@ impl Paths {
             self.logs(),
             self.pids(),
             self.data(),
+            self.runtimes(),
         ] {
             std::fs::create_dir_all(d)?;
         }
+        // `bin/<tool>` is created on demand by the installer / `<lang> use`,
+        // so a fresh data root does not fill up with empty directories.
         Ok(())
     }
+}
+
+/// Find project root by traversing upwards from the current directory,
+/// looking for `.fidim`, `Cargo.toml`, or `.git`.
+pub fn find_project_root() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("FIDIM_PROJECT_ROOT") {
+        return Some(PathBuf::from(explicit));
+    }
+    let mut cur = std::env::current_dir().ok()?;
+    loop {
+        if cur.join(".fidim").is_dir()
+            || cur.join("Cargo.toml").is_file()
+            || cur.join(".git").is_dir()
+        {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    std::env::current_dir().ok()
 }
 
 /// Default root: `$XDG_DATA_HOME/fine-ill-do-it-myself` (falls back to
@@ -81,6 +108,22 @@ mod tests {
         assert!(p.pids().exists());
         assert!(p.data().exists());
         assert_eq!(p.sites(), std::path::Path::new(t.path()).join("Sites"));
+    }
+
+    #[test]
+    fn fresh_layout_does_not_create_empty_tool_dirs() {
+        let t = temp();
+        let p = Paths::new(t.path().join("app"), t.path().join("Sites"));
+        p.create_all().unwrap();
+        // Tool dirs appear only when something is installed into them.
+        for sub in [
+            "caddy", "nginx", "httpd", "lighttpd", "php", "node", "python", "go", "java",
+        ] {
+            assert!(
+                !p.bin().join(sub).exists(),
+                "empty bin/{sub} must not be created eagerly"
+            );
+        }
     }
 
     #[test]

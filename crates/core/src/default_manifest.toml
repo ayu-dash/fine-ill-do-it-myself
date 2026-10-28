@@ -1,6 +1,11 @@
 # Default download manifest for fidim.
 # Update versions here without touching code. sha256 left empty = recorded on
 # first install into lock.toml and verified on later (re)installs.
+#
+# install_dir: extract tarball into .fidim/runtimes/<install_dir>/
+# strip_components: strip N leading path components (1 for version-prefixed tarballs)
+# files: which binaries to symlink from the runtime dir into bin/<lang>/
+#        format: "runtime/rel/path:bin/dest/rel"
 
 [[binaries]]
 name = "caddy"
@@ -10,34 +15,272 @@ sha256 = "5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd"
 tar_gz = true
 files = ["caddy"]
 
+# ─── MariaDB (portable Linux x86_64 binary tarball) ──────────────────────────
+[[binaries]]
+name = "mariadb"
+version = "11.4.13"
+url = "https://archive.mariadb.org/mariadb-11.4.13/bintar-linux-systemd-x86_64/mariadb-11.4.13-linux-systemd-x86_64.tar.gz"
+sha256 = "3cebf63914df3154b7cb6d548337eb2be42c773aeb641110446b72e2746cfed7"
+tar_gz = true
+install_dir = "mariadb/11.4.13"
+strip_components = 1
+files = [
+  "bin/mariadbd:mariadb/mariadbd",
+  "scripts/mariadb-install-db:mariadb/mariadb-install-db",
+  "bin/mariadb-admin:mariadb/mariadb-admin",
+  "bin/mariadb:mariadb/mariadb",
+  "bin/mysql:mariadb/mysql",
+]
+
+[[binaries]]
+name = "phpmyadmin"
+version = "5.2.3"
+url = "https://files.phpmyadmin.net/phpMyAdmin/5.2.3/phpMyAdmin-5.2.3-all-languages.tar.gz"
+sha256 = "12ba1c425fa4071abbd4e7668c9ebdeac0b0755a467a6d6d5026122bb47c102b"
+tar_gz = true
+install_dir = "phpmyadmin/5.2.3"
+strip_components = 1
+files = []
+
+# ─── PHP ─────────────────────────────────────────────────────────────────────
 [[binaries]]
 name = "php-fpm-8.1"
 version = "8.1.34"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.1.34-fpm-linux-x86_64.tar.gz"
-sha256 = "5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.1.34-fpm-linux-x86_64.tar.gz"
+sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.1"]
 
 [[binaries]]
 name = "php-fpm-8.2"
-version = "8.2.30"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.2.30-fpm-linux-x86_64.tar.gz"
-sha256 = "5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd"
+version = "8.2.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.2.32-fpm-linux-x86_64.tar.gz"
+sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.2"]
 
 [[binaries]]
 name = "php-fpm-8.3"
-version = "8.4.23"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.3.15-fpm-linux-x86_64.tar.gz"
-sha256 = "5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd"
+version = "8.3.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.3.32-fpm-linux-x86_64.tar.gz"
+sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.3"]
 
 [[binaries]]
 name = "php-fpm-8.4"
 version = "8.4.23"
-url = "https://dl.static-php.dev/static-php-cli/common/php-8.4.23-fpm-linux-x86_64.tar.gz"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.4.23-fpm-linux-x86_64.tar.gz"
 sha256 = ""
 tar_gz = true
-files = []
+files = ["php-fpm:php/php-fpm-8.4"]
+
+[[binaries]]
+name = "php-8.1"
+version = "8.1.34"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.1.34-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.1"]
+
+[[binaries]]
+name = "php-8.2"
+version = "8.2.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.2.32-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.2"]
+
+[[binaries]]
+name = "php-8.3"
+version = "8.3.32"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.3.32-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.3"]
+
+[[binaries]]
+name = "php-8.4"
+version = "8.4.23"
+url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.4.23-cli-linux-x86_64.tar.gz"
+sha256 = ""
+tar_gz = true
+files = ["php:php/php-8.4"]
+
+# ─── Node.js ────────────────────────────────────────────────────────────────
+# Tarballs have a top-level wrapper dir (node-v24.22.1-linux-x64/), so strip_components=1.
+# The full tree is extracted so that npm/npx symlinks inside bin/ stay valid.
+# Checksums: https://nodejs.org/dist/v<version>/SHASUMS256.txt
+
+[[binaries]]
+name = "node-26"
+version = "26.12.1"
+url = "https://nodejs.org/dist/v26.12.1/node-v26.12.1-linux-x64.tar.gz"
+sha256 = "0fd1eb7770598f52a21995edf6ed35fc690400fa437c2386af329519e9143132"
+tar_gz = true
+install_dir = "node/26"
+strip_components = 1
+files = ["bin/node:node/node-26", "bin/npm:node/npm-26", "bin/npx:node/npx-26"]
+
+[[binaries]]
+name = "node-24"
+version = "24.22.1"
+url = "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.gz"
+sha256 = "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c"
+tar_gz = true
+install_dir = "node/24"
+strip_components = 1
+files = ["bin/node:node/node-24", "bin/npm:node/npm-24", "bin/npx:node/npx-24"]
+
+[[binaries]]
+name = "node-22"
+version = "22.11.0"
+url = "https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.gz"
+sha256 = "4f862bab52039835efbe613b532238b6e4dde98d139a34e6923193e073438b13"
+tar_gz = true
+install_dir = "node/22"
+strip_components = 1
+files = ["bin/node:node/node-22", "bin/npm:node/npm-22", "bin/npx:node/npx-22"]
+
+[[binaries]]
+name = "node-20"
+version = "20.18.0"
+url = "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-x64.tar.gz"
+sha256 = "24a5d58a1d4c2903478f4b7c3cfd2eeb5cea2cae3baee11a4dc6a1fed25fec6c"
+tar_gz = true
+install_dir = "node/20"
+strip_components = 1
+files = ["bin/node:node/node-20", "bin/npm:node/npm-20", "bin/npx:node/npx-20"]
+
+# ─── Go ──────────────────────────────────────────────────────────────────────
+# Tarballs have a top-level `go/` dir, so strip_components=1.
+# Checksums: https://go.dev/dl/?mode=json&include=all
+
+[[binaries]]
+name = "go-1.27"
+version = "1.27.3"
+url = "https://go.dev/dl/go1.27.3.linux-amd64.tar.gz"
+sha256 = "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+tar_gz = true
+install_dir = "go/1.27"
+strip_components = 1
+files = ["bin/go:go/go-1.27", "bin/gofmt:go/gofmt-1.27"]
+
+[[binaries]]
+name = "go-1.26"
+version = "1.26.10"
+url = "https://go.dev/dl/go1.26.10.linux-amd64.tar.gz"
+sha256 = "ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"
+tar_gz = true
+install_dir = "go/1.26"
+strip_components = 1
+files = ["bin/go:go/go-1.26", "bin/gofmt:go/gofmt-1.26"]
+
+[[binaries]]
+name = "go-1.23"
+version = "1.23.2"
+url = "https://go.dev/dl/go1.23.2.linux-amd64.tar.gz"
+sha256 = "542d3c1705f1c6a1c5a80d5dc62e2e45171af291e755d591c5e6531ef63b454e"
+tar_gz = true
+install_dir = "go/1.23"
+strip_components = 1
+files = ["bin/go:go/go-1.23", "bin/gofmt:go/gofmt-1.23"]
+
+[[binaries]]
+name = "go-1.22"
+version = "1.22.8"
+url = "https://go.dev/dl/go1.22.8.linux-amd64.tar.gz"
+sha256 = "5f467d29fc67c7ae6468cb6ad5b047a274bae8180cac5e0b7ddbfeba3e47e18f"
+tar_gz = true
+install_dir = "go/1.22"
+strip_components = 1
+files = ["bin/go:go/go-1.22", "bin/gofmt:go/gofmt-1.22"]
+
+# ─── Python (astral python-build-standalone) ─────────────────────────────────
+# Tarballs have a top-level `python/` dir, so strip_components=1.
+# python3 is a real binary; pip3 is a wrapper script — both work from the tree.
+# Checksums: release asset `sha256:<hex>` from the GitHub releases API.
+
+[[binaries]]
+name = "python-3.15"
+version = "3.15.2"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.15.2+20261026-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "08d4ae9024a7cfbd3b70e559241afa2571cd3208d7bd5f96f88e0080dd4092aa"
+tar_gz = true
+install_dir = "python/3.15"
+strip_components = 1
+files = ["bin/python3:python/python-3.15", "bin/pip3:python/pip-3.15"]
+
+[[binaries]]
+name = "python-3.14"
+version = "3.14.10"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.14.10+20261026-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "1b38024924eb7f4cf0cab45d7b871d1f1991354190fccd2625ac7529a43786e2"
+tar_gz = true
+install_dir = "python/3.14"
+strip_components = 1
+files = ["bin/python3:python/python-3.14", "bin/pip3:python/pip-3.14"]
+
+[[binaries]]
+name = "python-3.13"
+version = "3.13.18"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18+20261026-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "126343c54daff4068efc1ac269518d0cc202d57857794948103dd1454e8881be"
+tar_gz = true
+install_dir = "python/3.13"
+strip_components = 1
+files = ["bin/python3:python/python-3.13", "bin/pip3:python/pip-3.13"]
+
+[[binaries]]
+name = "python-3.12"
+version = "3.12.7"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7+20241016-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "43576f7db1033dd57b900307f09c2e86f371152ac8a2607133afa51cbfc36064"
+tar_gz = true
+install_dir = "python/3.12"
+strip_components = 1
+files = ["bin/python3:python/python-3.12", "bin/pip3:python/pip-3.12"]
+
+[[binaries]]
+name = "python-3.11"
+version = "3.11.10"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.11.10+20241016-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "8b50a442b04724a24c1eebb65a36a0c0e833d35374dbdf9c9470d8a97b164cd9"
+tar_gz = true
+install_dir = "python/3.11"
+strip_components = 1
+files = ["bin/python3:python/python-3.11", "bin/pip3:python/pip-3.11"]
+
+# ─── Java (Eclipse Temurin) ──────────────────────────────────────────────────
+# Tarballs have a top-level versioned dir (jdk-25.0.5+8/), so strip_components=1.
+# Checksums: https://api.adoptium.net/v3/assets/latest/<major>/hotspot
+
+[[binaries]]
+name = "java-25"
+version = "25.0.5"
+url = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz"
+sha256 = "68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb"
+tar_gz = true
+install_dir = "java/25"
+strip_components = 1
+files = ["bin/java:java/java-25", "bin/javac:java/javac-25"]
+
+[[binaries]]
+name = "java-21"
+version = "21.0.5"
+url = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_linux_hotspot_21.0.5_11.tar.gz"
+sha256 = "3c654d98404c073b8a7e66bffb27f4ae3e7ede47d13284c132d40a83144bfd8c"
+tar_gz = true
+install_dir = "java/21"
+strip_components = 1
+files = ["bin/java:java/java-21", "bin/javac:java/javac-21"]
+
+[[binaries]]
+name = "java-17"
+version = "17.0.13"
+url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.13%2B11/OpenJDK17U-jdk_x64_linux_hotspot_17.0.13_11.tar.gz"
+sha256 = "8682892fc02965930b9022c066fa164dd6f458ef4a5dc262016aa28333b30f49"
+tar_gz = true
+install_dir = "java/17"
+strip_components = 1
+files = ["bin/java:java/java-17", "bin/javac:java/javac-17"]

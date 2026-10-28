@@ -30,8 +30,26 @@ enum Commands {
     },
     Restart,
     Status,
-    /// Manage /etc/hosts entries for .test projects
-    Hosts,
+    /// Print shell exports so managed clients (mysql, php, node, python, go, java) work here
+    Env {
+        /// Install wrappers into ~/.local/bin (or $FIDIM_SHIM_DIR) instead
+        #[arg(long)]
+        install: bool,
+    },
+    /// Manage /etc/hosts entries for .test projects (fallback when DNS is unavailable)
+    Hosts {
+        /// Only print missing entries without modifying /etc/hosts
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+        /// Deprecated alias (syncing is now default)
+        #[arg(long, short, hide = true)]
+        sync: bool,
+    },
+    /// Seamless *.test resolution via a wildcard local DNS responder
+    Dns {
+        #[command(subcommand)]
+        cmd: DnsCommands,
+    },
     /// Print steps to trust the local CA (needs root)
     Trust,
     /// Run the background daemon exposing a unix socket
@@ -45,6 +63,26 @@ enum Commands {
     Php {
         #[command(subcommand)]
         cmd: PhpCommands,
+    },
+    /// Manage Node.js versions
+    Node {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
+    /// Manage Python versions
+    Python {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
+    /// Manage Go versions
+    Go {
+        #[command(subcommand)]
+        cmd: LangCommands,
+    },
+    /// Manage Java versions
+    Java {
+        #[command(subcommand)]
+        cmd: LangCommands,
     },
     /// Show or change port assignments (etc/ports.toml)
     Ports {
@@ -76,7 +114,47 @@ enum WebCommands {
 }
 
 #[derive(Subcommand)]
+enum DnsCommands {
+    /// Run the wildcard DNS responder in the foreground
+    Serve {
+        #[arg(long, default_value_t = fine_ill_do_it_myself::dns::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Show whether *.test resolution is installed and running
+    Status,
+    /// One-time setup: route *.test to fidim (prints the plan unless --yes)
+    Install {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove the resolved drop-in and the user unit
+    Uninstall {
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum PhpCommands {
+    Install {
+        version: String,
+    },
+    List,
+    #[clap(name = "use")]
+    Use {
+        version: String,
+    },
+    Remove {
+        version: String,
+    },
+    /// Show the path to the php.ini configuration file
+    Ini {
+        version: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LangCommands {
     Install {
         version: String,
     },
@@ -143,23 +221,58 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{s}");
             }
         }
-        Some(Commands::Hosts) => {
+        Some(Commands::Env { install }) => {
+            if install {
+                let written = cli::install_shims(&env)?;
+                if written.is_empty() {
+                    println!(
+                        "no managed clients found; run `fidim install mariadb` or `fidim php install <version>` first"
+                    );
+                } else {
+                    for p in written {
+                        println!("{}", p.display());
+                    }
+                }
+            } else {
+                print!("{}", cli::shell_env(&env));
+            }
+        }
+        Some(Commands::Hosts { dry_run, sync: _ }) => {
             match cli::hosts_missing(&env) {
                 Ok(entries) => {
                     if entries.is_empty() {
                         println!("hosts up to date");
-                    } else {
+                    } else if dry_run {
                         for e in &entries {
                             println!("{e}");
                         }
                         let all = entries.join("\n");
-                        println!("sudo tee -a /etc/hosts <<'EOF'\n{all}\nEOF");
+                        println!("\nTo apply, run:\n  fidim hosts\nor:\n  sudo tee -a /etc/hosts <<'EOF'\n{all}\nEOF");
+                    } else {
+                        for e in &entries {
+                            println!("adding to /etc/hosts: {e}");
+                        }
+                        cli::hosts_sync(&entries)?;
+                        println!(
+                            "successfully updated /etc/hosts (added {} entries)",
+                            entries.len()
+                        );
                     }
                     Ok(())
                 }
                 Err(e) => Err(e),
             }?;
         }
+        Some(Commands::Dns { cmd }) => match cmd {
+            DnsCommands::Serve { port } => fine_ill_do_it_myself::dns::serve(port)?,
+            DnsCommands::Status => {
+                for line in cli::dns_status()? {
+                    println!("{line}");
+                }
+            }
+            DnsCommands::Install { yes } => cli::dns_install(yes)?,
+            DnsCommands::Uninstall { yes } => cli::dns_uninstall(yes)?,
+        },
         Some(Commands::Trust) => {
             for line in cli::trust(&env)? {
                 println!("{line}");
@@ -168,6 +281,15 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
         Some(Commands::Install { name }) => {
             let p = cli::install(&env, &name)?;
             println!("installed {name} -> {}", p.display());
+            if name == fine_ill_do_it_myself::phpmyadmin::SITE {
+                println!(
+                    "phpMyAdmin: {}",
+                    fine_ill_do_it_myself::phpmyadmin::url(&env.env, &env.ports)
+                );
+                println!(
+                    "login as root with an empty password (add the host once with: fidim hosts)"
+                );
+            }
         }
         Some(Commands::Projects) => {
             for p in cli::projects(&env)? {
@@ -192,7 +314,15 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 cli::php_remove(&env, &version)?;
                 println!("php {version} removed");
             }
+            PhpCommands::Ini { version } => {
+                let path = cli::php_ini(&env, version.as_deref())?;
+                println!("{}", path.display());
+            }
         },
+        Some(Commands::Node { cmd }) => handle_lang_cmd(&env, "node", cmd)?,
+        Some(Commands::Python { cmd }) => handle_lang_cmd(&env, "python", cmd)?,
+        Some(Commands::Go { cmd }) => handle_lang_cmd(&env, "go", cmd)?,
+        Some(Commands::Java { cmd }) => handle_lang_cmd(&env, "java", cmd)?,
         Some(Commands::Ports { cmd }) => match cmd {
             PortCommands::Show => {
                 let p = &env.ports;
@@ -246,9 +376,96 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
     Ok(())
 }
 
+fn handle_lang_cmd(
+    env: &cli::CliEnv,
+    lang: &str,
+    cmd: LangCommands,
+) -> Result<(), fine_ill_do_it_myself::Error> {
+    match cmd {
+        LangCommands::Install { version } => {
+            cli::lang_install(env, lang, &version)?;
+            println!("{lang} {version} installed");
+        }
+        LangCommands::List => {
+            for v in cli::lang_list(env, lang)? {
+                println!("{v}");
+            }
+        }
+        LangCommands::Use { version } => {
+            cli::lang_use(env, lang, &version)?;
+            println!("default {lang} {version}");
+        }
+        LangCommands::Remove { version } => {
+            cli::lang_remove(env, lang, &version)?;
+            println!("{lang} {version} removed");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use assert_cmd::Command;
+
+    #[test]
+    fn env_command_prints_shell_exports() {
+        let t = tempfile::tempdir().unwrap();
+        let mut cmd = Command::cargo_bin("fidim").unwrap();
+        let out = cmd
+            .arg("--data-root")
+            .arg(t.path())
+            .arg("env")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("export MYSQL_UNIX_PORT='"), "{s}");
+        assert!(s.contains("export MYSQL_TCP_PORT=3306"), "{s}");
+    }
+
+    #[test]
+    fn env_install_writes_client_shims() {
+        let data = tempfile::tempdir().unwrap();
+        let shims = tempfile::tempdir().unwrap();
+        let clients = data.path().join("bin/mariadb");
+        std::fs::create_dir_all(&clients).unwrap();
+        for tool in ["mysql", "mariadb"] {
+            std::fs::write(clients.join(tool), "").unwrap();
+        }
+        let php = data.path().join("bin/php");
+        std::fs::create_dir_all(&php).unwrap();
+        std::fs::write(php.join("php"), "").unwrap();
+        let node = data.path().join("bin/node");
+        std::fs::create_dir_all(&node).unwrap();
+        for tool in ["node", "npm", "npx"] {
+            std::fs::write(node.join(tool), "").unwrap();
+        }
+
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .env("FIDIM_SHIM_DIR", shims.path())
+            .arg("--data-root")
+            .arg(data.path())
+            .args(["env", "--install"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for name in ["mysql", "mariadb", "php", "node", "npm", "npx"] {
+            assert!(shims.path().join(name).exists(), "{name} shim missing");
+        }
+        let body = std::fs::read_to_string(shims.path().join("mysql")).unwrap();
+        assert!(body.contains("MYSQL_UNIX_PORT='"), "{body}");
+        let node = std::fs::read_to_string(shims.path().join("node")).unwrap();
+        assert!(!node.contains("MYSQL_UNIX_PORT"), "{node}");
+    }
 
     #[test]
     fn ports_show_lists_every_web_servers_own_ports() {
@@ -299,6 +516,24 @@ mod tests {
             .unwrap();
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("caddy: Stopped"), "stdout: {s}");
+    }
+
+    #[test]
+    fn dns_install_prints_the_plan_without_touching_the_system() {
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .args(["dns", "install"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("resolved.conf.d/90-fidim.conf"), "{s}");
+        assert!(s.contains("sudo systemctl restart systemd-resolved"), "{s}");
+        assert!(s.contains("--yes"), "must explain how to apply\n{s}");
     }
 
     #[test]

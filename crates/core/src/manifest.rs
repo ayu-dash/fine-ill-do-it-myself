@@ -24,8 +24,20 @@ pub struct BinarySource {
     #[serde(default)]
     pub tar_gz: bool,
     /// File names inside the tarball to preserve relative to its root.
+    /// Format: `"src_rel:dest_rel"` or `"name"` (src = dest).
     #[serde(default)]
     pub files: Vec<String>,
+    /// When set, extract the entire tarball into `.fidim/runtimes/<install_dir>/`
+    /// instead of copying individual files. `files` then lists which binaries
+    /// to symlink from the runtime dir into `bin/<lang>/`.
+    /// Example: `install_dir = "node/22"` → extracts to `runtimes/node/22/`.
+    #[serde(default)]
+    pub install_dir: String,
+    /// Number of leading path components to strip when extracting with `install_dir`.
+    /// Node/Java tarballs have a wrapper dir (e.g. `node-v22-linux-x64/`), so use 1.
+    /// Go tarballs have a `go/` prefix, so also use 1.
+    #[serde(default)]
+    pub strip_components: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -36,9 +48,13 @@ pub struct ManifestEntry {
 }
 
 impl Manifest {
+    pub fn parse(text: &str) -> Result<Self, std::io::Error> {
+        toml::from_str(text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let s = std::fs::read_to_string(path)?;
-        toml::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        Self::parse(&s)
     }
     pub fn save(&self, path: &Path) -> Result<(), std::io::Error> {
         let s = toml::to_string_pretty(self)
@@ -64,6 +80,10 @@ pub struct Lock {
     pub php_default: Option<String>,
     #[serde(default)]
     pub web_default: Option<String>,
+    #[serde(default)]
+    pub languages: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub language_defaults: std::collections::BTreeMap<String, String>,
 }
 
 impl Lock {
@@ -92,11 +112,15 @@ impl Downloader {
     /// Blocking repository download with (optional) checksum verification.
     pub fn download(&self, src: &BinarySource, dest: &Path) -> Result<(), super::error::Error> {
         use sha2::{Digest, Sha256};
-        let url = reqwest::blocking::Client::new()
-            .get(&src.url)
-            .send()?
-            .error_for_status()?;
-        let body = url.bytes()?;
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", "--", &src.url])
+            .output()
+            .map_err(|e| super::error::Error::Other(format!("curl exec failed: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(super::error::Error::Other(format!("curl failed: {stderr}")));
+        }
+        let body = out.stdout;
         let hash = Sha256::digest(&body);
         let hex = format!("{:x}", hash);
         if !src.sha256.is_empty() && src.sha256 != hex {
@@ -126,13 +150,15 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), super::error::Error> 
 pub struct PhpManager;
 
 impl PhpManager {
-    pub fn installed(&self, lock: &Lock, bin_dir: &PathBuf) -> Vec<String> {
+    pub fn installed(&self, lock: &Lock, bin_dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = lock.php.clone();
-        if let Ok(rd) = std::fs::read_dir(bin_dir) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("php-fpm-") {
-                    push_version(&mut v, n.trim_start_matches("php-fpm-"));
+        for dir in [bin_dir.join("php"), bin_dir.to_path_buf()] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if n.starts_with("php-fpm-") {
+                        push_version(&mut v, n.trim_start_matches("php-fpm-"));
+                    }
                 }
             }
         }
@@ -208,6 +234,99 @@ files = ["caddy"]
 "#;
         let m: Manifest = toml::from_str(toml).unwrap();
         assert!(m.find("caddy").unwrap().tar_gz);
+    }
+
+    #[test]
+    fn bundled_manifest_offers_new_language_versions() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        for name in [
+            "node-24",
+            "node-26",
+            "python-3.13",
+            "python-3.14",
+            "python-3.15",
+            "go-1.26",
+            "go-1.27",
+            "java-25",
+        ] {
+            assert!(m.find(name).is_some(), "manifest is missing {name}");
+        }
+    }
+
+    #[test]
+    fn bundled_manifest_offers_phpmyadmin_with_a_pinned_checksum() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let pma = m.find("phpmyadmin").expect("phpmyadmin missing");
+
+        assert_eq!(pma.version, "5.2.3");
+        assert!(pma.url.starts_with("https://"), "{}", pma.url);
+        assert_eq!(pma.sha256.len(), 64, "checksum must be pinned");
+        assert!(pma.tar_gz);
+        assert_eq!(pma.install_dir, "phpmyadmin/5.2.3");
+        assert_eq!(pma.strip_components, 1);
+        assert!(pma.files.is_empty(), "phpMyAdmin is a tree, not a binary");
+    }
+
+    #[test]
+    fn bundled_language_entries_are_pinned_https_and_installable() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        for lang in ["node", "python", "go", "java"] {
+            let prefix = format!("{lang}-");
+            let entries: Vec<_> = m
+                .binaries
+                .iter()
+                .filter(|b| b.name.starts_with(&prefix))
+                .collect();
+            assert!(
+                entries.len() >= 3,
+                "{lang} should offer at least 3 versions, got {}",
+                entries.len()
+            );
+            for b in entries {
+                let short = b.name.trim_start_matches(&prefix);
+                assert!(
+                    b.url.starts_with("https://"),
+                    "{} url must be https",
+                    b.name
+                );
+                assert_eq!(
+                    b.sha256.len(),
+                    64,
+                    "{} sha256 must be pinned (got {:?})",
+                    b.name,
+                    b.sha256
+                );
+                assert!(
+                    b.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{} sha256 must be hex",
+                    b.name
+                );
+                assert!(b.tar_gz, "{} must be a tarball", b.name);
+                assert_eq!(
+                    b.install_dir,
+                    format!("{lang}/{short}"),
+                    "{} install_dir",
+                    b.name
+                );
+                assert!(
+                    b.version.starts_with(&format!("{short}.")),
+                    "{} version {} should start with {short}.",
+                    b.name,
+                    b.version
+                );
+                assert!(!b.files.is_empty(), "{} needs files", b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_manifest_has_unique_binary_names() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let mut names: Vec<&str> = m.binaries.iter().map(|b| b.name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate manifest entry names");
     }
 
     #[test]
