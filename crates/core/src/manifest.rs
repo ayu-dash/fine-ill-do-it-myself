@@ -254,6 +254,20 @@ files = ["caddy"]
     }
 
     #[test]
+    fn bundled_manifest_offers_phpmyadmin_with_a_pinned_checksum() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let pma = m.find("phpmyadmin").expect("phpmyadmin missing");
+
+        assert_eq!(pma.version, "5.2.3");
+        assert!(pma.url.starts_with("https://"), "{}", pma.url);
+        assert_eq!(pma.sha256.len(), 64, "checksum must be pinned");
+        assert!(pma.tar_gz);
+        assert_eq!(pma.install_dir, "phpmyadmin/5.2.3");
+        assert_eq!(pma.strip_components, 1);
+        assert!(pma.files.is_empty(), "phpMyAdmin is a tree, not a binary");
+    }
+
+    #[test]
     fn bundled_language_entries_are_pinned_https_and_installable() {
         let m = Manifest::parse(crate::installer_defaults()).unwrap();
         for lang in ["node", "python", "go", "java"] {

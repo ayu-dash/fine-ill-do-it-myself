@@ -13,6 +13,8 @@ Caddy + PHP-FPM + (optional system) MariaDB, one folder per project under
 - Download manager with sha256 verification for managed binaries and runtimes
 - Optional MariaDB 11.4.13 Linux x86_64 runtime, downloaded with curl into the
   project data root; a system `mariadbd` on `PATH` remains supported
+- phpMyAdmin 5.2.3 as a managed site (`https://phpmyadmin.test`), installed on
+  demand and pointed at the fidim-managed MariaDB
 - A TUI (`fidim` default command), status CLI, unix-socket daemon
 
 ## Install
@@ -27,6 +29,7 @@ Bootstrap binaries from the manifest (defaults ship inside the binary):
 ```sh
 fidim install caddy
 fidim install mariadb   # optional, portable Linux x86_64 runtime (downloaded with curl)
+fidim install phpmyadmin   # optional: served at https://phpmyadmin.test
 fidim php install 8.4
 fidim php use 8.4
 ```
@@ -88,6 +91,15 @@ language. `~/.local/bin` must be on your `PATH`.
 `~/.local/share/fine-ill-do-it-myself/php/<version>/` and `fidim php list`
 picks it up automatically (`fidim php use <version>` selects it).
 
+**phpMyAdmin**: `fidim install phpmyadmin` extracts phpMyAdmin 5.2.3 under
+`runtimes/phpmyadmin/` and links it into `~/Sites/phpmyadmin`, so the usual
+vhost/certificate/hosts generation serves it at
+`https://phpmyadmin.test` (plus the HTTP variant). Its `config.inc.php` points
+at the fidim-managed MariaDB socket and uses the normal login form: user
+`root`, empty password. Run `fidim hosts` once to add the `phpmyadmin.test`
+entry. The symlink is only replaced when it is a fidim symlink, never when a
+real project folder has that name.
+
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
 keys (defaults q/r/s/x/a):
 
@@ -137,7 +149,7 @@ crates/fidim           clap CLI + ratatui TUI + unix socket daemon
 ```
 
 Everything network/process-dependent lives behind small traits (`Fetcher`,
-`Runner`) so the whole suite runs offline — 58 tests, no daemon needed.
+`Runner`) so the whole suite runs offline, no daemon needed.
 
 ## Development
 

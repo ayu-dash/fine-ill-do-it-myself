@@ -130,6 +130,13 @@ pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
     let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
     let out =
         fine_ill_do_it_myself::installer::install(&cli.env, &manifest, &mut lock, name, &fetcher)?;
+    if name == fine_ill_do_it_myself::phpmyadmin::SITE {
+        // Expose the freshly extracted tree as a site and refresh vhosts so it
+        // is reachable right away. Config generation is best-effort: installing
+        // phpMyAdmin before PHP should not fail.
+        fine_ill_do_it_myself::phpmyadmin::ensure_site(&cli.env, &cli.ports)?;
+        let _ = orchestrator::generate_configs(&cli.env, &cli.ports, &cli.php_default);
+    }
     Ok(out)
 }
 

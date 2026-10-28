@@ -128,6 +128,11 @@ pub fn generate_web_configs(
     env.ensure_dirs()?;
     let sites = env.paths.sites().display().to_string();
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
+    // phpMyAdmin is a normal site once installed: link it into Sites before
+    // the project list is read so vhosts/certs/hosts pick it up.
+    if let Err(e) = crate::phpmyadmin::ensure_site(env, ports) {
+        eprintln!("warn: phpMyAdmin site skipped: {e}");
+    }
     let projects = list_projects(env);
     // local CA + per-project leaf certs (silent no-op without openssl)
     if let Err(e) = crate::web::certs::regenerate(&env.paths.etc(), &projects) {
@@ -820,6 +825,24 @@ mod tests {
         let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
         assert!(cf.contains("blog.test:8180"), "http block missing\n{cf}");
         assert!(cf.contains("blog.test:8480"), "https block missing\n{cf}");
+    }
+
+    #[test]
+    fn generate_configs_serves_phpmyadmin_when_installed() {
+        let (env, _t) = env();
+        let pma = env.paths.runtimes().join("phpmyadmin/5.2.3");
+        std::fs::create_dir_all(&pma).unwrap();
+        std::fs::write(pma.join("index.php"), "<?php").unwrap();
+
+        generate_configs(&env, &PortPlan::default(), "8.4").unwrap();
+
+        let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
+        assert!(cf.contains("phpmyadmin.test"), "vhost missing\n{cf}");
+        assert!(
+            env.paths.sites().join("phpmyadmin").exists(),
+            "site link missing"
+        );
+        assert!(pma.join("config.inc.php").exists(), "config missing");
     }
 
     #[test]

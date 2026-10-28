@@ -16,6 +16,7 @@ pub fn app_display_name() -> &'static str {
 }
 pub mod orchestrator;
 pub mod php;
+pub mod phpmyadmin;
 pub mod supervisor;
 pub mod web;
 pub use orchestrator::{hosts_entries, list_projects};

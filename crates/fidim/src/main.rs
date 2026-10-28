@@ -245,6 +245,15 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
         Some(Commands::Install { name }) => {
             let p = cli::install(&env, &name)?;
             println!("installed {name} -> {}", p.display());
+            if name == fine_ill_do_it_myself::phpmyadmin::SITE {
+                println!(
+                    "phpMyAdmin: {}",
+                    fine_ill_do_it_myself::phpmyadmin::url(&env.env, &env.ports)
+                );
+                println!(
+                    "login as root with an empty password (add the host once with: fidim hosts)"
+                );
+            }
         }
         Some(Commands::Projects) => {
             for p in cli::projects(&env)? {
