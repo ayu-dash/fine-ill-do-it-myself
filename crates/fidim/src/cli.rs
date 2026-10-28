@@ -671,13 +671,9 @@ pub fn dns_install(apply: bool) -> Result<()> {
     if !apply {
         println!("\nNothing was changed. Apply with:\n  fidim dns install --yes");
         println!("\nRoot is used once, for:");
-        println!("  sudo mkdir -p /etc/systemd/resolved.conf.d");
-        println!(
-            "  sudo tee {} <<'EOF'\n{}EOF",
-            plan.dropin.display(),
-            plan.dropin_body
-        );
-        println!("  sudo systemctl restart systemd-resolved");
+        for line in fine_ill_do_it_myself::dns::root_steps(&plan) {
+            println!("{line}");
+        }
         return Ok(());
     }
 
@@ -697,9 +693,22 @@ pub fn dns_install(apply: bool) -> Result<()> {
         &["--user", "enable", "--now", "fidim-dns.service"],
     )?;
 
-    run_command("sudo", &["mkdir", "-p", "/etc/systemd/resolved.conf.d"])?;
-    run_sudo_tee(&plan.dropin, &plan.dropin_body)?;
-    run_command("sudo", &["systemctl", "restart", "systemd-resolved"])?;
+    let sudo = run_command("sudo", &["mkdir", "-p", "/etc/systemd/resolved.conf.d"])
+        .and_then(|()| run_sudo_tee(&plan.dropin, &plan.dropin_body))
+        .and_then(|()| run_command("sudo", &["systemctl", "restart", "systemd-resolved"]));
+    if let Err(e) = sudo {
+        eprintln!("\nsudo failed: {e}");
+        eprintln!("The responder is installed and running, but *.test is not routed to it yet.");
+        eprintln!(
+            "Run this in a terminal that can prompt for a password, then `fidim dns status`:\n"
+        );
+        for line in fine_ill_do_it_myself::dns::root_steps(&plan) {
+            eprintln!("{line}\n");
+        }
+        return Err(Error::Other(
+            "resolved drop-in not installed; see the commands above".into(),
+        ));
+    }
 
     println!("\ninstalled: any *.test name now resolves to 127.0.0.1");
     Ok(())

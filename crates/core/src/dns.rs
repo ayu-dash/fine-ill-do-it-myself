@@ -186,6 +186,20 @@ pub fn install_plan(fidim_bin: &Path, home: &Path, port: u16) -> InstallPlan {
     }
 }
 
+/// The root commands that finish the install. Printed when sudo cannot prompt
+/// (no terminal), so the user can paste them into their own shell.
+pub fn root_steps(plan: &InstallPlan) -> Vec<String> {
+    vec![
+        "sudo mkdir -p /etc/systemd/resolved.conf.d".to_string(),
+        format!(
+            "sudo tee {} >/dev/null <<'EOF'\n{}EOF",
+            plan.dropin.display(),
+            plan.dropin_body
+        ),
+        "sudo systemctl restart systemd-resolved".to_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +267,24 @@ mod tests {
         q[2] |= 0x80; // QR = response
 
         assert!(answer(&q, Ipv4Addr::LOCALHOST).is_none());
+    }
+
+    #[test]
+    fn root_steps_install_the_dropin_and_restart_resolved() {
+        let plan = install_plan(Path::new("/opt/fidim"), Path::new("/home/me"), DEFAULT_PORT);
+        let steps = root_steps(&plan);
+
+        assert_eq!(
+            steps[0],
+            "sudo mkdir -p /etc/systemd/resolved.conf.d".to_string()
+        );
+        assert!(
+            steps[1].starts_with("sudo tee /etc/systemd/resolved.conf.d/90-fidim.conf"),
+            "{}",
+            steps[1]
+        );
+        assert!(steps[1].contains("Domains=~test"), "{}", steps[1]);
+        assert_eq!(steps[2], "sudo systemctl restart systemd-resolved");
     }
 
     #[test]
