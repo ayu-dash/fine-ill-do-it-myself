@@ -47,6 +47,21 @@ fidim ports set http 8080   # override ports in etc/ports.toml
 fidim daemon &  # unix socket at ~/.local/share/fine-ill-do-it-myself/data/fidim.sock
 ```
 
+**Use `mysql`/`mariadb` straight from your terminal**: add this once to your
+shell rc (`~/.zshrc` or `~/.bashrc`):
+
+```sh
+eval "$(fidim env)"
+```
+
+It prepends the managed client dir to `PATH` and points `MYSQL_UNIX_PORT` /
+`MYSQL_TCP_PORT` at this data root, so `mariadb -u root` (or the `mysql` alias)
+talks to the fidim-managed server. One-shot alternative:
+
+```sh
+eval "$(fidim env)" && mysql -u root
+```
+
 **PHP drop-in**: drop an extracted PHP tree (containing `php-fpm`) under
 `~/.local/share/fine-ill-do-it-myself/php/<version>/` and `fidim php list`
 picks it up automatically (`fidim php use <version>` selects it).

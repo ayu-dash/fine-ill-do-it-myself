@@ -3,6 +3,7 @@ pub mod manifest;
 pub mod paths;
 pub mod proc;
 pub mod service;
+pub mod shell;
 
 pub use error::{Error, Result};
 pub use manifest::{Lock, Manifest, PhpManager};

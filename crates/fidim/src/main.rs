@@ -30,6 +30,8 @@ enum Commands {
     },
     Restart,
     Status,
+    /// Print shell exports so managed clients (mysql, mariadb) work in this terminal
+    Env,
     /// Manage /etc/hosts entries for .test projects (applies via sudo by default)
     Hosts {
         /// Only print missing entries without modifying /etc/hosts
@@ -189,6 +191,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{s}");
             }
         }
+        Some(Commands::Env) => print!("{}", cli::shell_env(&env)),
         Some(Commands::Hosts { dry_run, sync: _ }) => {
             match cli::hosts_missing(&env) {
                 Ok(entries) => {
@@ -339,6 +342,26 @@ fn handle_lang_cmd(
 #[cfg(test)]
 mod tests {
     use assert_cmd::Command;
+
+    #[test]
+    fn env_command_prints_shell_exports() {
+        let t = tempfile::tempdir().unwrap();
+        let mut cmd = Command::cargo_bin("fidim").unwrap();
+        let out = cmd
+            .arg("--data-root")
+            .arg(t.path())
+            .arg("env")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("export MYSQL_UNIX_PORT='"), "{s}");
+        assert!(s.contains("export MYSQL_TCP_PORT=3306"), "{s}");
+    }
 
     #[test]
     fn ports_show_lists_every_web_servers_own_ports() {

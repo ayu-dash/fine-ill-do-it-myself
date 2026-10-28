@@ -98,6 +98,12 @@ pub fn projects(cli: &CliEnv) -> Result<Vec<String>> {
 }
 
 /// Download + install a binary by name (caddy, php-fpm-8.4, ...).
+/// Shell exports for `eval "$(fidim env)"`: puts managed clients on PATH and
+/// points mysql/mariadb at this data root.
+pub fn shell_env(cli: &CliEnv) -> String {
+    fine_ill_do_it_myself::shell::exports(&cli.env, &cli.ports)
+}
+
 pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
     cli.env.ensure_dirs()?;
     let manifest = load_or_default_manifest(cli)?;
