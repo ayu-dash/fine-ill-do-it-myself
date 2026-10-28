@@ -66,17 +66,17 @@ DirectoryIndex index.php index.html index.htm login.php
 /// VirtualHost include: plain HTTP block and TLS block when a leaf cert file
 /// exists. PHP is routed through fcgi proxy to `fpm_port`.
 pub fn apache_vhost_conf(
-    project: &str,
-    sites_root: &str,
+    site: &crate::site::Site,
     fpm_port: u16,
     http_port: u16,
     https_port: u16,
     cert: Option<(&std::path::Path, &std::path::Path)>,
 ) -> Result<String> {
+    let project = &site.name;
     if project.is_empty() {
         return Err(Error::Other("project name must not be empty".into()));
     }
-    let docroot = format!("{sites_root}/{project}");
+    let docroot = site.docroot_str();
     let handler = format!(
         r#"    <FilesMatch "\.php$">
         SetHandler "proxy:fcgi://127.0.0.1:{fpm_port}"
@@ -121,8 +121,7 @@ pub fn regenerate(
     server_root: &str,
     pid: &str,
     error_log: &str,
-    sites_root: &str,
-    projects: &[String],
+    sites: &[crate::site::Site],
     fpm_port: u16,
     http_port: u16,
     https_port: u16,
@@ -133,10 +132,11 @@ pub fn regenerate(
     let dashboard_dir = etc.join("dashboard");
     std::fs::create_dir_all(&sites_dir)?;
     std::fs::create_dir_all(&dashboard_dir)?;
-    let dashboard_html = generate_dashboard_html(projects, http_port);
+    let names: Vec<String> = sites.iter().map(|s| s.name.clone()).collect();
+    let dashboard_html = generate_dashboard_html(&names, http_port);
     std::fs::write(dashboard_dir.join("index.html"), dashboard_html)?;
 
-    let conf = generate_apache_conf(server_root, projects, http_port, https_port)?
+    let conf = generate_apache_conf(server_root, &names, http_port, https_port)?
         .replace("{pid}", pid)
         .replace("{error_log}", error_log)
         .replace("{sites}", &sites_dir.display().to_string())
@@ -168,7 +168,8 @@ pub fn regenerate(
             let _ = std::fs::remove_file(e.path());
         }
     }
-    for p in projects {
+    for site in sites {
+        let p = &site.name;
         let cert = certs_dir.map(|d| {
             (
                 std::path::Path::new(d).join(format!("{p}.crt")),
@@ -177,7 +178,7 @@ pub fn regenerate(
         });
         let cert = cert.filter(|(c, _)| c.exists());
         let cert = cert.as_ref().map(|(a, b)| (a.as_path(), b.as_path()));
-        let body = apache_vhost_conf(p, sites_root, fpm_port, http_port, https_port, cert)?;
+        let body = apache_vhost_conf(site, fpm_port, http_port, https_port, cert)?;
         std::fs::write(sites_dir.join(format!("{p}.conf")), body)?;
     }
     Ok(())
@@ -242,7 +243,8 @@ mod tests {
 
     #[test]
     fn vhost_has_server_name_and_fpm_proxy() {
-        let c = apache_vhost_conf("blog", "/home/x/Sites", 9004, 8080, 8443, None).unwrap();
+        let c =
+            apache_vhost_conf(&site("blog", "/home/x/Sites/blog"), 9004, 8080, 8443, None).unwrap();
         assert!(c.contains("ServerName blog.test"), "server name");
         assert!(c.contains("DocumentRoot \"/home/x/Sites/blog\""));
         assert!(c.contains("proxy:fcgi://127.0.0.1:9004"));
@@ -251,10 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn vhost_uses_the_site_docroot() {
+        let c =
+            apache_vhost_conf(&site("shop", "/Sites/shop/public"), 9004, 8080, 8443, None).unwrap();
+
+        assert!(c.contains("DocumentRoot \"/Sites/shop/public\""), "{c}");
+        assert!(!c.contains("DocumentRoot \"/Sites/shop\""), "{c}");
+    }
+
+    #[test]
     fn vhost_tls_block_when_cert_given() {
         let c = apache_vhost_conf(
-            "blog",
-            "/Sites",
+            &site("blog", "/Sites/blog"),
             9004,
             80,
             443,
@@ -284,8 +294,10 @@ mod tests {
             "/root",
             "/pids/httpd.pid",
             "/logs/httpd.log",
-            "/Sites",
-            &["blog".into(), "sub.dir".into()],
+            &[
+                site("blog", "/Sites/blog"),
+                site("sub.dir", "/Sites/sub.dir"),
+            ],
             9004,
             8080,
             8443,
@@ -302,5 +314,12 @@ mod tests {
         assert!(blog.contains("SSLEngine on"), "cert present → TLS block");
         let subdir = std::fs::read_to_string(etc.join("apache/sites/sub.dir.conf")).unwrap();
         assert!(!subdir.contains("SSLEngine"), "no cert → no ssl block");
+    }
+
+    fn site(name: &str, docroot: &str) -> crate::site::Site {
+        crate::site::Site {
+            name: name.to_string(),
+            docroot: std::path::PathBuf::from(docroot),
+        }
     }
 }

@@ -39,17 +39,17 @@ setenv.add-response-header = ( "X-Powered-By" => "fine-ill-do-it-myself" )
 /// Per-project include: host-based vhost for HTTP plus an SSL socket block
 /// when a combined PEM exists.
 pub fn lighttpd_site_conf(
-    project: &str,
-    sites_root: &str,
+    site: &crate::site::Site,
     fpm_port: u16,
     http_port: u16,
     https_port: u16,
     pem: Option<&std::path::Path>,
 ) -> Result<String> {
+    let project = &site.name;
     if project.is_empty() {
         return Err(Error::Other("project name must not be empty".into()));
     }
-    let docroot = format!("{sites_root}/{project}");
+    let docroot = site.docroot_str();
     let fcgi = format!(
         "\t\tfastcgi.server = ( \".php\" => ( ( \"host\" => \"127.0.0.1\", \"port\" => {fpm_port}, \"check-local\" => \"disable\" ) ) )\n"
     );
@@ -82,8 +82,7 @@ pub fn regenerate(
     pid: &str,
     error_log: &str,
     access_log: &str,
-    sites_root: &str,
-    projects: &[String],
+    sites: &[crate::site::Site],
     fpm_port: u16,
     http_port: u16,
     https_port: u16,
@@ -104,7 +103,8 @@ pub fn regenerate(
     }
     let mut includes = Vec::new();
     let mut ssl_taken = false;
-    for p in projects {
+    for site in sites {
+        let p = &site.name;
         let pem = certs_dir.and_then(|d| {
             let crt = std::path::Path::new(d).join(format!("{p}.crt"));
             let key = std::path::Path::new(d).join(format!("{p}.key"));
@@ -122,14 +122,7 @@ pub fn regenerate(
                 pem_path
             })
         });
-        let body = lighttpd_site_conf(
-            p,
-            sites_root,
-            fpm_port,
-            http_port,
-            https_port,
-            pem.as_deref(),
-        )?;
+        let body = lighttpd_site_conf(site, fpm_port, http_port, https_port, pem.as_deref())?;
         std::fs::write(sites_dir.join(format!("{p}.conf")), body)?;
         includes.push(format!("{}/{}.conf", sites_dir.display(), p));
     }
@@ -170,8 +163,7 @@ mod tests {
     #[test]
     fn site_conf_has_fastcgi_and_optional_tls() {
         let c = lighttpd_site_conf(
-            "blog",
-            "/Sites",
+            &site("blog", "/Sites/blog"),
             9004,
             8080,
             8443,
@@ -183,8 +175,20 @@ mod tests {
         assert!(c.contains("\"check-local\" => \"disable\""));
         assert!(c.contains("ssl.pemfile = \"/etc/lighttpd/certs/blog.pem\""));
 
-        let plain = lighttpd_site_conf("blog", "/Sites", 9004, 8080, 8443, None).unwrap();
+        let plain =
+            lighttpd_site_conf(&site("blog", "/Sites/blog"), 9004, 8080, 8443, None).unwrap();
         assert!(!plain.contains("ssl"), "no pem → no ssl block");
+    }
+
+    #[test]
+    fn site_conf_uses_the_site_docroot() {
+        let c = lighttpd_site_conf(&site("shop", "/Sites/shop/public"), 9004, 8080, 8443, None)
+            .unwrap();
+
+        assert!(
+            c.contains("server.document-root = \"/Sites/shop/public\""),
+            "{c}"
+        );
     }
 
     #[test]
@@ -201,8 +205,7 @@ mod tests {
             "/run/lighttpd.pid",
             "/logs/error.log",
             "/logs/access.log",
-            &sites.display().to_string(),
-            &["blog".to_string()],
+            &[site("blog", "/Sites/blog")],
             9004,
             8080,
             8443,
@@ -239,8 +242,7 @@ mod tests {
             "/run/lighttpd.pid",
             "/logs/error.log",
             "/logs/access.log",
-            "/Sites",
-            &["blog".to_string()],
+            &[site("blog", "/Sites/blog")],
             9004,
             8080,
             8443,
@@ -255,5 +257,12 @@ mod tests {
         let conf = std::fs::read_to_string(etc.join("lighttpd/lighttpd.conf")).unwrap();
         assert!(conf.contains("blog.conf"));
         assert!(!std::fs::exists(sites_dir.join("old.conf")).unwrap());
+    }
+
+    fn site(name: &str, docroot: &str) -> crate::site::Site {
+        crate::site::Site {
+            name: name.to_string(),
+            docroot: std::path::PathBuf::from(docroot),
+        }
     }
 }

@@ -35,17 +35,17 @@ events {{
 /// Server block for one project: HTTP listener plus TLS listener when cert
 /// files are supplied. PHP goes to the fastcgi pass on `fpm_port`.
 pub fn nginx_server_conf(
-    project: &str,
-    sites_root: &str,
+    site: &crate::site::Site,
     fpm_port: u16,
     http_port: u16,
     https_port: u16,
     cert: Option<(&std::path::Path, &std::path::Path)>,
 ) -> Result<String> {
+    let project = &site.name;
     if project.is_empty() {
         return Err(Error::Other("project name must not be empty".into()));
     }
-    let docroot = format!("{sites_root}/{project}");
+    let docroot = site.docroot_str();
     let php_location = format!(
         r#"    location ~ \.php$ {{
         fastcgi_pass 127.0.0.1:{fpm_port};
@@ -92,8 +92,7 @@ pub fn regenerate(
     etc: &std::path::Path,
     pid: &str,
     error_log: &str,
-    sites_root: &str,
-    projects: &[String],
+    sites: &[crate::site::Site],
     fpm_port: u16,
     http_port: u16,
     https_port: u16,
@@ -108,7 +107,8 @@ pub fn regenerate(
         }
     }
     let mut includes = Vec::new();
-    for p in projects {
+    for site in sites {
+        let p = &site.name;
         let cert = certs_dir.map(|d| {
             (
                 std::path::Path::new(d).join(format!("{p}.crt")),
@@ -117,7 +117,7 @@ pub fn regenerate(
         });
         let cert = cert.filter(|(c, _)| c.exists());
         let cert = cert.as_ref().map(|(a, b)| (a.as_path(), b.as_path()));
-        let body = nginx_server_conf(p, sites_root, fpm_port, http_port, https_port, cert)?;
+        let body = nginx_server_conf(site, fpm_port, http_port, https_port, cert)?;
         std::fs::write(sites_dir.join(format!("{p}.conf")), body)?;
         includes.push(format!("{}/{}.conf", sites_dir.display(), p));
     }
@@ -177,9 +177,9 @@ mod tests {
 
     #[test]
     fn server_block_has_php_pass_and_optional_tls() {
+        let site = site("blog", "/Sites/blog");
         let c = nginx_server_conf(
-            "blog",
-            "/Sites",
+            &site,
             9004,
             8080,
             8443,
@@ -196,8 +196,18 @@ mod tests {
         assert!(c.contains("listen 8443 ssl;"));
         assert!(c.contains("ssl_certificate /c/blog.crt;"));
 
-        let plain = nginx_server_conf("blog", "/Sites", 9004, 8080, 8443, None).unwrap();
+        let plain = nginx_server_conf(&site, 9004, 8080, 8443, None).unwrap();
         assert!(!plain.contains("ssl"), "no cert → no ssl listener");
+    }
+
+    #[test]
+    fn server_block_uses_the_site_docroot() {
+        let site = site("shop", "/Sites/shop/public");
+
+        let c = nginx_server_conf(&site, 9004, 8080, 8443, None).unwrap();
+
+        assert!(c.contains("root /Sites/shop/public;"), "{c}");
+        assert!(!c.contains("root /Sites/shop;"), "{c}");
     }
 
     #[test]
@@ -211,8 +221,7 @@ mod tests {
             &etc,
             "/run/nginx.pid",
             "/logs/nginx.log",
-            "/Sites",
-            &["alpha".to_string()],
+            &[site("alpha", "/Sites/alpha")],
             9004,
             8080,
             8443,
@@ -224,5 +233,12 @@ mod tests {
         assert!(!conf.contains("old.conf"), "stale includes must be cleared");
         assert!(conf.contains("/alpha.conf"));
         assert!(!std::fs::exists(sites_dir.join("old.conf")).unwrap());
+    }
+
+    fn site(name: &str, docroot: &str) -> crate::site::Site {
+        crate::site::Site {
+            name: name.to_string(),
+            docroot: std::path::PathBuf::from(docroot),
+        }
     }
 }

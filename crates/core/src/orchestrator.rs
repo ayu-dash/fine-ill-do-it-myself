@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use crate::database::{datadir_missing, generate_mariadb_cnf, start_cmd as mariadb_start_cmd};
 use crate::proc::Runner;
 use crate::supervisor::{with_log_append, Env, PortPlan, Supervisor};
-use crate::web::caddyfile::generate_caddyfile_for_projects_tls;
+use crate::web::caddyfile::generate_caddyfile_for_sites;
 
 pub const CADDY: &str = "caddy";
 pub const NGINX: &str = "nginx";
@@ -126,14 +126,14 @@ pub fn generate_web_configs(
     web: &str,
 ) -> Result<()> {
     env.ensure_dirs()?;
-    let sites = env.paths.sites().display().to_string();
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
     // phpMyAdmin is a normal site once installed: link it into Sites before
     // the project list is read so vhosts/certs/hosts pick it up.
     if let Err(e) = crate::phpmyadmin::ensure_site(env, ports) {
         eprintln!("warn: phpMyAdmin site skipped: {e}");
     }
-    let projects = list_projects(env);
+    let sites = list_sites(env);
+    let projects: Vec<String> = sites.iter().map(|s| s.name.clone()).collect();
     // local CA + per-project leaf certs (silent no-op without openssl)
     if let Err(e) = crate::web::certs::regenerate(&env.paths.etc(), &projects) {
         eprintln!("warn: certificate generation skipped: {e}");
@@ -161,7 +161,6 @@ pub fn generate_web_configs(
                     .display()
                     .to_string(),
                 &sites,
-                &projects,
                 fpm_port,
                 http_port,
                 https_port,
@@ -176,7 +175,6 @@ pub fn generate_web_configs(
                 &env.paths.pids().join("httpd.pid").display().to_string(),
                 &env.paths.logs().join("httpd.log").display().to_string(),
                 &sites,
-                &projects,
                 fpm_port,
                 http_port,
                 https_port,
@@ -189,7 +187,6 @@ pub fn generate_web_configs(
                 &env.paths.pids().join("nginx.pid").display().to_string(),
                 &env.paths.logs().join("nginx.log").display().to_string(),
                 &sites,
-                &projects,
                 fpm_port,
                 http_port,
                 https_port,
@@ -197,13 +194,13 @@ pub fn generate_web_configs(
             )?;
         }
         _ => {
-            let tls_line = |p: &String| {
-                let cert = certs_dir.join(format!("{p}.crt"));
+            let tls_line = |s: &crate::site::Site| {
+                let cert = certs_dir.join(format!("{}.crt", s.name));
                 if cert.exists() {
                     format!(
                         "\ttls {} {}\n",
                         cert.display(),
-                        certs_dir.join(format!("{p}.key")).display()
+                        certs_dir.join(format!("{}.key", s.name)).display()
                     )
                 } else {
                     "\ttls internal\n".to_string()
@@ -211,9 +208,7 @@ pub fn generate_web_configs(
             };
             std::fs::write(
                 env.caddyfile_path(),
-                generate_caddyfile_for_projects_tls(
-                    &sites, fpm_port, &projects, http_port, https_port, &tls_line,
-                )?,
+                generate_caddyfile_for_sites(&sites, fpm_port, http_port, https_port, &tls_line)?,
             )?;
         }
     }
@@ -698,13 +693,22 @@ pub fn status_all<R: Runner + Clone>(
 
 /// List folders under `~/Sites` (the project list shown in the TUI).
 pub fn list_projects(env: &Env) -> Vec<String> {
-    if let Ok(rd) = std::fs::read_dir(env.paths.sites()) {
-        let mut v: Vec<String> = rd
+    list_sites(env).into_iter().map(|s| s.name).collect()
+}
+
+/// Projects under `Sites` paired with the folder the web server should serve.
+pub fn list_sites(env: &Env) -> Vec<crate::site::Site> {
+    let root = env.paths.sites();
+    if let Ok(rd) = std::fs::read_dir(root) {
+        let mut v: Vec<crate::site::Site> = rd
             .flatten()
             .filter(|e| e.path().is_dir())
-            .map(|e| e.file_name().to_string_lossy().to_string())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                crate::site::Site::detect(&name, root)
+            })
             .collect();
-        v.sort();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
         return v;
     }
     Vec::new()
@@ -890,6 +894,29 @@ mod tests {
         let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
         assert!(cf.contains("blog.test:8180"), "http block missing\n{cf}");
         assert!(cf.contains("blog.test:8480"), "https block missing\n{cf}");
+    }
+
+    #[test]
+    fn generate_configs_serves_framework_projects_from_public() {
+        let (env, _t) = env();
+        std::fs::create_dir_all(env.paths.sites().join("shop/public")).unwrap();
+        std::fs::write(env.paths.sites().join("shop/public/index.php"), "<?php").unwrap();
+        let lock = Lock {
+            web_default: Some(NGINX.into()),
+            ..Lock::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+
+        generate_configs(&env, &PortPlan::default(), "8.4").unwrap();
+
+        let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/shop.conf")).unwrap();
+        assert!(
+            site.contains(&format!(
+                "root {};",
+                env.paths.sites().join("shop/public").display()
+            )),
+            "nginx must serve public/, not the project root\n{site}"
+        );
     }
 
     #[test]
@@ -1083,6 +1110,23 @@ mod tests {
         std::fs::write(env.paths.sites().join("file.txt"), "").unwrap();
         let names = list_projects(&env);
         assert_eq!(names, vec!["blog".to_string(), "shop".to_string()]);
+    }
+
+    #[test]
+    fn list_sites_points_framework_projects_at_their_public_folder() {
+        let (env, _t) = env();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        std::fs::write(env.paths.sites().join("blog/index.php"), "<?php").unwrap();
+        std::fs::create_dir_all(env.paths.sites().join("shop/public")).unwrap();
+        std::fs::write(env.paths.sites().join("shop/public/index.php"), "<?php").unwrap();
+
+        let sites = list_sites(&env);
+
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert_eq!(sites[0].name, "blog");
+        assert_eq!(sites[0].docroot, env.paths.sites().join("blog"));
+        assert_eq!(sites[1].name, "shop");
+        assert_eq!(sites[1].docroot, env.paths.sites().join("shop/public"));
     }
 
     #[test]

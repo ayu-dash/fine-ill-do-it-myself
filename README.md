@@ -7,6 +7,8 @@ Caddy + PHP-FPM + (optional system) MariaDB, one folder per project under
 ## What you get
 
 - `~/Sites/<name>` folders become `https://<name>.test` vhosts automatically
+- Framework-aware docroot: a project with `public/index.php` (Laravel, Symfony)
+  is served from `public/`; flat PHP projects are served from the folder itself
 - A local certificate authority (one root, one leaf per project) generated with
   openssl — real TLS, no `tls internal` surprises
 - php-fpm pool + caddy config auto-generated per start
