@@ -339,13 +339,18 @@ impl<R: Runner> Supervisor<R> {
         }
     }
 
-    /// Parse a list of `*.pid` files present in the pid dir.
+    /// Parse a list of `*.pid` files present in the pid dir. Pid files that
+    /// mariadbd writes next to its socket (`db.sock.pid` on older installs) are
+    /// not services and are skipped.
     pub fn known_services(&self) -> Vec<String> {
         let mut v = Vec::new();
         if let Ok(rd) = std::fs::read_dir(self.env.paths.pids()) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
                 if let Some(base) = n.strip_suffix(".pid") {
+                    if base.ends_with(".sock") {
+                        continue;
+                    }
                     v.push(base.to_string());
                 }
             }
@@ -414,6 +419,22 @@ mod tests {
             ports: PortPlan::default(),
             runner: FakeRunner::default(),
         }
+    }
+
+    #[test]
+    fn known_services_ignores_the_mariadb_socket_pid_file() {
+        let t = tempfile::tempdir().unwrap();
+        let s = Supervisor {
+            env: Env::new(t.path().join("app"), t.path().join("Sites")),
+            ports: PortPlan::default(),
+            runner: FakeRunner::default(),
+        };
+        s.env.ensure_dirs().unwrap();
+        std::fs::write(s.env.paths.pids().join("mariadb.pid"), "1").unwrap();
+        // mariadbd writes <socket>.pid next to the socket; it is not a service
+        std::fs::write(s.env.paths.pids().join("db.sock.pid"), "1").unwrap();
+
+        assert_eq!(s.known_services(), vec!["mariadb".to_string()]);
     }
 
     #[test]
