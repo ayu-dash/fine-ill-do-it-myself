@@ -2369,8 +2369,6 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         );
     f.render_stateful_widget(proj_list, projects, &mut plst);
 
-    render_quick_create(app, f, area);
-
     // Detail panel: exactly the lines cached by `refresh_mgmt`, so Enter on
     // the right panel acts on what is displayed.
     if let Some(detail_area) = detail_area {
@@ -2477,6 +2475,7 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), hint_area);
+    render_quick_create(app, f, area);
 }
 
 /// Terminal entry: non-blocking event loop. Every system operation runs on a
@@ -3195,6 +3194,38 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn quick_create_modal_renders_over_the_side_container() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        app.detail = Some("detail: caddy".into());
+        app.panel_right = true;
+        app.mgmt_lines = vec!["web.use nginx".into(), "  version 1.2.3".into()];
+        app.quick_create = Some(QuickCreateField::Name);
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        term.draw(|f| render(&app, f, f.area())).unwrap();
+
+        let buffer = term.backend().buffer();
+        assert_eq!(
+            buffer[(78, 2)].symbol(),
+            "─",
+            "the modal's top border must not be overwritten by side-panel content"
+        );
+        assert_eq!(
+            buffer[(99, 2)].symbol(),
+            "╮",
+            "the modal's top-right border must be drawn over the side panel"
+        );
+        let text = rendered_text(buffer);
+        assert!(
+            text.contains("New project"),
+            "the new-project modal must remain visible:\n{text}"
+        );
     }
 
     #[test]
