@@ -2313,28 +2313,13 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
             lang_lst.select(Some(pos));
         }
         let lang_marker = if lang_focus { "▶ " } else { "  " };
-        let selected_lang_label = collapsed_lang
-            .iter()
-            .find(|(idx, _)| *idx == left_cursor)
-            .map(|(_, language)| {
-                let version = if language == "php" {
-                    php_row.clone()
-                } else {
-                    app.lang_versions
-                        .get(language)
-                        .cloned()
-                        .unwrap_or_else(|| "not installed".to_string())
-                };
-                format!("{language}: {version}")
-            })
-            .unwrap_or_else(|| format!("php: {php_row}"));
         let lang_list = List::new(lang_items)
             .highlight_symbol(lang_marker.to_owned())
             .highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
             .block(
                 Block::default()
                     .title(format!(
-                        " programming languages ({selected_lang_label}){} ",
+                        " programming languages (n: new project){} ",
                         if lang_focus { " ◀" } else { "" }
                     ))
                     .borders(Borders::ALL)
@@ -2354,7 +2339,6 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         .iter()
         .map(|p| {
             ListItem::new(Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(Color::Cyan)),
                 Span::styled(p.clone(), Style::default().fg(Color::White)),
                 Span::styled(".test  ", Style::default().fg(Color::DarkGray)),
             ]))
@@ -4491,6 +4475,10 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
+        assert!(
+            !text.contains("▸"),
+            "project rows should not contain a triangle marker:\n{text}"
+        );
     }
 
     #[test]
@@ -4537,7 +4525,7 @@ mod tests {
     }
 
     #[test]
-    fn language_panel_header_tracks_the_selected_runtime() {
+    fn language_panel_header_shows_the_new_project_shortcut() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -4551,8 +4539,8 @@ mod tests {
 
         let text = rendered_text(term.backend().buffer());
         assert!(
-            text.contains("programming languages (node: 24.1.0)"),
-            "header should identify selected Node runtime:\n{text}"
+            text.contains("programming languages (n: new project)"),
+            "language header should show the new-project shortcut:\n{text}"
         );
     }
 
