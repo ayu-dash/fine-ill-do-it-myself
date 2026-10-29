@@ -631,23 +631,15 @@ impl App {
                         self.actions.push(Action::StartService(i));
                     }
                 }
-                // languages: php-fpm is a service and toggles; the other
-                // runtimes have no process to stop, so Enter opens their
-                // version list instead.
+                // Language rows open their version list; Enter never toggles a runtime.
                 "languages" => {
                     let i = self.cursor();
                     let name = self.services[i].name.clone();
-                    if is_runtime_only(&name) {
+                    if is_language(&name) {
                         self.detail = Some(format!("detail: {name}"));
                         self.panel_right = true;
                         self.cursor_right = 0;
                         self.message = "select a version, Enter to activate".into();
-                    } else if self.services[i].state == ServiceState::Running {
-                        self.message = "stop requested".into();
-                        self.actions.push(Action::StopService(i));
-                    } else {
-                        self.message = "start requested".into();
-                        self.actions.push(Action::StartService(i));
                     }
                 }
                 "projects" => {
@@ -1067,10 +1059,7 @@ pub fn ports_label(name: &str, php_row: &str, ports: &fine_ill_do_it_myself::Por
         if php_row != ver {
             return String::new();
         }
-        format!(
-            "fpm {}",
-            fine_ill_do_it_myself::php::fpm::fpm_port_for(ver, 9000, ports)
-        )
+        ver.to_string()
     } else if name == "caddy" || name == "httpd" || name == "nginx" || name == "lighttpd" {
         // each row shows its own per-server ports, not the shared pair
         let (http, https) = ports.web_ports(name);
@@ -2320,7 +2309,7 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
             .block(
                 Block::default()
                     .title(format!(
-                        " programming languages (n: new project){} ",
+                        " programming languages{} ",
                         if lang_focus { " ◀" } else { "" }
                     ))
                     .borders(Borders::ALL)
@@ -2354,8 +2343,7 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         ));
     }
     let proj_title = format!(
-        " projects ({}: ~/Sites){} ",
-        app.projects.len(),
+        " projects (n: new project){} ",
         if proj_focus { " ◀" } else { "" }
     );
     let proj_list = List::new(proj_items)
@@ -3519,7 +3507,7 @@ mod tests {
             ports_label("lighttpd", "8.4", &ports),
             "http:8083 https:8446"
         );
-        assert_eq!(ports_label("php-8.4", "8.4", &ports), "fpm 9004");
+        assert_eq!(ports_label("php-8.4", "8.4", &ports), "8.4");
         assert_eq!(ports_label("php-8.4", "8.2", &ports), "");
         assert_eq!(ports_label("mariadb", "8.4", &ports), "3306");
     }
@@ -4053,14 +4041,16 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_php_fpm_row_still_toggles_the_service() {
+    fn enter_on_php_row_opens_version_list_without_toggling_service() {
         let mut a = App::new(vec![svc("php-8.4", true)], vec![]);
         assert_eq!(focused_panel(&a), "languages");
 
         a.on_key(KeyCode::Enter);
 
-        assert_eq!(a.actions, vec![Action::StopService(0)]);
-        assert!(!a.panel_right);
+        assert!(a.actions.is_empty());
+        assert!(a.panel_right);
+        assert_eq!(a.detail.as_deref(), Some("detail: php-8.4"));
+        assert_eq!(a.message, "select a version, Enter to activate");
     }
 
     #[test]
@@ -4539,12 +4529,15 @@ mod tests {
     }
 
     #[test]
-    fn language_panel_header_shows_the_new_project_shortcut() {
+    fn project_panel_header_shows_the_new_project_shortcut() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(vec![svc("php-8.4", false), svc("node-24", false)], vec![]);
-        app.cursor_left = 1;
+        let mut app = App::new(
+            vec![svc("php-8.4", false), svc("node-24", false)],
+            vec!["blog".into()],
+        );
+        app.cursor_left = 2;
         app.php_row = "8.4".into();
         app.lang_versions.insert("node".into(), "24.1.0".into());
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
@@ -4553,8 +4546,16 @@ mod tests {
 
         let text = rendered_text(term.backend().buffer());
         assert!(
-            text.contains("programming languages (n: new project)"),
-            "language header should show the new-project shortcut:\n{text}"
+            text.contains("projects (n: new project)"),
+            "projects header should show the new-project shortcut:\n{text}"
+        );
+        assert!(
+            text.contains("programming languages"),
+            "language panel should still be rendered:\n{text}"
+        );
+        assert!(
+            !text.contains("programming languages (n: new project)"),
+            "language header must not show the project shortcut:\n{text}"
         );
     }
 

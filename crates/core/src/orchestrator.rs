@@ -381,6 +381,9 @@ fn start_service_with<R: Runner + Clone>(
     };
     let (name, bin, args, log) =
         spec.ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
+    if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str()) {
+        ensure_php_fpm_started(env, ports, runner, php_version, scan)?;
+    }
     sup.reap_orphans(&name, scan)?;
     check_port(fpm_port, &bin)?;
     let mut full = vec![bin];
@@ -390,31 +393,52 @@ fn start_service_with<R: Runner + Clone>(
     sup.write_pid(&name, pid)?;
     ensure_started(&sup, &name, pid, &log, service_port(&name, ports))?;
 
-    // If starting a web server, ensure php-fpm is also running so PHP requests succeed
-    if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str()) {
-        let php_service = format!("php-{php_version}");
-        if sup.status(&php_service).state != crate::service::ServiceState::Running {
-            if let Ok(php_specs) = service_cmds(env, ports, php_version) {
-                if let Some((_, pbin, pargs, plog)) =
-                    php_specs.into_iter().find(|(n, ..)| n == &php_service)
-                {
-                    let _ = sup.reap_orphans(&php_service, scan);
-                    if check_port(fpm_port, &pbin).is_ok() {
-                        let mut pfull = vec![pbin];
-                        pfull.extend(pargs);
-                        if let Ok(pwrapped) = with_log_append(&pfull, &plog) {
-                            if let Ok(ppid) = sup.runner.spawn(&pwrapped) {
-                                let _ = sup.write_pid(&php_service, ppid);
-                                ensure_started(&sup, &php_service, ppid, &plog, Some(fpm_port))?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    Ok(sup.status(&name))
+}
+
+fn ensure_php_fpm_started<R: Runner + Clone>(
+    env: &Env,
+    ports: &PortPlan,
+    runner: &R,
+    php_version: &str,
+    scan: crate::supervisor::PortScan<'_>,
+) -> Result<()> {
+    let service = format!("php-{php_version}");
+    let sup = Supervisor {
+        env: env.clone(),
+        ports: ports.clone(),
+        runner: runner.clone(),
+    };
+    if sup.status(&service).state == crate::service::ServiceState::Running {
+        return Ok(());
     }
 
-    Ok(sup.status(&name))
+    sup.reap_orphans(&service, scan)?;
+    let bin = php_binary_for(env, php_version).ok_or_else(|| {
+        Error::Other(format!(
+            "php {php_version} not installed (fidim install php-fpm-{php_version})"
+        ))
+    })?;
+    let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
+    check_port(fpm_port, &bin.display().to_string())?;
+    let mut args = vec![
+        "-F".to_string(),
+        "-y".to_string(),
+        env.fpm_conf_path(php_version).display().to_string(),
+    ];
+    let ini_path = env.php_ini_path(php_version);
+    if ini_path.exists() {
+        args.push("-c".to_string());
+        args.push(ini_path.display().to_string());
+    }
+    let mut command = vec![bin.display().to_string()];
+    command.extend(args);
+    let log = env.paths.logs().join(format!("{service}.log"));
+    let wrapped = with_log_append(&command, &log)?;
+    let pid = sup.runner.spawn(&wrapped)?;
+    sup.write_pid(&service, pid)?;
+    ensure_started(&sup, &service, pid, &log, Some(fpm_port))?;
+    Ok(())
 }
 
 /// Replay configs + reap ghost processes that own them (pid files were lost).
@@ -1034,6 +1058,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct PhpFailingRunner {
+        commands: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Runner for PhpFailingRunner {
+        fn spawn(&self, cmd: &[String]) -> std::result::Result<u32, std::io::Error> {
+            let command = cmd.join(" ");
+            self.commands.lock().unwrap().push(command.clone());
+            if command.contains("php-fpm-8.4") {
+                return Err(std::io::Error::other("PHP-FPM could not start"));
+            }
+            Ok(5000)
+        }
+
+        fn is_running(&self, _pid: u32) -> bool {
+            true
+        }
+
+        fn kill(&self, _pid: u32) -> std::result::Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn start_reports_a_service_that_never_binds_and_clears_its_pid() {
         let (env, _t) = env();
@@ -1210,12 +1258,33 @@ mod tests {
         };
         let f = FakeRunner::default();
         start_service(&env, &ports, &f, "8.4", NGINX).unwrap();
+        assert!(
+            env.paths.pids().join("php-8.4.pid").exists(),
+            "starting a web server must also start the selected PHP-FPM service"
+        );
         let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/blog.conf")).unwrap();
         assert!(
             site.contains("listen 8281;"),
             "non-chosen web must bind its own port\n{site}"
         );
         assert!(site.contains("listen 8446 "), "{site}");
+    }
+
+    #[test]
+    fn starting_web_server_reports_automatic_php_fpm_start_failure() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
+        std::fs::write(env.paths.bin().join("php-fpm-8.4"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        let runner = PhpFailingRunner::default();
+
+        let result = start_service(&env, &PortPlan::default(), &runner, "8.4", CADDY);
+
+        assert!(
+            result.is_err(),
+            "starting the web server must report if its automatic PHP-FPM start fails"
+        );
     }
 
     #[test]
