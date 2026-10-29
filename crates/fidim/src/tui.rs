@@ -3799,8 +3799,15 @@ mod tests {
 
     #[test]
     fn quick_create_plan_covers_dir_and_hosts() {
-        let plan = quick_create_plan("~/Sites", "shop");
-        assert_eq!(plan, vec!["mkdir -p ~/Sites/shop", "127.0.0.1 shop.test"]);
+        let project_dir = "~/.local/share/fine-ill-do-it-myself/projects";
+        let plan = quick_create_plan(project_dir, "shop");
+        assert_eq!(
+            plan,
+            vec![
+                "mkdir -p ~/.local/share/fine-ill-do-it-myself/projects/shop",
+                "127.0.0.1 shop.test"
+            ]
+        );
     }
 
     /// Regression: when the port editor is open and the user presses Enter,

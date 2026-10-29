@@ -343,7 +343,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             if let Some(database) = &made.database {
                 println!("database: {database}");
             }
-            let next = template.next_step(&name);
+            let next = template.next_step(&made.path);
             if !next.is_empty() {
                 println!("next: {next}");
             }
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_command_prints_nothing_for_empty_sites() {
+    fn projects_command_prints_nothing_for_empty_projects() {
         let t = tempfile::tempdir().unwrap();
         let mut cmd = Command::cargo_bin("fidim").unwrap();
         let out = cmd
@@ -618,7 +618,7 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let sites = t.path().join("sites");
+        let sites = t.path().join("projects");
         assert!(sites.join("blog/index.php").is_file());
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("blog"), "{s}");
@@ -641,7 +641,7 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(t.path().join("sites/landing/index.html").is_file());
+        assert!(t.path().join("projects/landing/index.html").is_file());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("created landing (html)"), "{stdout}");
     }

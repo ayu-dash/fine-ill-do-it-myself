@@ -635,7 +635,7 @@ pub fn web_config_path(env: &Env, web: &str) -> std::path::PathBuf {
 /// Directory that contains `modules/` next to an httpd binary.
 /// Searches up to 3 levels above the binary so it works with multiple layouts:
 /// - XAMPP: `<prefix>/bin/httpd` → `<prefix>/modules/`  (2 levels up)
-/// - fidim project-local: `.fidim/bin/httpd/httpd` → `.fidim/modules/`  (3 levels up)
+/// - fidim data root: `bin/httpd/httpd` → `modules/`  (3 levels up)
 /// - Simple flat install: `<prefix>/httpd` → `<prefix>/modules/`  (1 level up)
 pub fn apache_server_root(bin: &std::path::Path) -> std::path::PathBuf {
     let mut cur = bin.parent().unwrap_or(Path::new("."));
@@ -855,7 +855,7 @@ pub fn status_all<R: Runner + Clone>(
     names.iter().map(|n| sup.status(n)).collect()
 }
 
-/// List folders under `~/Sites` (the project list shown in the TUI).
+/// List folders under the managed projects directory (the TUI project list).
 pub fn list_projects(env: &Env) -> Vec<String> {
     list_sites(env).into_iter().map(|s| s.name).collect()
 }
@@ -974,7 +974,7 @@ mod webchoice_tests {
 
     #[test]
     fn apache_server_root_finds_modules_three_levels_up() {
-        // fidim project-local layout: .fidim/bin/httpd/httpd → .fidim/modules/
+        // Nested installs are supported when modules live three levels above the binary.
         let t = tempfile::tempdir().unwrap();
         let bin = t.path().join(".fidim/bin/httpd/httpd");
         std::fs::create_dir_all(t.path().join(".fidim/bin/httpd")).unwrap();

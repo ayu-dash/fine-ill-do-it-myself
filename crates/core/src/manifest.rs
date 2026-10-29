@@ -27,7 +27,7 @@ pub struct BinarySource {
     /// Format: `"src_rel:dest_rel"` or `"name"` (src = dest).
     #[serde(default)]
     pub files: Vec<String>,
-    /// When set, extract the entire tarball into `.fidim/runtimes/<install_dir>/`
+    /// When set, extract the entire tarball into `<data_root>/runtimes/<install_dir>/`
     /// instead of copying individual files. `files` then lists which binaries
     /// to symlink from the runtime dir into `bin/<lang>/`.
     /// Example: `install_dir = "node/22"` → extracts to `runtimes/node/22/`.

@@ -15,51 +15,25 @@ pub struct Env {
 }
 
 impl Env {
-    /// Load the environment. Prefers a project-local `.fidim` root within the current
-    /// project directory so all configs, binaries, and logs stay strictly inside the project.
+    /// Load the environment from an explicit override or the user's XDG data directory.
     pub fn load_real() -> Result<Self> {
         if let Ok(dir) = std::env::var("FIDIM_DATA_ROOT") {
             let root = PathBuf::from(dir);
-            let sites = if root
-                .parent()
-                .map(|p| p.join("sites").is_dir())
-                .unwrap_or(false)
-            {
-                root.parent().unwrap().join("sites")
-            } else {
-                root.join("sites")
-            };
-            return Ok(Env::new(root, sites));
-        }
-        if let Some(proj) = crate::paths::find_project_root() {
-            let root = proj.join(".fidim");
-            let home_sites = std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join("Sites"))
-                .ok();
-            let sites = if proj.join("sites").is_dir() {
-                proj.join("sites")
-            } else if root.join("sites").is_dir() {
-                root.join("sites")
-            } else if let Some(ref hs) = home_sites {
-                if hs.is_dir() {
-                    hs.clone()
-                } else {
-                    root.join("sites")
-                }
-            } else {
-                root.join("sites")
-            };
-            return Ok(Env::new(root, sites));
+            let projects = crate::paths::default_projects(&root);
+            return Ok(Env::new(root, projects));
         }
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| Error::Other("cannot resolve home (set $HOME)".into()))?;
         let data = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".local/share"));
+            .unwrap_or_else(|| home.join(".local/share"));
+        let root = crate::paths::default_root(data);
         Ok(Env::new(
-            crate::paths::default_root(data),
-            crate::paths::default_sites(home),
+            root.clone(),
+            crate::paths::default_projects(&root),
         ))
     }
     pub fn new(root: PathBuf, sites: PathBuf) -> Self {

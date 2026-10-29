@@ -83,12 +83,13 @@ impl Template {
     }
 
     /// One-line hint shown after creation.
-    pub fn next_step(self, name: &str) -> String {
+    pub fn next_step(self, project_path: &Path) -> String {
+        let project_path = crate::supervisor::shlex_quote(&project_path.display().to_string());
         match self {
-            Template::Node => format!("cd Sites/{name} && node server.js"),
-            Template::Python => format!("cd Sites/{name} && python3 app.py"),
+            Template::Node => format!("cd {project_path} && node server.js"),
+            Template::Python => format!("cd {project_path} && python3 app.py"),
             Template::Laravel => {
-                format!("cd Sites/{name} && php artisan serve  # or just open the site")
+                format!("cd {project_path} && php artisan serve  # or just open the site")
             }
             _ => String::new(),
         }
@@ -587,9 +588,16 @@ mod tests {
 
     #[test]
     fn template_hints_only_mention_a_command_when_one_is_needed() {
-        assert!(Template::Node.next_step("app").contains("node server.js"));
-        assert!(Template::Python.next_step("api").contains("python3 app.py"));
-        assert!(Template::Php.next_step("blog").is_empty());
+        let node_path = Path::new("/tmp/projects/app");
+        let python_path = Path::new("/tmp/projects/api");
+        let php_path = Path::new("/tmp/projects/blog");
+        assert!(Template::Node
+            .next_step(node_path)
+            .contains("node server.js"));
+        assert!(Template::Python
+            .next_step(python_path)
+            .contains("python3 app.py"));
+        assert!(Template::Php.next_step(php_path).is_empty());
     }
 
     #[test]

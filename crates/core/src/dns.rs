@@ -1,7 +1,7 @@
 //! Wildcard DNS for local development.
 //!
-//! Every `*.test` name resolves to `127.0.0.1`, so adding a folder to
-//! `~/Sites` is instantly reachable without editing `/etc/hosts` per project.
+//! Every `*.test` name resolves to `127.0.0.1`, so adding a managed project is
+//! instantly reachable without editing `/etc/hosts` per project.
 //! `fidim dns install` points systemd-resolved at this resolver once (sudo,
 //! explicit); after that, new projects need no root access at all.
 

@@ -16,16 +16,8 @@ pub struct CliEnv {
 impl CliEnv {
     /// Test helper: everything under the given temporary root.
     pub fn with_data_root(root: std::path::PathBuf) -> Self {
-        let sites = if root
-            .parent()
-            .map(|p| p.join("sites").is_dir())
-            .unwrap_or(false)
-        {
-            root.parent().unwrap().join("sites")
-        } else {
-            root.join("sites")
-        };
-        let env = Env::new(root, sites);
+        let projects = root.join("projects");
+        let env = Env::new(root, projects);
         let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
         let php_default = std::env::var("FIDIM_PHP_DEFAULT").unwrap_or_else(|_| {
             Lock::load(&env.lock_path())
@@ -39,8 +31,7 @@ impl CliEnv {
             php_default,
         }
     }
-    /// Project layout: everything under <project_root>/.fidim,
-    /// keeping all binaries, configs, and sites strictly within the project.
+    /// User layout: managed files and projects live under the XDG data root.
     pub fn real() -> Result<Self> {
         let env = Env::load_real()?;
         let ports = PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());

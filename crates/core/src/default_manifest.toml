@@ -2,7 +2,7 @@
 # Update versions here without touching code. sha256 left empty = recorded on
 # first install into lock.toml and verified on later (re)installs.
 #
-# install_dir: extract tarball into .fidim/runtimes/<install_dir>/
+# install_dir: extract tarball into <data_root>/runtimes/<install_dir>/
 # strip_components: strip N leading path components (1 for version-prefixed tarballs)
 # files: which binaries to symlink from the runtime dir into bin/<lang>/
 #        format: "runtime/rel/path:bin/dest/rel"

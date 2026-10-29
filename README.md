@@ -2,11 +2,12 @@
 
 A local web dev stack manager for Linux, in the spirit of Laragon. It wires up
 Caddy + PHP-FPM + (optional system) MariaDB, one folder per project under
-`~/Sites`, reachable at `*.test` domains with real HTTPS.
+`~/.local/share/fine-ill-do-it-myself/projects`, reachable at `*.test` domains
+with real HTTPS.
 
 ## What you get
 
-- `~/Sites/<name>` folders become `https://<name>.test` vhosts automatically
+- Managed project folders become `https://<name>.test` vhosts automatically
 - Framework-aware docroot: a project with `public/index.php` (Laravel, Symfony)
   is served from `public/`, and unknown paths reach `index.php` (nginx,
   lighttpd and Caddy natively, Apache through the project's `.htaccess`);
@@ -106,7 +107,7 @@ language. `~/.local/bin` must be on your `PATH`.
 ## Create a project
 
 ```sh
-fidim new blog              # PHP welcome page in ~/Sites/blog
+fidim new blog              # PHP welcome page in the managed projects folder
 fidim new html landing      # static index.html
 fidim new laravel shop      # composer create-project
 fidim new wordpress wp      # pinned tarball, sha256 checked
@@ -124,7 +125,7 @@ database removes the new project folder again and the command exits non-zero.
 
 No `/etc/hosts` editing per project. `fidim` ships a wildcard DNS responder: it
 answers every `A` query under `.test` with `127.0.0.1` and everything else with
-NXDOMAIN, so a new folder in `~/Sites` is reachable as `http://<folder>.test`
+NXDOMAIN, so a new managed project folder is reachable as `http://<folder>.test`
 the moment it exists.
 
 Install it once (root is used exactly once, and only if you pass `--yes`):
@@ -167,7 +168,8 @@ fidim hosts --dry-run  # print them, change nothing
 picks it up automatically (`fidim php use <version>` selects it).
 
 **phpMyAdmin**: `fidim install phpmyadmin` extracts phpMyAdmin 5.2.3 under
-`runtimes/phpmyadmin/` and links it into `~/Sites/phpmyadmin`, so the usual
+`runtimes/phpmyadmin/` and links it into the managed `projects/phpmyadmin`,
+so the usual
 vhost/certificate/hosts generation serves it at
 `https://phpmyadmin.test` (plus the HTTP variant). Its `config.inc.php` points
 at the fidim-managed MariaDB socket and uses the normal login form: user
@@ -225,14 +227,18 @@ sudo update-ca-certificates
 
 ## Where things live
 
-Inside a project (a directory with `.git`, `Cargo.toml`, or `.fidim`) the data
-root is `<project>/.fidim/`; run outside a project it falls back to the XDG
-directory `~/.local/share/fine-ill-do-it-myself/`. Use `fidim --data-root <dir>`
-to pin one explicitly.
+The data root is `$XDG_DATA_HOME/fine-ill-do-it-myself/` (normally
+`~/.local/share/fine-ill-do-it-myself/`) regardless of the current directory.
+Use `fidim --data-root <dir>` or `FIDIM_DATA_ROOT` to override it explicitly.
+Existing `~/Sites` and project-local `.fidim` data are left untouched; no
+migration is performed. Copy projects you want fidim to manage into
+`<data root>/projects/`. Runtime/config data at old roots is not used
+automatically.
 
 ```
 <data root>/
   bin/        managed binaries (caddy, php-fpm-<ver>, node, ...)
+  projects/  web projects created and served by fidim
   runtimes/   extracted language/web runtimes (node/24, phpmyadmin/5.2.3, ...)
   etc/        generated configs (Caddyfile, php-fpm conf, my.cnf, certs/)
   run/        pid files + sockets
