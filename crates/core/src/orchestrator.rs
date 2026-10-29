@@ -25,9 +25,14 @@ pub fn default_php(lock: &Lock) -> String {
     lock.php_default.clone().unwrap_or_else(|| "8.4".into())
 }
 
-/// Which web server the user picked (caddy | apache | nginx).
+/// Which supported web server the user picked, falling back to Caddy if the
+/// persisted value is invalid.
 pub fn default_web(lock: &Lock) -> String {
-    lock.web_default.clone().unwrap_or_else(|| CADDY.into())
+    lock.web_default
+        .as_deref()
+        .filter(|web| [CADDY, NGINX, APACHE, LIGHTTPD].contains(web))
+        .unwrap_or(CADDY)
+        .to_string()
 }
 
 /// Load the default web server from lock.toml (caddy when unset).
@@ -515,25 +520,35 @@ pub fn web_version(env: &Env, web: &str) -> Option<String> {
     };
     let txt =
         String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
-    let num: Vec<char> = txt
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let raw: String = num.into_iter().collect();
-    let v: String = raw
-        .split(['\t', ' '])
-        .next()
-        .unwrap_or_default()
-        .split('.')
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(".");
-    (!v.is_empty()).then_some(v)
+    parse_web_version(&txt)
+}
+
+fn parse_web_version(output: &str) -> Option<String> {
+    output
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .find_map(|token| {
+            let version = token
+                .strip_prefix('v')
+                .or_else(|| token.strip_prefix('V'))
+                .unwrap_or(token);
+            let parts: Vec<_> = version.split('.').collect();
+            if parts.len() < 2
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
+            {
+                return None;
+            }
+            Some(parts.into_iter().take(3).collect::<Vec<_>>().join("."))
+        })
 }
 
 /// Data-root binary when present, otherwise `PATH` fallback; error when
 /// neither exists.
 pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
+    if ![CADDY, NGINX, APACHE, LIGHTTPD].contains(&web) {
+        return Err(Error::Other(format!("unknown web server: {web}")));
+    }
     let local = web_bin_path(env, web);
     if local.exists() {
         return Ok(local);
@@ -854,6 +869,26 @@ mod webchoice_tests {
     }
 
     #[test]
+    fn default_web_ignores_invalid_persisted_server_name() {
+        let lock = Lock {
+            web_default: Some("caddy  [2.10.210839268]".into()),
+            ..Lock::default()
+        };
+
+        assert_eq!(default_web(&lock), CADDY);
+    }
+
+    #[test]
+    fn resolve_web_bin_rejects_unknown_server_names() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().to_path_buf(), t.path().join("Sites"));
+        std::fs::create_dir_all(env.paths.bin().join(CADDY)).unwrap();
+        std::fs::write(env.caddy_bin(), "fake caddy").unwrap();
+
+        assert!(resolve_web_bin(&env, "caddy  [2.10.210839268]").is_err());
+    }
+
+    #[test]
     fn web_paths_and_args_per_server() {
         let t = tempfile::tempdir().unwrap();
         let env = Env::new(t.path().to_path_buf(), t.path().join("Sites"));
@@ -1050,21 +1085,21 @@ mod tests {
     }
 
     #[test]
-    fn web_version_parses_binary_output() {
+    fn web_version_parses_caddy_semver_without_build_hash() {
         let t = tempfile::tempdir().unwrap();
-        let bin = t.path().join("fake-web");
-        std::fs::write(&bin, "#!/bin/sh\necho 'fake-web 1.2.3' >&2\n").unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        std::fs::create_dir_all(env.paths.bin().join("caddy")).unwrap();
+        let bin = env.caddy_bin();
+        std::fs::write(&bin, "#!/bin/sh\necho 'v2.10.2 h1:210839268'\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
-        // point caddy's known bin path at the fake via web_bin_path override test:
+
         let got = crate::orchestrator::web_version(&env, CADDY);
-        // data bin path does not exist -> None (no panic on missing binary)
-        assert!(got.is_none() || got.is_some(), "probe must not panic");
-        let _ = bin;
+
+        assert_eq!(got.as_deref(), Some("2.10.2"));
     }
 
     #[test]

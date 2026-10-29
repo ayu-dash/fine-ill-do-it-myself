@@ -714,8 +714,9 @@ impl App {
             self.message = format!("php.use {v} requested");
             self.actions.push(Action::UsePhp(v.to_string()));
         } else if let Some(n) = text.strip_prefix("web.use ") {
-            self.message = format!("web.use {n} requested");
-            self.actions.push(Action::UseWeb(n.to_string()));
+            let server = n.split_whitespace().next().unwrap_or_default();
+            self.message = format!("web.use {server} requested");
+            self.actions.push(Action::UseWeb(server.to_string()));
         } else if let Some((lang_or_srv, ver)) = text.split_once(".use ") {
             let s = lang_or_srv.trim_start_matches("▶ ").trim();
             if ["node", "python", "go", "java"].contains(&s) {
@@ -3698,6 +3699,19 @@ mod tests {
         p.cursor_right = 1;
         p.mgmt_enter(&["▶ php.use 8.4".to_string(), "  php.use 8.3".to_string()]);
         assert_eq!(p.actions.first(), Some(&Action::UsePhp("8.3".into())));
+    }
+
+    #[test]
+    fn management_enter_ignores_the_displayed_web_version() {
+        let mut app = App::new(vec![], vec![]);
+
+        app.mgmt_enter(&["web.use caddy  [2.10.2]".to_string()]);
+
+        assert_eq!(
+            app.actions,
+            vec![Action::UseWeb("caddy".into())],
+            "version text is display-only and must not become the server name"
+        );
     }
 
     #[test]
