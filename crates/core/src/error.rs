@@ -16,6 +16,8 @@ pub enum Error {
     PhpNotInstalled(String),
     #[error("service `{0}` is not running")]
     NotRunning(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("port {0} is already in use; try {1}")]
     PortConflict(u16, String),
     #[error("{0}")]

@@ -1,12 +1,16 @@
 //! Install binaries from the manifest: fetch, verify checksum, extract,
 //! chmod, record into lock.toml. The `Fetcher` trait keeps this testable
 //! offline (default impl uses system curl).
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
 use std::{fs, io, path::PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::cancel::CancelToken;
 use crate::error::{Error, Result};
 use crate::manifest::{Lock, Manifest};
 use crate::supervisor::Env;
@@ -15,11 +19,47 @@ pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &str) -> Result<Vec<u8>>;
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CurlFetcher;
+/// Download progress callback: `(done, total)`. `total == 0` means the server
+/// did not report a size, so the UI shows an indeterminate bar.
+pub type ProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-impl Fetcher for CurlFetcher {
-    fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+/// `curl`-backed fetcher. Plain construction keeps the original blocking
+/// behaviour; [`CurlFetcher::with_progress`] adds a progress meter and lets a
+/// [`CancelToken`] abort the transfer (used by the TUI worker so a slow
+/// download can never freeze or trap the interface).
+#[derive(Clone, Default)]
+pub struct CurlFetcher {
+    cancel: Option<CancelToken>,
+    progress: Option<ProgressSink>,
+}
+
+impl std::fmt::Debug for CurlFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CurlFetcher")
+            .field("cancellable", &self.cancel.is_some())
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
+}
+
+impl CurlFetcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fetcher whose transfer reports percentages and stops when `cancel` is
+    /// set (the curl child is killed within ~40 ms).
+    pub fn with_progress(
+        cancel: CancelToken,
+        sink: impl Fn(u64, u64) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cancel: Some(cancel),
+            progress: Some(Arc::new(sink)),
+        }
+    }
+
+    fn fetch_blocking(&self, url: &str) -> Result<Vec<u8>> {
         let out = Command::new("curl")
             .args(["-fsSL", "--", url])
             .output()
@@ -30,6 +70,120 @@ impl Fetcher for CurlFetcher {
         }
         Ok(out.stdout)
     }
+
+    fn fetch_streaming(&self, url: &str) -> Result<Vec<u8>> {
+        let mut child = Command::new("curl")
+            .args(["-fsSL", "--progress-bar", "--", url])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Other(format!("curl exec failed: {e}")))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Other("curl stdout unavailable".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Other("curl stderr unavailable".into()))?;
+
+        // Body and progress meter are two pipes: drain them concurrently so
+        // neither side can fill its buffer and stall curl.
+        let body = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+        });
+        let sink = self.progress.clone();
+        let meter = std::thread::spawn(move || {
+            let mut err = stderr;
+            let mut buf = [0u8; 512];
+            let mut carry = String::new();
+            let mut last = None;
+            loop {
+                match err.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        carry.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if let Some(pct) = parse_progress_percent(&carry) {
+                            if last != Some(pct) {
+                                last = Some(pct);
+                                if let Some(sink) = &sink {
+                                    sink(pct, 100);
+                                }
+                            }
+                        }
+                        if carry.len() > 512 {
+                            let keep = carry.chars().count().saturating_sub(64);
+                            carry = carry.chars().skip(keep).collect();
+                        }
+                    }
+                }
+            }
+            carry
+        });
+
+        let status = loop {
+            if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = body.join();
+                let _ = meter.join();
+                return Err(Error::Cancelled);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = body.join();
+                    let _ = meter.join();
+                    return Err(Error::Other(format!("curl wait failed: {e}")));
+                }
+            }
+        };
+        let bytes = body
+            .join()
+            .map_err(|_| Error::Other("curl reader panicked".into()))?
+            .map_err(Error::Io)?;
+        let tail = meter.join().unwrap_or_default();
+        if !status.success() {
+            let detail = tail
+                .rsplit(['\r', '\n'])
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return Err(Error::Other(format!("curl failed: {detail}")));
+        }
+        Ok(bytes)
+    }
+}
+
+impl Fetcher for CurlFetcher {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+        if self.cancel.is_none() && self.progress.is_none() {
+            return self.fetch_blocking(url);
+        }
+        self.fetch_streaming(url)
+    }
+}
+
+/// Last percentage printed by curl's progress bar in `text`.
+///
+/// Output looks like `####  45.0%\r####  90.0%\r`, so the number is read
+/// backwards from the final `%`. Pure function: unit-tested offline.
+pub(crate) fn parse_progress_percent(text: &str) -> Option<u64> {
+    let pct = text.rfind('%')?;
+    let before = &text[..pct];
+    let start = before
+        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let value: f64 = before[start..].trim_end_matches('.').parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(value.clamp(0.0, 100.0).round() as u64)
 }
 
 pub type HttpFetcher = CurlFetcher;
@@ -557,15 +711,70 @@ files = ["bin/node:node/node-20", "bin/npm:node/npm-20"]
         let sample = t.path().join("sample.txt");
         fs::write(&sample, b"hello from curl").unwrap();
         let url = format!("file://{}", sample.to_str().unwrap());
-        let fetcher = CurlFetcher;
+        let fetcher = CurlFetcher::default();
         let data = fetcher.fetch(&url).unwrap();
         assert_eq!(data, b"hello from curl");
     }
 
     #[test]
     fn curl_fetcher_fails_on_nonexistent() {
-        let fetcher = CurlFetcher;
+        let fetcher = CurlFetcher::default();
         let res = fetcher.fetch("file:///nonexistent/path/that/does/not/exist");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn progress_parser_reads_the_last_percentage() {
+        assert_eq!(parse_progress_percent("###  45.0%"), Some(45));
+        assert_eq!(parse_progress_percent("\r####  12.5%\r"), Some(13));
+        assert_eq!(parse_progress_percent("100.0%"), Some(100));
+        assert_eq!(parse_progress_percent(" 0.0%"), Some(0));
+        assert_eq!(parse_progress_percent("no meter here"), None);
+        assert_eq!(parse_progress_percent("%"), None);
+    }
+
+    #[test]
+    fn progress_parser_clamps_out_of_range_values() {
+        assert_eq!(parse_progress_percent("1234.5%"), Some(100));
+    }
+
+    #[test]
+    fn streaming_fetch_still_returns_the_body() {
+        let t = tempfile::tempdir().unwrap();
+        let sample = t.path().join("sample.bin");
+        fs::write(&sample, vec![7u8; 64 * 1024]).unwrap();
+        let url = format!("file://{}", sample.to_str().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let sink = seen.clone();
+
+        let fetcher = CurlFetcher::with_progress(CancelToken::new(), move |done, total| {
+            sink.lock().unwrap().push((done, total));
+        });
+        let data = fetcher.fetch(&url).unwrap();
+
+        assert_eq!(data.len(), 64 * 1024, "the whole body must arrive");
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(_, total)| *total == 100),
+            "progress is reported as a percentage: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_token_aborts_the_transfer() {
+        let t = tempfile::tempdir().unwrap();
+        let sample = t.path().join("sample.bin");
+        fs::write(&sample, vec![1u8; 1024]).unwrap();
+        let url = format!("file://{}", sample.to_str().unwrap());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let fetcher = CurlFetcher::with_progress(cancel, |_, _| {});
+        let err = fetcher.fetch(&url).unwrap_err();
+
+        assert!(
+            matches!(err, Error::Cancelled),
+            "a cancelled download must not pretend it succeeded: {err}"
+        );
     }
 }

@@ -5,6 +5,7 @@ pub mod proc;
 pub mod service;
 pub mod shell;
 
+pub use cancel::CancelToken;
 pub use error::{Error, Result};
 pub use manifest::{Lock, Manifest, PhpManager};
 pub use paths::Paths;
@@ -28,6 +29,7 @@ pub mod installer;
 pub fn installer_defaults() -> &'static str {
     include_str!("default_manifest.toml")
 }
+pub mod cancel;
 pub mod composer;
 pub mod database;
 pub mod dns;

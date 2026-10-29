@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use fine_ill_do_it_myself::{ServiceState, ServiceStatus};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -315,6 +317,24 @@ pub struct App {
     pub with_db: bool,
     /// Inline validation message shown inside the modal.
     pub form_error: Option<String>,
+    /// Action currently running on the worker thread (`None` = idle).
+    pub job: Option<Job>,
+    /// Ports resolved during refresh; `render` never resolves them itself.
+    pub ports: fine_ill_do_it_myself::PortPlan,
+    /// Default PHP version, cached for the running-row label.
+    pub php_row: String,
+    /// Active version per language family, cached during refresh.
+    pub lang_versions: std::collections::BTreeMap<String, String>,
+    /// True while the background service/config refresh is running.
+    refreshing: bool,
+    /// Management panel snapshot currently being computed in the background.
+    mgmt_pending: Option<(usize, bool, u64)>,
+    /// Cached management panel title and lines (built by `refresh_mgmt`).
+    pub mgmt_title: String,
+    /// Inputs the cached management lines were built from.
+    pub mgmt_for: Option<(usize, bool, u64)>,
+    /// Bumped on every refresh so caches know they are stale.
+    pub data_revision: u64,
 }
 
 impl App {
@@ -347,7 +367,34 @@ impl App {
             template_cursor: default_template_index(),
             with_db: false,
             form_error: None,
+            job: None,
+            ports: fine_ill_do_it_myself::PortPlan::default(),
+            php_row: String::new(),
+            lang_versions: std::collections::BTreeMap::new(),
+            refreshing: false,
+            mgmt_pending: None,
+            mgmt_title: String::new(),
+            mgmt_for: None,
+            data_revision: 0,
         }
+    }
+
+    /// Cancel the job running on the worker thread (Esc). Returns false when
+    /// the app is idle.
+    fn cancel_job(&mut self) -> bool {
+        match &self.job {
+            Some(job) => {
+                job.cancel.cancel();
+                self.message = format!("cancelling {}...", job.label);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Inputs the cached management panel depends on.
+    pub fn mgmt_key(&self) -> (usize, bool, u64) {
+        (self.cursor_left, self.detail.is_some(), self.data_revision)
     }
 
     fn cursor(&self) -> usize {
@@ -516,6 +563,10 @@ impl App {
                 }
                 _ => return,
             }
+        }
+        // A running job owns Esc: it cancels the work instead of quitting.
+        if key == KeyCode::Esc && self.cancel_job() {
+            return;
         }
         if key == self.keybinds.quit {
             self.quit = true;
@@ -1097,6 +1148,9 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
         // First, so the footer never clips it behind the fixed service keys.
         fixed.insert(0, ("n".to_string(), "new project"));
     }
+    if app.job.is_some() {
+        fixed.insert(0, ("esc".to_string(), "cancel"));
+    }
     let mut out: Vec<(String, &'static str)> = Vec::new();
     for (k, l) in fixed {
         if !out.iter().any(|(seen, _)| seen == &k) {
@@ -1163,14 +1217,19 @@ pub fn installed_server_versions(env: &fine_ill_do_it_myself::Env, server: &str)
 /// Title + exact text of the management panel's items for `app`'s current
 /// state. Shared by the renderer and by `App::mgmt_enter` so Enter always
 /// acts on precisely the line that is displayed.
-pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<String>) {
+fn mgmt_panel_for(
+    env: &fine_ill_do_it_myself::Env,
+    services: &[ServiceStatus],
+    cursor_left: usize,
+    config_rows: &[ConfigRow],
+) -> (String, Vec<String>) {
     let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
     let cur_php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
     let cur_web = fine_ill_do_it_myself::orchestrator::web_server(env);
     let ports =
         fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
 
-    if let Some(svc) = app.services.get(app.cursor_left) {
+    if let Some(svc) = services.get(cursor_left) {
         if svc.name.starts_with("php-") || svc.name == "php" {
             return (
                 format!(" php versions (current: {cur_php}) "),
@@ -1197,23 +1256,7 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
                         let is_active = v == &cur
                             || (v == "system" && (cur == "system" || cur.starts_with("system")));
                         let mark = if is_active { "▶ " } else { "  " };
-                        let label = if v == "system" {
-                            if let Some(sys) = fine_ill_do_it_myself::lang::which_system_lang(lang)
-                            {
-                                if let Some(sys_ver) =
-                                    fine_ill_do_it_myself::lang::probe_version(&sys)
-                                {
-                                    format!("system ({sys_ver})")
-                                } else {
-                                    "system".to_string()
-                                }
-                            } else {
-                                "system".to_string()
-                            }
-                        } else {
-                            v.clone()
-                        };
-                        lines.push(format!("{mark}{lang}.use {label}"));
+                        lines.push(format!("{mark}{lang}.use {v}"));
                     }
                 }
                 return (format!(" {lang} versions (current: {cur}) "), lines);
@@ -1258,8 +1301,7 @@ pub fn mgmt_panel(env: &fine_ill_do_it_myself::Env, app: &App) -> (String, Vec<S
         }
     }
     // no service focused: the global config list
-    let mut lines: Vec<String> = app
-        .config_rows
+    let mut lines: Vec<String> = config_rows
         .iter()
         .map(|r| match r {
             ConfigRow::UsePhp(v) => {
@@ -1523,542 +1565,324 @@ fn quick_create_template_options() -> Vec<(fine_ill_do_it_myself::project::Templ
         .collect()
 }
 
-/// Terminal entry: raw mode loop with ratatui rendering of status + logs.
-pub fn run_tui(
-    env: &fine_ill_do_it_myself::Env,
-    _ports: fine_ill_do_it_myself::PortPlan,
-) -> Result<(), fine_ill_do_it_myself::Error> {
-    use crossterm::event::{Event, KeyEventKind};
-    use crossterm::terminal;
-    use ratatui::backend::CrosstermBackend;
-    use ratatui::Terminal;
-    // refuse to hijack a non-terminal; scripted invocations keep working
-    if unsafe { libc::isatty(1) } != 1 {
-        println!("TUI requires a tty; use: status");
-        return Ok(());
-    }
-    let refresh = make_refresh(env.clone());
-    let act = make_actioner(env.clone());
-    let _ = terminal::enable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
+/// How long one `poll` may block waiting for a key.
+const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+/// Status refresh cadence while the UI is idle.
+const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the spinner is repainted while a job runs.
+const SPINNER_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
-    let projects: Vec<String> = fine_ill_do_it_myself::list_projects(env);
-    let mut app = App::new(Vec::new(), projects);
-    app.editor = fine_ill_do_it_myself::editor::detect_default();
-    app.keybinds = load_keybinds(
-        &std::fs::read_to_string(env.paths.etc().join("keys.toml")).unwrap_or_default(),
-    );
+/// Set from SIGTERM/SIGINT/SIGHUP so the loop can restore the terminal.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut term = Terminal::new(backend).ok();
-    refresh(&mut app);
-    loop {
-        let ports =
-            fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
-        if let Some(t) = term.as_mut() {
-            let _ = t.draw(|f| {
-                use ratatui::layout::{Constraint, Layout};
-                use ratatui::style::{Color, Modifier, Style};
-                use ratatui::text::{Line, Span};
-                use ratatui::widgets::{
-                    Block, BorderType, Borders, List, ListItem, ListState, Paragraph,
-                };
+extern "C" fn request_stop(_: libc::c_int) {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
-                let area = f.area();
+fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
 
-                // Only show detail panel if app.detail is Some
-                let (main_area, detail_area) = if app.detail.is_some() {
-                    let [left, right] = Layout::horizontal([
-                        Constraint::Percentage(65),
-                        Constraint::Percentage(35),
-                    ])
-                    .areas(area);
-                    (left, Some(right))
-                } else {
-                    (area, None)
-                };
+/// Put the terminal back the way we found it. Safe to call twice.
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::terminal::disable_raw_mode();
+}
 
-                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-                let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-
-                let non_lang_indices: Vec<usize> = app
-                    .services
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| !is_language(&s.name))
-                    .map(|(i, _)| i)
-                    .collect();
-
-                // Collapse language versions: show only one row per language
-                // family (php, node, python, go, java). `language_reps` holds
-                // the active version row for each family and is what navigation
-                // walks, so the highlight never lands on a hidden version.
-                let collapsed_lang: Vec<(usize, String)> = app
-                    .language_reps
-                    .iter()
-                    .filter_map(|&idx| {
-                        app.services
-                            .get(idx)
-                            .map(|s| (idx, language_family(&s.name).to_string()))
-                    })
-                    .collect();
-
-                let svc_height = if non_lang_indices.is_empty() {
-                    0
-                } else {
-                    non_lang_indices.len() as u16 + 2
-                };
-
-                let lang_height = if collapsed_lang.is_empty() {
-                    0
-                } else {
-                    collapsed_lang.len() as u16 + 2
-                };
-
-                let [services, languages, projects, footer] = Layout::vertical([
-                    Constraint::Length(svc_height),
-                    Constraint::Length(lang_height),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .areas(main_area);
-
-                let left_cursor = app.cursor_left;
-                let svc_focus = !app.panel_right && non_lang_indices.contains(&left_cursor);
-                let lang_focus = !app.panel_right && app.language_reps.contains(&left_cursor);
-                let proj_focus = !app.panel_right && left_cursor >= app.services.len();
-
-                // 1. Services panel (web servers, databases, etc.)
-                if svc_height > 0 {
-                    let items: Vec<ListItem> = non_lang_indices
-                        .iter()
-                        .map(|&idx| {
-                            let s = &app.services[idx];
-                            let (mark, name, color) = match &s.state {
-                                ServiceState::Running => {
-                                    ("● ".to_string(), s.name.clone(), Color::Green)
-                                }
-                                ServiceState::Error(msg) => {
-                                    ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
-                                }
-                                _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
-                            };
-                            let p = ports_label(&s.name, &php_row, &ports);
-                            let (p1, p2) = if let Some((http, https)) = p.split_once(' ') {
-                                (http.to_string(), https.to_string())
-                            } else if s.name == "mariadb" && !p.is_empty() {
-                                (format!("port:{p}"), String::new())
-                            } else {
-                                (p, String::new())
-                            };
-                            let mut spans = vec![
-                                Span::styled(mark, Style::default().fg(color)),
-                                Span::styled(
-                                    format!("{:<11}", name),
-                                    Style::default()
-                                        .fg(Color::White)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                            ];
-                            if !p1.is_empty() {
-                                spans.push(Span::styled(
-                                    format!("{:<12}", p1),
-                                    Style::default().fg(Color::DarkGray),
-                                ));
-                            }
-                            if !p2.is_empty() {
-                                spans.push(Span::styled(p2, Style::default().fg(Color::DarkGray)));
-                            }
-                            ListItem::new(Line::from(spans))
-                        })
-                        .collect();
-
-                    let mut lst = ListState::default();
-                    if let Some(pos) = non_lang_indices.iter().position(|&i| i == left_cursor) {
-                        lst.select(Some(pos));
-                    }
-                    let svc_marker = if svc_focus { "▶ " } else { "  " };
-                    let svc_list = List::new(items)
-                        .highlight_symbol(svc_marker.to_owned())
-                        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
-                        .block(
-                            Block::default()
-                                .title(format!(" services{} ", if svc_focus { " ◀" } else { "" }))
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .border_style(Style::default().fg(if svc_focus {
-                                    Color::Cyan
-                                } else {
-                                    Color::DarkGray
-                                })),
-                        );
-                    f.render_stateful_widget(svc_list, services, &mut lst);
-                }
-
-                // 2. Programming languages panel (PHP runtimes, etc.)
-                if lang_height > 0 {
-                    let lang_items: Vec<ListItem> = collapsed_lang
-                        .iter()
-                        .map(|(idx, display_name)| {
-                            let s = &app.services[*idx];
-                            let p = if display_name == "php" {
-                                ports_label(&s.name, &php_row, &ports)
-                            } else {
-                                fine_ill_do_it_myself::lang::active_lang_version(env, display_name)
-                                    .unwrap_or_else(|| "not installed".to_string())
-                            };
-                            let mut spans = vec![Span::styled(
-                                format!("{:<13}", display_name),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            )];
-                            if !p.is_empty() {
-                                spans.push(Span::styled(
-                                    format!("{:<12}", p),
-                                    Style::default().fg(Color::DarkGray),
-                                ));
-                            }
-                            ListItem::new(Line::from(spans))
-                        })
-                        .collect();
-
-                    let mut lang_lst = ListState::default();
-                    if let Some(pos) = collapsed_lang.iter().position(|(i, _)| *i == left_cursor) {
-                        lang_lst.select(Some(pos));
-                    }
-                    let lang_marker = if lang_focus { "▶ " } else { "  " };
-                    let lang_list = List::new(lang_items)
-                        .highlight_symbol(lang_marker.to_owned())
-                        .highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
-                        .block(
-                            Block::default()
-                                .title(format!(
-                                    " programming languages (php: {php_row}){} ",
-                                    if lang_focus { " ◀" } else { "" }
-                                ))
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .border_style(Style::default().fg(if lang_focus {
-                                    Color::Green
-                                } else {
-                                    Color::DarkGray
-                                })),
-                        );
-                    f.render_stateful_widget(lang_list, languages, &mut lang_lst);
-                }
-
-                // 3. Projects panel
-                let proj_items: Vec<ListItem> = app
-                    .projects
-                    .iter()
-                    .map(|p| {
-                        ListItem::new(Line::from(vec![
-                            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
-                            Span::styled(p.clone(), Style::default().fg(Color::White)),
-                            Span::styled(".test  ", Style::default().fg(Color::DarkGray)),
-                        ]))
-                    })
-                    .collect();
-                let mut plst = ListState::default();
-                if proj_focus {
-                    plst.select(Some(
-                        left_cursor
-                            .saturating_sub(app.services.len())
-                            .min(app.projects.len().saturating_sub(1)),
-                    ));
-                }
-                let proj_title = format!(
-                    " projects ({}: ~/Sites){} ",
-                    app.projects.len(),
-                    if proj_focus { " ◀" } else { "" }
-                );
-                let proj_list = List::new(proj_items)
-                    .highlight_symbol(
-                        if proj_focus && app.quick_create.is_none() {
-                            "▶ "
-                        } else {
-                            "  "
-                        }
-                        .to_owned(),
-                    )
-                    .highlight_style(Style::default().bg(Color::Blue))
-                    .block(
-                        Block::default()
-                            .title(proj_title)
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if proj_focus {
-                                Color::Blue
-                            } else {
-                                Color::DarkGray
-                            })),
-                    );
-                f.render_stateful_widget(proj_list, projects, &mut plst);
-
-                render_quick_create(&app, f, area);
-
-                // detail panel - shown when 'd' is pressed; items come from
-                // mgmt_panel so Enter (mgmt_enter) acts on exactly these lines
-                if let Some(detail_area) = detail_area {
-                    let (mgmt_title, lines) = mgmt_panel(env, &app);
-                    app.mgmt_line_count = lines.len();
-                    app.mgmt_lines = lines.clone();
-                    let mgmt_focus = app.panel_right;
-                    let mgmt_items: Vec<ListItem> = lines
-                        .iter()
-                        .map(|line| {
-                            let selectable = App::is_mgmt_selectable(line);
-                            let color = if !selectable {
-                                Color::DarkGray
-                            } else if line.starts_with("web.use") {
-                                Color::Cyan
-                            } else {
-                                Color::Yellow
-                            };
-                            ListItem::new(Line::from(Span::styled(
-                                line.clone(),
-                                Style::default().fg(color),
-                            )))
-                        })
-                        .collect();
-
-                    let mut mlst = ListState::default();
-                    if mgmt_focus {
-                        mlst.select(Some(app.cursor().min(mgmt_items.len().saturating_sub(1))));
-                    }
-                    let mgmt_list = List::new(mgmt_items)
-                        .highlight_symbol("▶ ")
-                        .highlight_style(Style::default().bg(Color::Magenta))
-                        .block(
-                            Block::default()
-                                .title(mgmt_title)
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .border_style(Style::default().fg(if mgmt_focus {
-                                    Color::Magenta
-                                } else {
-                                    Color::DarkGray
-                                })),
-                        );
-                    f.render_stateful_widget(mgmt_list, detail_area, &mut mlst);
-                }
-
-                // footer with key hints (caller-owned list, context aware)
-                let hints = footer_hints(&app);
-                let mut spans: Vec<Span> = Vec::new();
-                for (key, label) in hints {
-                    spans.push(Span::styled(
-                        format!(" {key} "),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    spans.push(Span::styled(
-                        format!(" {label} "),
-                        Style::default().fg(Color::Cyan),
-                    ));
-                }
-                if let Some((d, tot)) = app.progress {
-                    let pct = (d * 100).checked_div(tot).unwrap_or(0);
-                    spans.push(Span::styled(
-                        format!(" {pct}% "),
-                        Style::default().fg(Color::Green),
-                    ));
-                }
-                if !app.message.is_empty() {
-                    spans.push(Span::styled(
-                        format!(" {} ", app.message),
-                        Style::default().fg(if app.message.to_lowercase().contains("error") {
-                            Color::Red
-                        } else {
-                            Color::Yellow
-                        }),
-                    ));
-                }
-                if let Some(Edit::Port(key)) = &app.edit {
-                    spans.push(Span::styled(
-                        format!(" edit {key}: {}█ ", app.input),
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ));
-                }
-                f.render_widget(Paragraph::new(Line::from(spans)), footer);
-            });
+/// A panic, SIGTERM or SIGINT must never leave the user in raw mode with no
+/// cursor. Ctrl-C cannot reach us as a signal while raw mode is on, so the
+/// signal handlers only matter for `kill` / window-manager shutdown.
+fn install_terminal_hooks() {
+    let main_thread = std::thread::current().id();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A worker panic must not tear down the screen under a live UI.
+        if std::thread::current().id() == main_thread {
+            restore_terminal();
         }
-        if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
-            if let Ok(Event::Key(k)) = crossterm::event::read() {
-                if k.kind == KeyEventKind::Press {
-                    // Enter on the right panel acts on the highlighted
-                    // management line (port editor, web.use, php.use) ONLY
-                    // when the editor is not already open.  If the editor is
-                    // active the keystroke must reach on_key so it can commit
-                    // the typed value via SetPort (the bug: without this guard
-                    // mgmt_enter would re-open the editor with the stale
-                    // prefill and silently discard the user's input).
-                    if k.code == crossterm::event::KeyCode::Enter
-                        && app.panel_right
-                        && app.detail.is_some()
-                        && app.edit.is_none()
-                    {
-                        let (_, lines) = mgmt_panel(env, &app);
-                        app.mgmt_line_count = lines.len();
-                        app.mgmt_lines = lines.clone();
-                        app.mgmt_enter(&lines);
-                    } else {
-                        app.on_key(k.code);
-                    }
-                    while let Some(a) = app.actions.pop() {
-                        act(&mut app, &a);
-                        refresh(&mut app);
-                    }
-                    // A terminal editor (vim, nano, ...) cannot run while the
-                    // TUI owns the screen: give the terminal back, run it
-                    // attached, then restore the TUI.
-                    if let Some(cmd) = app.pending_terminal_editor.take() {
-                        let _ = terminal::disable_raw_mode();
-                        let _ =
-                            crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
-                        let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
-                        let _ =
-                            crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
-                        let _ = terminal::enable_raw_mode();
-                        if let Some(t) = term.as_mut() {
-                            let _ = t.clear();
-                        }
-                        app.message = match status {
-                            Ok(s) if s.success() => "editor closed".into(),
-                            Ok(s) => format!("editor exited with {s}"),
-                            Err(e) => format!("editor failed: {e}"),
-                        };
-                        refresh(&mut app);
-                    }
-                }
+        previous(info);
+    }));
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_stop as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            request_stop as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            request_stop as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// One long-running action running on the worker thread.
+pub struct Job {
+    pub label: String,
+    pub started: std::time::Instant,
+    pub cancel: fine_ill_do_it_myself::CancelToken,
+}
+
+impl Job {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            started: std::time::Instant::now(),
+            cancel: fine_ill_do_it_myself::CancelToken::new(),
+        }
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+
+/// Messages the worker thread sends back to the UI loop.
+enum WorkerMsg {
+    /// Download progress as (done, total); total 0 means "unknown".
+    Progress {
+        done: u64,
+        total: u64,
+    },
+    Done(Outcome),
+    RefreshDone(std::result::Result<RefreshData, String>),
+    ManagementDone {
+        key: (usize, bool, u64),
+        result: std::result::Result<(String, Vec<String>), String>,
+    },
+}
+
+struct RefreshData {
+    services: Vec<ServiceStatus>,
+    language_reps: Vec<usize>,
+    ports: fine_ill_do_it_myself::PortPlan,
+    php_row: String,
+    lang_versions: std::collections::BTreeMap<String, String>,
+    config_rows: Vec<ConfigRow>,
+}
+
+/// What the UI has to apply once an action finished. Everything that needs the
+/// terminal (a terminal editor) is handed back to the loop instead of running
+/// inside the worker.
+struct Outcome {
+    message: String,
+    detail: Option<String>,
+    created_project: Option<String>,
+    terminal_editor: Option<Vec<String>>,
+}
+
+/// Read-only view of the app that the worker needs. Captured before spawning so
+/// the worker never touches UI state.
+struct ActionContext {
+    services: Vec<String>,
+    editor: Option<fine_ill_do_it_myself::editor::Editor>,
+}
+
+fn action_label(action: &Action, ctx: &ActionContext) -> String {
+    let svc = |i: usize| {
+        ctx.services
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("#{i}"))
+    };
+    match action {
+        Action::RestartAll => "restarting everything".into(),
+        Action::StartService(i) => format!("starting {}", svc(*i)),
+        Action::StopService(i) => format!("stopping {}", svc(*i)),
+        Action::RestartService(i) => format!("restarting {}", svc(*i)),
+        Action::UsePhp(v) => format!("switching php to {v}"),
+        Action::UseWeb(n) => format!("switching web server to {n}"),
+        Action::SetPort { key, value } => format!("setting {key} = {value}"),
+        Action::ShowDetail(n) => format!("loading {n}"),
+        Action::UseServerVersion { server, version } => format!("switching {server} to {version}"),
+        Action::UseLang { lang, version } => format!("switching {lang} to {version}"),
+        Action::OpenProject(p) => format!("opening {p}.test"),
+        Action::OpenEditor(p) => format!("opening {p} in the editor"),
+        Action::InstallComposer => "downloading composer".into(),
+        Action::CreateProject { name, .. } => format!("creating {name}"),
+    }
+}
+
+/// Hand one action to a worker thread. The UI thread returns immediately, so
+/// the screen keeps drawing and keys keep working during a slow download or a
+/// MariaDB first start.
+fn start_job(
+    env: &fine_ill_do_it_myself::Env,
+    app: &mut App,
+    action: Action,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+) {
+    let ctx = ActionContext {
+        services: app.services.iter().map(|s| s.name.clone()).collect(),
+        editor: app.editor.clone(),
+    };
+    let job = Job::new(action_label(&action, &ctx));
+    let cancel = job.cancel.clone();
+    let label = job.label.clone();
+    app.job = Some(job);
+    app.progress = None;
+    app.message.clear();
+    let env = env.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fidim-job".into())
+        .spawn(move || {
+            let progress = tx.clone();
+            let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::with_progress(
+                cancel.clone(),
+                move |done, total| {
+                    let _ = progress.send(WorkerMsg::Progress { done, total });
+                },
+            );
+            // A panic in one action must surface as a message, never as a
+            // spinner that runs forever with no way out.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_action(
+                    &env,
+                    &fine_ill_do_it_myself::RealRunner,
+                    &ctx,
+                    &action,
+                    &fetcher,
+                )
+            }))
+            .unwrap_or_else(|_| Outcome {
+                message: format!("{label}: internal error (see logs)"),
+                detail: None,
+                created_project: None,
+                terminal_editor: None,
+            });
+            let _ = tx.send(WorkerMsg::Done(outcome));
+        });
+    if let Err(e) = spawned {
+        app.job = None;
+        app.message = format!("cannot start worker: {e}");
+    }
+}
+
+fn apply_outcome(app: &mut App, outcome: Outcome) {
+    app.message = outcome.message;
+    if let Some(name) = outcome.created_project {
+        app.projects.push(name);
+        app.projects.sort();
+        app.projects.dedup();
+    }
+    if let Some(cmd) = outcome.terminal_editor {
+        app.pending_terminal_editor = Some(cmd);
+    }
+    if let Some(detail) = outcome.detail {
+        app.detail = Some(detail);
+        app.panel_right = true;
+        app.cursor_right = 0;
+    }
+}
+
+fn stop_named<R>(
+    env: &fine_ill_do_it_myself::Env,
+    ports: &fine_ill_do_it_myself::PortPlan,
+    runner: &R,
+    name: &str,
+) -> fine_ill_do_it_myself::Result<()>
+where
+    R: fine_ill_do_it_myself::Runner + Clone,
+{
+    fine_ill_do_it_myself::supervisor::Supervisor {
+        env: env.clone(),
+        ports: ports.clone(),
+        runner: runner.clone(),
+    }
+    .stop(name)
+}
+
+/// Detail text for one service row (reads lock/bin state; worker thread only).
+fn service_detail(env: &fine_ill_do_it_myself::Env, name: &str) -> String {
+    let mut detail = format!("Service: {name}\n\n");
+    if name.starts_with("php-") {
+        detail.push_str("PHP-FPM Service\n");
+        if let Ok(lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
+            let cur = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+            detail.push_str(&format!("Current default: {cur}\n"));
+        }
+        if let Some(ver) = name.strip_prefix("php-") {
+            if let Some(bin) = fine_ill_do_it_myself::orchestrator::php_binary_for(env, ver) {
+                detail.push_str(&format!("Binary: {}\n", bin.display()));
             }
         }
-        if app.quit {
-            break;
+    } else if ["caddy", "httpd", "nginx", "lighttpd"].contains(&name) {
+        detail.push_str("Web Server\n");
+        if let Some(ver) = fine_ill_do_it_myself::orchestrator::web_version(env, name) {
+            detail.push_str(&format!("Version: {ver}\n"));
         }
-    }
-
-    let _ = crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
-    let _ = terminal::disable_raw_mode();
-    Ok(())
-}
-
-fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App) {
-    move |app: &mut App| {
         let ports =
             fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
-        let mut statuses = fine_ill_do_it_myself::orchestrator::status_all(
-            &env,
-            &ports,
-            &fine_ill_do_it_myself::RealRunner,
-        );
-        statuses.sort_by_key(|s| is_language(&s.name));
-        app.services = statuses;
-        app.language_reps = language_representatives(&env, &app.services);
-
-        // build config rows
-        let mut rows: Vec<ConfigRow> = Vec::new();
-
-        // php versions
-        for v in fine_ill_do_it_myself::orchestrator::installed_php_versions(&env) {
-            rows.push(ConfigRow::UsePhp(v));
-        }
-
-        // web servers
-        for w in [
-            fine_ill_do_it_myself::orchestrator::CADDY,
-            fine_ill_do_it_myself::orchestrator::APACHE,
-            fine_ill_do_it_myself::orchestrator::NGINX,
-            fine_ill_do_it_myself::orchestrator::LIGHTTPD,
-        ] {
-            let ver = fine_ill_do_it_myself::orchestrator::web_version(&env, w);
-            rows.push(ConfigRow::UseWeb {
-                name: w.to_string(),
-                ver,
-            });
-        }
-
-        // ports
-        rows.push(ConfigRow::Port {
-            key: "http".into(),
-            value: ports.http,
-        });
-        rows.push(ConfigRow::Port {
-            key: "https".into(),
-            value: ports.https,
-        });
-        rows.push(ConfigRow::Port {
-            key: "fpm_base".into(),
-            value: ports.fpm_base,
-        });
-        rows.push(ConfigRow::Port {
-            key: "mariadb".into(),
-            value: ports.mariadb,
-        });
-
-        app.config_rows = rows;
-        app.clamp_now();
-        app.normalize_left_cursor();
+        let (http, https) = ports.web_ports(name);
+        detail.push_str(&format!("HTTP port: {http}\n"));
+        detail.push_str(&format!("HTTPS port: {https}\n"));
+    } else if name == "mariadb" {
+        detail.push_str("MariaDB Database\n");
+        let ports =
+            fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+        detail.push_str(&format!("Port: {}\n", ports.mariadb));
     }
+    detail
 }
 
-/// Execute one queued action against the system; sets the status-bar
-/// message with the outcome. Ports are re-resolved from `etc/ports.toml` on
-/// every execution so a SetPort followed by any start/restart picks up the
-/// saved values instead of a snapshot from TUI startup.
-fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
+/// Execute one action. Runs on the worker thread (or synchronously from tests)
+/// and returns everything the UI has to apply, never touching `App`.
+fn execute_action<R, F>(
     env: &fine_ill_do_it_myself::Env,
-    runner: R,
-    app: &mut App,
+    runner: &R,
+    ctx: &ActionContext,
     action: &Action,
-) {
+    fetcher: &F,
+) -> Outcome
+where
+    R: fine_ill_do_it_myself::Runner + Clone,
+    F: fine_ill_do_it_myself::installer::Fetcher,
+{
     let ports =
         fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
     let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
     let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-    let r: Result<Vec<_>, _> = match action {
-        Action::RestartAll => fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, &runner)
-            .and_then(|_| {
-                fine_ill_do_it_myself::orchestrator::start_all(env, &ports, &runner, &php)
+    let mut detail = None;
+    let mut created_project = None;
+    let mut terminal_editor = None;
+
+    let r: std::result::Result<(), fine_ill_do_it_myself::Error> = match action {
+        Action::RestartAll => fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, runner)
+            .and_then(|_| fine_ill_do_it_myself::orchestrator::start_all(env, &ports, runner, &php))
+            .map(|_| ()),
+        Action::StartService(i) => match ctx.services.get(*i) {
+            Some(name) => {
+                fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
+                    .map(|_| ())
+            }
+            None => Err(fine_ill_do_it_myself::Error::Other(format!(
+                "service row {i} no longer exists"
+            ))),
+        },
+        Action::StopService(i) => match ctx.services.get(*i) {
+            Some(name) => stop_named(env, &ports, runner, name),
+            None => Err(fine_ill_do_it_myself::Error::Other(format!(
+                "service row {i} no longer exists"
+            ))),
+        },
+        Action::RestartService(i) => match ctx.services.get(*i) {
+            Some(name) => stop_named(env, &ports, runner, name).and_then(|_| {
+                fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
+                    .map(|_| ())
             }),
-        Action::StartService(i) => {
-            let name = app.services[*i].name.clone();
-            fine_ill_do_it_myself::orchestrator::start_service(env, &ports, &runner, &php, &name)
-                .map(|s| vec![s])
-        }
-        Action::StopService(i) => {
-            let name = app.services[*i].name.clone();
-            let sup = fine_ill_do_it_myself::supervisor::Supervisor {
-                env: env.clone(),
-                ports: ports.clone(),
-                runner: runner.clone(),
-            };
-            sup.stop(&name).map(|_| Vec::new())
-        }
-        Action::RestartService(i) => {
-            let name = app.services[*i].name.clone();
-            let sup = fine_ill_do_it_myself::supervisor::Supervisor {
-                env: env.clone(),
-                ports: ports.clone(),
-                runner: runner.clone(),
-            };
-            sup.stop(&name).and_then(|_| {
-                fine_ill_do_it_myself::orchestrator::start_service(
-                    env, &ports, &runner, &php, &name,
-                )
-                .map(|s| vec![s])
-            })
-        }
+            None => Err(fine_ill_do_it_myself::Error::Other(format!(
+                "service row {i} no longer exists"
+            ))),
+        },
         Action::UsePhp(v) => {
             let cli_env = crate::cli::CliEnv {
                 env: env.clone(),
                 ports: ports.clone(),
                 php_default: v.clone(),
             };
-            crate::cli::php_use(&cli_env, v).map(|_| vec![])
+            crate::cli::php_use(&cli_env, v)
         }
         Action::UseLang { lang, version } => {
             let cli_env = crate::cli::CliEnv {
@@ -2066,7 +1890,7 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 ports: ports.clone(),
                 php_default: version.clone(),
             };
-            crate::cli::lang_use(&cli_env, lang, version).map(|_| vec![])
+            crate::cli::lang_use(&cli_env, lang, version)
         }
         Action::UseWeb(name) => {
             if fine_ill_do_it_myself::orchestrator::resolve_web_bin(env, name).is_err() {
@@ -2076,25 +1900,18 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
             } else if let Ok(mut lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
                 lock.web_default = Some(name.clone());
                 let php = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                let res: Result<Vec<_>, fine_ill_do_it_myself::Error> = lock
-                    .save(&env.lock_path())
-                    .map_err(|e| e.into())
+                lock.save(&env.lock_path())
+                    .map_err(fine_ill_do_it_myself::Error::Io)
                     .and_then(|_| {
                         fine_ill_do_it_myself::orchestrator::generate_configs(env, &ports, &php)
                     })
-                    .map(|_| vec![]);
-                res
             } else {
                 Err(fine_ill_do_it_myself::Error::Other(
                     "failed to load lock".into(),
                 ))
             }
         }
-        Action::SetPort { key, value } => {
-            // shared with the CLI: accepts the per-server pairs too
-            // (nginx_http, ...) and rejects unknown keys with an error
-            crate::cli::port_set(&env.paths.etc(), key, *value).map(|_| vec![])
-        }
+        Action::SetPort { key, value } => crate::cli::port_set(&env.paths.etc(), key, *value),
         Action::UseServerVersion { server, version } => {
             let server_dir = env.paths.bin().join(server);
             let (src, dest) = if server_dir.is_dir() {
@@ -2127,45 +1944,12 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 };
                 #[cfg(not(unix))]
                 let res = std::fs::copy(&src, &dest).map(|_| ());
-                res.map(|_| vec![])
-                    .map_err(fine_ill_do_it_myself::Error::Io)
+                res.map_err(fine_ill_do_it_myself::Error::Io)
             }
         }
         Action::ShowDetail(name) => {
-            // Build detail content based on service
-            let mut detail = format!("Service: {name}\n\n");
-            if name.starts_with("php-") {
-                detail.push_str("PHP-FPM Service\n");
-                if let Ok(lock) = fine_ill_do_it_myself::Lock::load(&env.lock_path()) {
-                    let cur = fine_ill_do_it_myself::orchestrator::default_php(&lock);
-                    detail.push_str(&format!("Current default: {cur}\n"));
-                }
-                if let Some(ver) = name.strip_prefix("php-") {
-                    if let Some(bin) = fine_ill_do_it_myself::orchestrator::php_binary_for(env, ver)
-                    {
-                        detail.push_str(&format!("Binary: {}\n", bin.display()));
-                    }
-                }
-            } else if ["caddy", "httpd", "nginx", "lighttpd"].contains(&name.as_str()) {
-                detail.push_str("Web Server\n");
-                if let Some(ver) = fine_ill_do_it_myself::orchestrator::web_version(env, name) {
-                    detail.push_str(&format!("Version: {ver}\n"));
-                }
-                let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
-                    std::env::var(k).ok()
-                });
-                let (http, https) = ports.web_ports(name.as_str());
-                detail.push_str(&format!("HTTP port: {http}\n"));
-                detail.push_str(&format!("HTTPS port: {https}\n"));
-            } else if name == "mariadb" {
-                detail.push_str("MariaDB Database\n");
-                let ports = fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| {
-                    std::env::var(k).ok()
-                });
-                detail.push_str(&format!("Port: {}\n", ports.mariadb));
-            }
-            app.detail = Some(detail);
-            Ok(vec![])
+            detail = Some(service_detail(env, name));
+            Ok(())
         }
         Action::OpenProject(project) => {
             let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
@@ -2188,7 +1972,7 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                     "opened {url} (note: {project}.test missing in /etc/hosts, run: fidim hosts --sync)"
                 )))
             } else {
-                Ok(vec![])
+                Ok(())
             }
         }
         Action::OpenEditor(project) => {
@@ -2198,16 +1982,16 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                     "project folder {} not found",
                     site.display()
                 )))
-            } else if let Some(editor) = app.editor.clone() {
+            } else if let Some(editor) = ctx.editor.clone() {
                 let cmd = editor.command(&site);
                 if editor.kind == fine_ill_do_it_myself::editor::EditorKind::Terminal {
-                    // the event loop owns the terminal: park the argv there
-                    app.pending_terminal_editor = Some(cmd);
-                    Ok(vec![])
+                    // the event loop owns the terminal: park the argv for it
+                    terminal_editor = Some(cmd);
+                    Ok(())
                 } else {
                     runner
                         .spawn(&cmd)
-                        .map(|_| vec![])
+                        .map(|_| ())
                         .map_err(fine_ill_do_it_myself::Error::Io)
                 }
             } else {
@@ -2222,14 +2006,12 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 ports: ports.clone(),
                 php_default: php.clone(),
             };
-            crate::cli::load_or_default_manifest(&cli)
-                .and_then(|manifest| {
-                    let mut lock =
-                        fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-                    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
-                    fine_ill_do_it_myself::composer::ensure(env, &manifest, &mut lock, &fetcher)
-                })
-                .map(|_| vec![])
+            crate::cli::load_or_default_manifest(&cli).and_then(|manifest| {
+                let mut lock =
+                    fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+                fine_ill_do_it_myself::composer::ensure(env, &manifest, &mut lock, fetcher)
+                    .map(|_| ())
+            })
         }
         Action::CreateProject { name, template, db } => {
             let cli = crate::cli::CliEnv {
@@ -2237,62 +2019,844 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
                 ports: ports.clone(),
                 php_default: php.clone(),
             };
-            crate::cli::create_project(&cli, name, *template, *db).map(|made| {
-                app.projects.push(
-                    made.path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                );
-                app.projects.sort();
-                app.projects.dedup();
-                vec![]
-            })
+            crate::cli::create_project_with_fetcher(&cli, name, *template, *db, fetcher).map(
+                |made| {
+                    created_project = Some(
+                        made.path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                },
+            )
         }
     };
-    match r {
-        Ok(_) => match action {
-            Action::OpenProject(p) => {
-                let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
-                let web = fine_ill_do_it_myself::orchestrator::default_web(&lock);
-                let (http_port, _) = ports.web_ports(&web);
-                let port_str = if http_port == 80 {
-                    String::new()
-                } else {
-                    format!(":{http_port}")
-                };
-                app.message = format!("opened http://{p}.test{port_str} in browser");
-            }
-            Action::OpenEditor(p) => {
-                let editor = app
-                    .editor
-                    .as_ref()
-                    .map(|e| e.name())
-                    .unwrap_or_else(|| "editor".into());
-                app.message = format!("opening {p} in {editor}");
-            }
-            Action::InstallComposer => app.message = "composer installed".into(),
-            Action::CreateProject { name, template, .. } => {
-                app.message = format!("created {name} ({})", template.label());
-            }
-            _ => app.message = format!("{action:?} ok").to_lowercase(),
-        },
-        Err(e) => match action {
-            Action::OpenEditor(p) => app.message = format!("{p}: {e}"),
-            Action::InstallComposer => app.message = format!("composer install: {e}"),
-            Action::CreateProject { name, .. } => app.message = format!("create {name}: {e}"),
-            _ => app.message = format!("{action:?}: {e}").to_lowercase(),
-        },
+
+    let failed = r.is_err();
+    let message = match (&r, action) {
+        (Ok(()), Action::OpenProject(p)) => {
+            let web = fine_ill_do_it_myself::orchestrator::default_web(&lock);
+            let (http_port, _) = ports.web_ports(&web);
+            let port_str = if http_port == 80 {
+                String::new()
+            } else {
+                format!(":{http_port}")
+            };
+            format!("opened http://{p}.test{port_str} in browser")
+        }
+        (Ok(()), Action::OpenEditor(p)) => {
+            let editor = ctx
+                .editor
+                .as_ref()
+                .map(|e| e.name())
+                .unwrap_or_else(|| "editor".into());
+            format!("opening {p} in {editor}")
+        }
+        (Ok(()), Action::InstallComposer) => "composer installed".into(),
+        (Ok(()), Action::CreateProject { name, template, .. }) => {
+            format!("created {name} ({})", template.label())
+        }
+        (Ok(()), _) => format!("{action:?} ok").to_lowercase(),
+        (Err(e), Action::OpenEditor(p)) => format!("{p}: {e}"),
+        (Err(e), Action::InstallComposer) => format!("composer install: {e}"),
+        (Err(e), Action::CreateProject { name, .. }) => format!("create {name}: {e}"),
+        (Err(e), _) => format!("{action:?}: {e}").to_lowercase(),
+    };
+
+    Outcome {
+        message,
+        detail: if failed { None } else { detail },
+        created_project: if failed { None } else { created_project },
+        terminal_editor: if failed { None } else { terminal_editor },
     }
 }
 
-/// Build the real-system action handler for the TUI event loop.
+/// Synchronous helper kept for tests (and `make_actioner`): execute one action
+/// against the real system and apply its outcome immediately.
+#[allow(dead_code)]
+fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
+    env: &fine_ill_do_it_myself::Env,
+    runner: R,
+    app: &mut App,
+    action: &Action,
+) {
+    let ctx = ActionContext {
+        services: app.services.iter().map(|s| s.name.clone()).collect(),
+        editor: app.editor.clone(),
+    };
+    let outcome = execute_action(
+        env,
+        &runner,
+        &ctx,
+        action,
+        &fine_ill_do_it_myself::installer::CurlFetcher::default(),
+    );
+    apply_outcome(app, outcome);
+}
+
+/// Build the real-system action handler used by tests.
+#[allow(dead_code)]
 fn make_actioner(env: fine_ill_do_it_myself::Env) -> impl Fn(&mut App, &Action) {
     move |app: &mut App, action: &Action| {
         perform_action(&env.clone(), fine_ill_do_it_myself::RealRunner, app, action);
     }
 }
+
+/// Route one key: Enter on the right panel acts on the *cached* management
+/// lines (so it matches exactly what is on screen), everything else goes to
+/// `App::on_key`. Kept separate so the behaviour is testable without a tty.
+pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) {
+    if key == crossterm::event::KeyCode::Enter
+        && app.panel_right
+        && app.detail.is_some()
+        && app.edit.is_none()
+    {
+        if app.mgmt_for == Some(app.mgmt_key()) {
+            // Cloning cached lines avoids re-reading the filesystem for a
+            // keystroke and guarantees Enter acts on the visible rows.
+            let lines = app.mgmt_lines.clone();
+            app.mgmt_enter(&lines);
+        } else {
+            app.message = "loading management options...".into();
+        }
+    } else {
+        app.on_key(key);
+    }
+}
+
+/// Next queued action, first-in first-out.
+fn take_next(actions: &mut Vec<Action>) -> Option<Action> {
+    if actions.is_empty() {
+        None
+    } else {
+        Some(actions.remove(0))
+    }
+}
+
+/// Spinner frame for the working indicator (one step per 250 ms).
+pub fn spinner(elapsed: std::time::Duration) -> &'static str {
+    const FRAMES: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+    FRAMES[(elapsed.as_millis() / 250) as usize % FRAMES.len()]
+}
+
+/// Pure rendering: reads only `App`, never the filesystem, a lock file or a
+/// child process. Keeping I/O out of this function is what keeps the TUI
+/// responsive; refresh work happens before the draw.
+pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
+
+    let (main_area, detail_area) = if app.detail.is_some() {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+                .areas(area);
+        (left, Some(right))
+    } else {
+        (area, None)
+    };
+
+    let ports = &app.ports;
+    let php_row = &app.php_row;
+
+    let non_lang_indices: Vec<usize> = app
+        .services
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !is_language(&s.name))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Collapse language versions: show only one row per language family
+    // (php, node, python, go, java). `language_reps` holds the active version
+    // row for each family and is what navigation walks.
+    let collapsed_lang: Vec<(usize, String)> = app
+        .language_reps
+        .iter()
+        .filter_map(|&idx| {
+            app.services
+                .get(idx)
+                .map(|s| (idx, language_family(&s.name).to_string()))
+        })
+        .collect();
+
+    let svc_height = if non_lang_indices.is_empty() {
+        0
+    } else {
+        non_lang_indices.len() as u16 + 2
+    };
+    let lang_height = if collapsed_lang.is_empty() {
+        0
+    } else {
+        collapsed_lang.len() as u16 + 2
+    };
+
+    // A status row (job / progress / message / port editor) gets its own line
+    // so it can never be clipped by the key-hint row on a narrow terminal.
+    let status_line = app.job.is_some()
+        || app.progress.is_some()
+        || !app.message.is_empty()
+        || app.edit.is_some();
+
+    let [services, languages, projects, footer] = Layout::vertical([
+        Constraint::Length(svc_height),
+        Constraint::Length(lang_height),
+        Constraint::Min(1),
+        Constraint::Length(if status_line { 2 } else { 1 }),
+    ])
+    .areas(main_area);
+
+    let left_cursor = app.cursor_left;
+    let svc_focus = !app.panel_right && non_lang_indices.contains(&left_cursor);
+    let lang_focus = !app.panel_right && app.language_reps.contains(&left_cursor);
+    let proj_focus = !app.panel_right && left_cursor >= app.services.len();
+
+    // 1. Services panel (web servers, databases, ...)
+    if svc_height > 0 {
+        let items: Vec<ListItem> = non_lang_indices
+            .iter()
+            .map(|&idx| {
+                let s = &app.services[idx];
+                let (mark, name, color) = match &s.state {
+                    ServiceState::Running => ("● ".to_string(), s.name.clone(), Color::Green),
+                    ServiceState::Error(msg) => {
+                        ("✗ ".to_string(), format!("{} ({msg})", s.name), Color::Red)
+                    }
+                    _ => ("○ ".to_string(), s.name.clone(), Color::DarkGray),
+                };
+                let p = ports_label(&s.name, php_row, ports);
+                let (p1, p2) = if let Some((http, https)) = p.split_once(' ') {
+                    (http.to_string(), https.to_string())
+                } else if s.name == "mariadb" && !p.is_empty() {
+                    (format!("port:{p}"), String::new())
+                } else {
+                    (p, String::new())
+                };
+                let mut spans = vec![
+                    Span::styled(mark, Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:<11}", name),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                if !p1.is_empty() {
+                    spans.push(Span::styled(
+                        format!("{:<12}", p1),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                if !p2.is_empty() {
+                    spans.push(Span::styled(p2, Style::default().fg(Color::DarkGray)));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let mut lst = ListState::default();
+        if let Some(pos) = non_lang_indices.iter().position(|&i| i == left_cursor) {
+            lst.select(Some(pos));
+        }
+        let svc_marker = if svc_focus { "▶ " } else { "  " };
+        let svc_list = List::new(items)
+            .highlight_symbol(svc_marker.to_owned())
+            .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+            .block(
+                Block::default()
+                    .title(format!(" services{} ", if svc_focus { " ◀" } else { "" }))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if svc_focus {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })),
+            );
+        f.render_stateful_widget(svc_list, services, &mut lst);
+    }
+
+    // 2. Programming languages panel (PHP runtimes, etc.)
+    if lang_height > 0 {
+        let lang_items: Vec<ListItem> = collapsed_lang
+            .iter()
+            .map(|(idx, display_name)| {
+                let s = &app.services[*idx];
+                let p = if display_name == "php" {
+                    ports_label(&s.name, php_row, ports)
+                } else {
+                    app.lang_versions
+                        .get(display_name)
+                        .cloned()
+                        .unwrap_or_else(|| "not installed".to_string())
+                };
+                let mut spans = vec![Span::styled(
+                    format!("{:<13}", display_name),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                if !p.is_empty() {
+                    spans.push(Span::styled(
+                        format!("{:<12}", p),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let mut lang_lst = ListState::default();
+        if let Some(pos) = collapsed_lang.iter().position(|(i, _)| *i == left_cursor) {
+            lang_lst.select(Some(pos));
+        }
+        let lang_marker = if lang_focus { "▶ " } else { "  " };
+        let selected_lang_label = collapsed_lang
+            .iter()
+            .find(|(idx, _)| *idx == left_cursor)
+            .map(|(_, language)| {
+                let version = if language == "php" {
+                    php_row.clone()
+                } else {
+                    app.lang_versions
+                        .get(language)
+                        .cloned()
+                        .unwrap_or_else(|| "not installed".to_string())
+                };
+                format!("{language}: {version}")
+            })
+            .unwrap_or_else(|| format!("php: {php_row}"));
+        let lang_list = List::new(lang_items)
+            .highlight_symbol(lang_marker.to_owned())
+            .highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
+            .block(
+                Block::default()
+                    .title(format!(
+                        " programming languages ({selected_lang_label}){} ",
+                        if lang_focus { " ◀" } else { "" }
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if lang_focus {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })),
+            );
+        f.render_stateful_widget(lang_list, languages, &mut lang_lst);
+    }
+
+    // 3. Projects panel
+    let proj_items: Vec<ListItem> = app
+        .projects
+        .iter()
+        .map(|p| {
+            ListItem::new(Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+                Span::styled(p.clone(), Style::default().fg(Color::White)),
+                Span::styled(".test  ", Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut plst = ListState::default();
+    if proj_focus {
+        plst.select(Some(
+            left_cursor
+                .saturating_sub(app.services.len())
+                .min(app.projects.len().saturating_sub(1)),
+        ));
+    }
+    let proj_title = format!(
+        " projects ({}: ~/Sites){} ",
+        app.projects.len(),
+        if proj_focus { " ◀" } else { "" }
+    );
+    let proj_list = List::new(proj_items)
+        .highlight_symbol(
+            if proj_focus && app.quick_create.is_none() {
+                "▶ "
+            } else {
+                "  "
+            }
+            .to_owned(),
+        )
+        .highlight_style(Style::default().bg(Color::Blue))
+        .block(
+            Block::default()
+                .title(proj_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if proj_focus {
+                    Color::Blue
+                } else {
+                    Color::DarkGray
+                })),
+        );
+    f.render_stateful_widget(proj_list, projects, &mut plst);
+
+    render_quick_create(app, f, area);
+
+    // Detail panel: exactly the lines cached by `refresh_mgmt`, so Enter on
+    // the right panel acts on what is displayed.
+    if let Some(detail_area) = detail_area {
+        let mgmt_focus = app.panel_right;
+        let mgmt_items: Vec<ListItem> = app
+            .mgmt_lines
+            .iter()
+            .map(|line| {
+                let selectable = App::is_mgmt_selectable(line);
+                let color = if !selectable {
+                    Color::DarkGray
+                } else if line.starts_with("web.use") {
+                    Color::Cyan
+                } else {
+                    Color::Yellow
+                };
+                ListItem::new(Line::from(Span::styled(
+                    line.clone(),
+                    Style::default().fg(color),
+                )))
+            })
+            .collect();
+
+        let mut mlst = ListState::default();
+        if mgmt_focus {
+            mlst.select(Some(app.cursor().min(mgmt_items.len().saturating_sub(1))));
+        }
+        let mgmt_list = List::new(mgmt_items)
+            .highlight_symbol("▶ ")
+            .highlight_style(Style::default().bg(Color::Magenta))
+            .block(
+                Block::default()
+                    .title(app.mgmt_title.clone())
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if mgmt_focus {
+                        Color::Magenta
+                    } else {
+                        Color::DarkGray
+                    })),
+            );
+        f.render_stateful_widget(mgmt_list, detail_area, &mut mlst);
+    }
+
+    // Footer row 1: working indicator, download progress, last message and the
+    // port editor. Row 2 (when present) holds the context key hints.
+    let (status_area, hint_area) = if status_line {
+        let [status, hints] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(footer);
+        (Some(status), hints)
+    } else {
+        (None, footer)
+    };
+    if let Some(status_area) = status_area {
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(job) = &app.job {
+            spans.push(Span::styled(
+                format!(" {} ", spinner(job.elapsed())),
+                Style::default().fg(Color::Yellow),
+            ));
+            spans.push(Span::styled(
+                format!("{} {:.0}s ", job.label, job.elapsed().as_secs_f32()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some((done, total)) = app.progress {
+            spans.push(Span::styled(
+                format!("{} ", progress_bar(done, total, 10)),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if !app.message.is_empty() {
+            spans.push(Span::styled(
+                format!(" {} ", app.message),
+                Style::default().fg(if app.message.to_lowercase().contains("error") {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }),
+            ));
+        }
+        if let Some(Edit::Port(key)) = &app.edit {
+            spans.push(Span::styled(
+                format!(" edit {key}: {}█ ", app.input),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), status_area);
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    for (key, label) in footer_hints(app) {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {label} "),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), hint_area);
+}
+
+/// Terminal entry: non-blocking event loop. Every system operation runs on a
+/// worker thread; this loop only consumes messages, draws and reads keys, so a
+/// slow download or a 15 s MariaDB first start can never freeze the interface.
+pub fn run_tui(
+    env: &fine_ill_do_it_myself::Env,
+    _ports: fine_ill_do_it_myself::PortPlan,
+) -> Result<(), fine_ill_do_it_myself::Error> {
+    use crossterm::event::{Event, KeyEventKind};
+    use crossterm::terminal;
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+
+    // refuse to hijack a non-terminal; scripted invocations keep working
+    if unsafe { libc::isatty(1) } != 1 {
+        println!("TUI requires a tty; use: status");
+        return Ok(());
+    }
+
+    install_terminal_hooks();
+    let _ = terminal::enable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
+
+    let projects: Vec<String> = fine_ill_do_it_myself::list_projects(env);
+    let mut app = App::new(Vec::new(), projects);
+    app.editor = fine_ill_do_it_myself::editor::detect_default();
+    app.keybinds = load_keybinds(
+        &std::fs::read_to_string(env.paths.etc().join("keys.toml")).unwrap_or_default(),
+    );
+
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut term = Terminal::new(backend).ok();
+
+    let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+    start_refresh(env, &mut app, tx.clone());
+    let mut draw = true;
+    let mut last_draw = std::time::Instant::now();
+    let mut last_refresh = std::time::Instant::now();
+
+    loop {
+        // 1. Results and progress from the worker thread.
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                WorkerMsg::Progress { done, total } => app.progress = Some((done, total)),
+                WorkerMsg::Done(outcome) => {
+                    apply_outcome(&mut app, outcome);
+                    app.job = None;
+                    app.progress = None;
+                    // force the service list to refresh on the next step
+                    last_refresh = std::time::Instant::now() - REFRESH_EVERY;
+                }
+                WorkerMsg::RefreshDone(result) => {
+                    app.refreshing = false;
+                    match result {
+                        Ok(data) => apply_refresh(&mut app, data),
+                        Err(error) => app.message = error,
+                    }
+                }
+                WorkerMsg::ManagementDone { key, result } => {
+                    apply_mgmt_refresh(&mut app, key, result);
+                }
+            }
+            draw = true;
+        }
+
+        // 2. Hand the terminal to a terminal editor, then take it back.
+        if app.job.is_none() {
+            if let Some(cmd) = app.pending_terminal_editor.take() {
+                restore_terminal();
+                let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
+                let _ = crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen);
+                let _ = terminal::enable_raw_mode();
+                if let Some(t) = term.as_mut() {
+                    let _ = t.clear();
+                }
+                app.message = match status {
+                    Ok(s) if s.success() => "editor closed".into(),
+                    Ok(s) => format!("editor exited with {s}"),
+                    Err(e) => format!("editor failed: {e}"),
+                };
+                draw = true;
+            }
+        }
+
+        // 3. Periodic status refresh while the queue is empty.
+        if app.job.is_none()
+            && app.actions.is_empty()
+            && !app.refreshing
+            && last_refresh.elapsed() >= REFRESH_EVERY
+        {
+            start_refresh(env, &mut app, tx.clone());
+            last_refresh = std::time::Instant::now();
+        }
+
+        // 4. Rebuild the management panel only when its inputs changed.
+        if app.detail.is_some()
+            && app.mgmt_for != Some(app.mgmt_key())
+            && app.mgmt_pending.is_none()
+        {
+            start_mgmt_refresh(env, &mut app, tx.clone());
+        }
+
+        // 5. Dispatch the next queued action (FIFO, one job at a time).
+        if app.job.is_none() {
+            if let Some(action) = take_next(&mut app.actions) {
+                start_job(env, &mut app, action, tx.clone());
+                draw = true;
+            }
+        }
+
+        // 6. Draw only when something changed (or to animate the spinner).
+        if draw || (app.job.is_some() && last_draw.elapsed() >= SPINNER_TICK) {
+            if let Some(t) = term.as_mut() {
+                let _ = t.draw(|f| {
+                    let area = f.area();
+                    render(&app, f, area);
+                });
+            }
+            last_draw = std::time::Instant::now();
+            draw = false;
+        }
+
+        // 7. Input: drain every key already queued, then wait briefly.
+        //    One key per 200 ms tick used to lag behind fast typing; a poll
+        //    error (EINTR) must sleep instead of spinning at 100% CPU.
+        let mut handled = 0;
+        loop {
+            let wait = if handled == 0 { TICK } else { Duration::ZERO };
+            let ready = match crossterm::event::poll(wait) {
+                Ok(ready) => ready,
+                Err(_) => {
+                    std::thread::sleep(TICK);
+                    false
+                }
+            };
+            if !ready {
+                break;
+            }
+            match crossterm::event::read() {
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                    handle_key(&mut app, k.code);
+                    // Moving the left cursor changes the right panel's rows;
+                    // rebuild it before the next key so Enter can never act on
+                    // a panel belonging to a different service.
+                    if app.detail.is_some() && app.mgmt_for != Some(app.mgmt_key()) {
+                        start_mgmt_refresh(env, &mut app, tx.clone());
+                    }
+                    draw = true;
+                }
+                Ok(Event::Resize(_, _)) => draw = true,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            handled += 1;
+            if handled >= 64 || app.quit {
+                break;
+            }
+        }
+
+        if app.quit || stop_requested() {
+            break;
+        }
+    }
+
+    // A cancelled job may still hold a curl child: give it a moment to die so
+    // nothing keeps downloading after the UI is gone.
+    if let Some(job) = &app.job {
+        job.cancel.cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.job.is_some() && std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(WorkerMsg::Done(outcome)) => {
+                    apply_outcome(&mut app, outcome);
+                    app.job = None;
+                }
+                Ok(WorkerMsg::Progress { .. }) => {}
+                Ok(WorkerMsg::RefreshDone(_)) | Ok(WorkerMsg::ManagementDone { .. }) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+    restore_terminal();
+    Ok(())
+}
+
+fn make_refresh(env: fine_ill_do_it_myself::Env) -> impl Fn() -> RefreshData {
+    move || {
+        let ports =
+            fine_ill_do_it_myself::PortPlan::resolve(&env.paths.etc(), |k| std::env::var(k).ok());
+        let mut statuses = fine_ill_do_it_myself::orchestrator::status_all(
+            &env,
+            &ports,
+            &fine_ill_do_it_myself::RealRunner,
+        );
+        statuses.sort_by_key(|s| is_language(&s.name));
+        let language_reps = language_representatives(&env, &statuses);
+
+        let lock = fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
+        let php_row = fine_ill_do_it_myself::orchestrator::default_php(&lock);
+
+        // Runtime versions are probed here, once per refresh, and cached for
+        // the renderer. Probing inside `render` spawned processes per frame.
+        let mut lang_versions = std::collections::BTreeMap::new();
+        for lang in ["node", "python", "go", "java"] {
+            let version = fine_ill_do_it_myself::lang::active_lang_version(&env, lang)
+                .unwrap_or_else(|| "not installed".to_string());
+            lang_versions.insert(lang.to_string(), version);
+        }
+
+        // build config rows
+        let mut rows: Vec<ConfigRow> = Vec::new();
+
+        // php versions
+        for v in fine_ill_do_it_myself::orchestrator::installed_php_versions(&env) {
+            rows.push(ConfigRow::UsePhp(v));
+        }
+
+        // web servers
+        for w in [
+            fine_ill_do_it_myself::orchestrator::CADDY,
+            fine_ill_do_it_myself::orchestrator::APACHE,
+            fine_ill_do_it_myself::orchestrator::NGINX,
+            fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+        ] {
+            let ver = fine_ill_do_it_myself::orchestrator::web_version(&env, w);
+            rows.push(ConfigRow::UseWeb {
+                name: w.to_string(),
+                ver,
+            });
+        }
+
+        // ports
+        for (key, value) in [
+            ("http", ports.http),
+            ("https", ports.https),
+            ("fpm_base", ports.fpm_base),
+            ("mariadb", ports.mariadb),
+        ] {
+            rows.push(ConfigRow::Port {
+                key: key.into(),
+                value,
+            });
+        }
+
+        RefreshData {
+            services: statuses,
+            language_reps,
+            ports,
+            php_row,
+            lang_versions,
+            config_rows: rows,
+        }
+    }
+}
+
+fn apply_refresh(app: &mut App, data: RefreshData) {
+    app.services = data.services;
+    app.language_reps = data.language_reps;
+    app.ports = data.ports;
+    app.php_row = data.php_row;
+    app.lang_versions = data.lang_versions;
+    app.config_rows = data.config_rows;
+    app.data_revision += 1;
+    app.clamp_now();
+    app.normalize_left_cursor();
+}
+
+fn start_refresh(
+    env: &fine_ill_do_it_myself::Env,
+    app: &mut App,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+) {
+    if app.refreshing {
+        return;
+    }
+    app.refreshing = true;
+    let refresh = make_refresh(env.clone());
+    let spawned = std::thread::Builder::new()
+        .name("fidim-refresh".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(refresh))
+                .map_err(|_| "refresh failed unexpectedly".to_string());
+            let _ = tx.send(WorkerMsg::RefreshDone(result));
+        });
+    if let Err(e) = spawned {
+        app.refreshing = false;
+        app.message = format!("cannot start refresh worker: {e}");
+    }
+}
+
+/// Recompute the cached management panel off the UI thread.
+fn start_mgmt_refresh(
+    env: &fine_ill_do_it_myself::Env,
+    app: &mut App,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+) {
+    if app.detail.is_none() {
+        app.mgmt_for = None;
+        app.mgmt_pending = None;
+        return;
+    }
+    let key = app.mgmt_key();
+    if app.mgmt_for == Some(key) || app.mgmt_pending.is_some() {
+        return;
+    }
+    app.mgmt_pending = Some(key);
+    let env = env.clone();
+    let services = app.services.clone();
+    let cursor_left = app.cursor_left;
+    let config_rows = app.config_rows.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fidim-management".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mgmt_panel_for(&env, &services, cursor_left, &config_rows)
+            }))
+            .map_err(|_| "management panel refresh failed unexpectedly".to_string());
+            let _ = tx.send(WorkerMsg::ManagementDone { key, result });
+        });
+    if let Err(e) = spawned {
+        app.mgmt_pending = None;
+        app.message = format!("cannot start management worker: {e}");
+    }
+}
+
+fn apply_mgmt_refresh(
+    app: &mut App,
+    key: (usize, bool, u64),
+    result: Result<(String, Vec<String>), String>,
+) {
+    if app.mgmt_pending == Some(key) {
+        app.mgmt_pending = None;
+    }
+    if app.mgmt_key() != key {
+        return;
+    }
+    match result {
+        Ok((title, lines)) => {
+            app.mgmt_title = title;
+            app.mgmt_line_count = lines.len();
+            app.mgmt_lines = lines;
+            app.mgmt_for = Some(key);
+            app.clamp_now();
+        }
+        Err(error) => {
+            app.mgmt_for = Some(key);
+            app.message = error;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3438,6 +4002,43 @@ mod tests {
     }
 
     #[test]
+    fn d_on_node_opens_node_management_not_php_versions() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mut lock = fine_ill_do_it_myself::Lock::default();
+        lock.languages.insert("node".into(), vec!["24".to_string()]);
+        lock.language_defaults
+            .insert("node".into(), "24".to_string());
+        lock.save(&env.lock_path()).unwrap();
+
+        let services = vec![
+            svc("caddy", true),
+            svc("php-8.4", false),
+            svc("node-24", false),
+        ];
+        let mut app = App::new(services.clone(), vec![]);
+        app.language_reps = language_representatives(&env, &app.services);
+        app.cursor_left = *app
+            .language_reps
+            .iter()
+            .find(|&&idx| language_family(&app.services[idx].name) == "node")
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        handle_key(&mut app, KeyCode::Char('d'));
+        let (title, _) = mgmt_panel_for(&env, &app.services, app.cursor_left, &app.config_rows);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "opening Node management blocked for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(title, " node versions (current: 24) ");
+        assert_eq!(app.detail.as_deref(), Some("detail: node-24"));
+    }
+
+    #[test]
     fn start_stop_restart_keys_ignore_language_runtimes() {
         let mut a = App::new(vec![svc("caddy", true), svc("python-3.13", true)], vec![]);
         a.cursor_left = 1;
@@ -3557,7 +4158,7 @@ mod tests {
         env.ensure_dirs().unwrap();
         let app = App::new(vec![], vec!["blog".into()]);
 
-        let (_, lines) = mgmt_panel(&env, &app);
+        let (_, lines) = mgmt_panel_for(&env, &app.services, app.cursor_left, &app.config_rows);
 
         assert!(
             lines.iter().any(|l| l.contains("composer.install")),
@@ -3573,7 +4174,7 @@ mod tests {
         std::fs::write(env.paths.bin().join("composer"), "phar").unwrap();
         let app = App::new(vec![], vec!["blog".into()]);
 
-        let (_, lines) = mgmt_panel(&env, &app);
+        let (_, lines) = mgmt_panel_for(&env, &app.services, app.cursor_left, &app.config_rows);
 
         assert!(
             lines
@@ -3749,5 +4350,353 @@ mod tests {
             "message should name the override variable, got {:?}",
             app.message
         );
+    }
+
+    // ---- worker thread, progress and cancellation --------------------------
+
+    #[test]
+    fn queued_actions_are_taken_first_in_first_out() {
+        let mut queue = vec![Action::RestartAll, Action::StopService(0)];
+
+        assert_eq!(take_next(&mut queue), Some(Action::RestartAll));
+        assert_eq!(take_next(&mut queue), Some(Action::StopService(0)));
+        assert_eq!(take_next(&mut queue), None);
+    }
+
+    #[test]
+    fn a_worker_job_creates_the_project_and_reports_back() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        let mut app = App::new(vec![], vec![]);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        start_job(
+            &env,
+            &mut app,
+            Action::CreateProject {
+                name: "landing".into(),
+                template: fine_ill_do_it_myself::project::Template::Html,
+                db: false,
+            },
+            tx,
+        );
+
+        assert!(app.job.is_some(), "the job must be visible while it runs");
+        let outcome = loop {
+            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+                WorkerMsg::Done(outcome) => break outcome,
+                WorkerMsg::Progress { .. } => {}
+                WorkerMsg::RefreshDone(_) | WorkerMsg::ManagementDone { .. } => {}
+            }
+        };
+        apply_outcome(&mut app, outcome);
+        app.job = None;
+
+        assert!(env.paths.sites().join("landing/index.html").is_file());
+        assert_eq!(app.projects, vec!["landing"]);
+        assert!(app.message.contains("created landing"), "{}", app.message);
+    }
+
+    #[test]
+    fn esc_cancels_a_running_job_instead_of_quitting() {
+        let mut a = App::new(vec![], vec![]);
+        a.job = Some(Job::new("downloading composer"));
+
+        a.on_key(KeyCode::Esc);
+
+        let job = a.job.as_ref().expect("the job must still be tracked");
+        assert!(job.cancel.is_cancelled(), "Esc must ask the worker to stop");
+        assert!(!a.quit, "Esc must not quit while work is running");
+        assert!(a.message.contains("cancelling"), "{}", a.message);
+    }
+
+    #[test]
+    fn footer_hints_offer_cancel_while_a_job_runs() {
+        let mut a = App::new(vec![], vec![]);
+        a.job = Some(Job::new("starting caddy"));
+
+        let hints = footer_hints(&a);
+
+        assert!(
+            hints
+                .iter()
+                .any(|(key, label)| key == "esc" && *label == "cancel"),
+            "{hints:?}"
+        );
+        assert!(
+            hints.iter().any(|(key, _)| key == "q"),
+            "quit must stay reachable: {hints:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_advances_with_time() {
+        assert_eq!(spinner(Duration::from_millis(0)), "⠋");
+        assert_eq!(spinner(Duration::from_millis(250)), "⠙");
+        assert_eq!(spinner(Duration::from_millis(1000)), "⠋");
+    }
+
+    #[test]
+    fn applying_a_detail_outcome_opens_the_cached_panel() {
+        let mut app = App::new(vec![svc("caddy", true)], vec![]);
+
+        apply_outcome(
+            &mut app,
+            Outcome {
+                message: "ok".into(),
+                detail: Some("Service: caddy".into()),
+                created_project: None,
+                terminal_editor: None,
+            },
+        );
+
+        assert_eq!(app.detail.as_deref(), Some("Service: caddy"));
+        assert!(app.panel_right, "the detail panel must take focus");
+        assert_eq!(app.cursor_right, 0);
+    }
+
+    // ---- renderer ---------------------------------------------------------
+
+    #[test]
+    fn render_shows_services_progress_and_cancel_hint() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(
+            vec![svc("caddy", true), svc("php-8.4", false)],
+            vec!["blog".into()],
+        );
+        app.php_row = "8.4".into();
+        app.lang_versions.insert("node".into(), "24".into());
+        app.job = Some(Job::new("downloading composer"));
+        app.progress = Some((50, 100));
+        app.message = "working".into();
+        let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        term.draw(|f| {
+            let area = f.area();
+            render(&app, f, area);
+        })
+        .unwrap();
+
+        let text = rendered_text(term.backend().buffer());
+        for needle in [
+            "caddy",
+            "php",
+            "blog",
+            "downloading composer",
+            "50%",
+            "cancel",
+            "working",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn render_uses_the_cached_management_panel() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(vec![svc("caddy", true)], vec![]);
+        app.detail = Some("detail: caddy".into());
+        app.panel_right = true;
+        app.mgmt_title = " caddy management ".into();
+        app.mgmt_lines = vec![
+            "web.use caddy".to_string(),
+            "  port http = 8080".to_string(),
+        ];
+        app.mgmt_line_count = 2;
+        app.mgmt_for = Some(app.mgmt_key());
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        term.draw(|f| {
+            let area = f.area();
+            render(&app, f, area);
+        })
+        .unwrap();
+
+        let text = rendered_text(term.backend().buffer());
+        assert!(text.contains("caddy management"), "{text}");
+        assert!(text.contains("port http = 8080"), "{text}");
+    }
+
+    #[test]
+    fn render_survives_a_tiny_terminal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = App::new(vec![svc("caddy", true)], vec!["blog".into()]);
+        let mut term = Terminal::new(TestBackend::new(16, 5)).unwrap();
+
+        term.draw(|f| {
+            let area = f.area();
+            render(&app, f, area);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn language_panel_header_tracks_the_selected_runtime() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(vec![svc("php-8.4", false), svc("node-24", false)], vec![]);
+        app.cursor_left = 1;
+        app.php_row = "8.4".into();
+        app.lang_versions.insert("node".into(), "24.1.0".into());
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        term.draw(|f| render(&app, f, f.area())).unwrap();
+
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("programming languages (node: 24.1.0)"),
+            "header should identify selected Node runtime:\n{text}"
+        );
+    }
+
+    #[test]
+    fn refresh_caches_ports_runtimes_and_the_management_panel() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mut app = App::new(vec![svc("caddy", true)], vec![]);
+        app.detail = Some("detail: caddy".into());
+        app.panel_right = true;
+
+        let refresh = make_refresh(env.clone());
+        apply_refresh(&mut app, refresh());
+        let mgmt_key = app.mgmt_key();
+        let mgmt = mgmt_panel_for(&env, &app.services, app.cursor_left, &app.config_rows);
+        apply_mgmt_refresh(&mut app, mgmt_key, Ok(mgmt));
+
+        assert!(!app.php_row.is_empty(), "the php row must be resolved once");
+        assert_eq!(app.ports.caddy_http, 8080, "ports are cached for render");
+        assert!(
+            app.lang_versions.contains_key("node"),
+            "runtime versions must be cached: {:?}",
+            app.lang_versions
+        );
+        assert!(
+            !app.mgmt_lines.is_empty(),
+            "refresh must build the management panel"
+        );
+        assert_eq!(app.mgmt_for, Some(app.mgmt_key()));
+    }
+
+    #[test]
+    fn initial_refresh_does_not_block_on_a_slow_version_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let caddy_dir = env.paths.bin().join("caddy");
+        std::fs::create_dir_all(&caddy_dir).unwrap();
+        let caddy = caddy_dir.join("caddy");
+        std::fs::write(&caddy, "#!/bin/sh\nsleep 1\necho 'v2.0.0'\n").unwrap();
+        std::fs::set_permissions(&caddy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(vec![], vec![]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        start_refresh(&env, &mut app, tx);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "initial refresh blocked the UI for {:?}",
+            started.elapsed()
+        );
+        assert!(app.refreshing, "refresh should be in progress");
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        assert!(
+            matches!(result, Ok(WorkerMsg::RefreshDone(Ok(_)))),
+            "refresh worker did not return successfully"
+        );
+    }
+
+    #[test]
+    fn management_refresh_does_not_block_on_a_slow_version_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let caddy_dir = env.paths.bin().join("caddy");
+        std::fs::create_dir_all(&caddy_dir).unwrap();
+        let caddy = caddy_dir.join("caddy");
+        std::fs::write(&caddy, "#!/bin/sh\nsleep 1\necho 'v2.0.0'\n").unwrap();
+        std::fs::set_permissions(&caddy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(vec![svc("caddy", true)], vec![]);
+        app.detail = Some("detail: caddy".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        start_mgmt_refresh(&env, &mut app, tx);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "management refresh blocked the UI for {:?}",
+            started.elapsed()
+        );
+        assert!(app.mgmt_pending.is_some());
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        assert!(
+            matches!(result, Ok(WorkerMsg::ManagementDone { .. })),
+            "management worker did not return its result"
+        );
+    }
+
+    #[test]
+    fn handle_key_commits_the_typed_port_from_the_cached_lines() {
+        let mut a = App::new(vec![svc("nginx", false)], vec![]);
+        a.detail = Some("detail: nginx".into());
+        a.panel_right = true;
+        a.mgmt_lines = vec![
+            "web.use nginx".to_string(),
+            "  version 1.2".to_string(),
+            "  port http = 8082".to_string(),
+            "  port https = 8445".to_string(),
+        ];
+        a.mgmt_line_count = 4;
+        a.cursor_right = 2;
+        a.mgmt_for = Some(a.mgmt_key());
+
+        handle_key(&mut a, KeyCode::Enter);
+        assert_eq!(a.input, "8082", "the editor prefills the cached value");
+        for c in ['9', '0', '9', '0'] {
+            handle_key(&mut a, KeyCode::Char(c));
+        }
+        handle_key(&mut a, KeyCode::Enter);
+
+        assert!(
+            a.actions.contains(&Action::SetPort {
+                key: "nginx_http".into(),
+                value: 9090,
+            }),
+            "Enter must commit the typed value, got {:?}",
+            a.actions
+        );
+    }
+
+    #[test]
+    fn enter_does_not_use_a_stale_management_panel() {
+        let mut app = App::new(vec![svc("nginx", false)], vec![]);
+        app.detail = Some("detail: nginx".into());
+        app.panel_right = true;
+        app.mgmt_lines = vec!["  port http = 8082".to_string()];
+
+        handle_key(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.edit.is_none(),
+            "stale panel must not open the port editor"
+        );
+        assert!(
+            app.actions.is_empty(),
+            "stale panel must not queue an action"
+        );
+        assert!(app.message.contains("loading"));
     }
 }

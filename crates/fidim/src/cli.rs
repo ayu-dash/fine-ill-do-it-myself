@@ -127,7 +127,7 @@ pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
     cli.env.ensure_dirs()?;
     let manifest = load_or_default_manifest(cli)?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
-    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::default();
     let out =
         fine_ill_do_it_myself::installer::install(&cli.env, &manifest, &mut lock, name, &fetcher)?;
     if name == fine_ill_do_it_myself::phpmyadmin::SITE {
@@ -560,9 +560,21 @@ pub fn create_project(
     template: fine_ill_do_it_myself::project::Template,
     with_db: bool,
 ) -> Result<CreatedProject> {
-    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher;
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::default();
+    create_project_with_fetcher(cli, name, template, with_db, &fetcher)
+}
+
+/// [`create_project`] with a caller-supplied fetcher, so the TUI can report
+/// download progress and cancel a slow transfer.
+pub fn create_project_with_fetcher<F: fine_ill_do_it_myself::installer::Fetcher>(
+    cli: &CliEnv,
+    name: &str,
+    template: fine_ill_do_it_myself::project::Template,
+    with_db: bool,
+    fetcher: &F,
+) -> Result<CreatedProject> {
     let runner = fine_ill_do_it_myself::proc::RealCommandRunner;
-    let made = create_project_with(cli, name, template, with_db, &fetcher, &runner)?;
+    let made = create_project_with(cli, name, template, with_db, fetcher, &runner)?;
     restart_web_if_running(cli)?;
     Ok(made)
 }
