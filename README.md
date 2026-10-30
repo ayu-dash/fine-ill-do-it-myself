@@ -26,6 +26,22 @@ with real HTTPS.
 
 ## Install
 
+Download the Linux `.run` installer from GitHub Releases and run it as your
+normal user. It installs the executable under
+`~/.local/share/fine-ill-do-it-myself/` and creates
+`~/.local/bin/fidim`; it does not require `sudo`.
+
+```sh
+chmod +x fine-ill-do-it-myself-<version>-x86_64-linux.run
+./fine-ill-do-it-myself-<version>-x86_64-linux.run
+```
+
+The installer asks before replacing an existing `~/.local/bin/fidim`; pass
+`--yes` to replace it without prompting. Ensure `~/.local/bin` is on `PATH`.
+To build a `.run` installer locally after a release build, use
+`scripts/build-run-installer.sh`. The portable tarball and `cargo install`
+remain available as alternatives.
+
 ```sh
 cargo build --release
 cargo install --path crates/fidim
