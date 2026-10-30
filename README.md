@@ -44,9 +44,12 @@ remain available as alternatives.
 
 To uninstall, run
 `~/.local/share/fine-ill-do-it-myself/uninstall.sh`. It removes the managed
-`fidim` executable and its matching `~/.local/bin/fidim` symlink, while keeping
-projects, downloaded runtimes, configuration, and logs. If you installed with
-custom directories, pass the same `--data-dir DIR` and `--bin-dir DIR` options.
+`fidim` executable, its matching command symlink, and generated command shims
+from `fidim env --install`, while keeping projects, downloaded runtimes,
+configuration, and logs. Shims are removed only when they have fidim's
+generated-file marker; unrelated commands are kept. Pass `--shim-dir DIR` if
+you installed shims in a custom directory. If you installed fidim with custom
+directories, pass the same `--data-dir DIR` and `--bin-dir DIR` options.
 
 ```sh
 cargo build --release
