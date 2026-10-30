@@ -28,7 +28,9 @@ trap 'exit 1' HUP INT TERM
 
 mkdir "$work_dir/payload"
 cp "$binary" "$work_dir/payload/fidim"
-tar -czf "$work_dir/payload.tar.gz" -C "$work_dir/payload" fidim
+cp "$repo_root/scripts/uninstall-fidim.sh" "$work_dir/payload/uninstall.sh"
+chmod 755 "$work_dir/payload/uninstall.sh"
+tar -czf "$work_dir/payload.tar.gz" -C "$work_dir/payload" fidim uninstall.sh
 
 cat > "$temporary_output" <<'INSTALLER'
 #!/bin/sh
@@ -135,13 +137,21 @@ if [ ! -f "$work_dir/fidim" ]; then
     printf 'error: installer payload does not contain fidim\n' >&2
     exit 1
 fi
+if [ ! -f "$work_dir/uninstall.sh" ]; then
+    printf 'error: installer payload does not contain uninstall.sh\n' >&2
+    exit 1
+fi
 
 mkdir -p "$data_root" "$bin_dir"
 staged_binary=$data_root/.fidim.new.$$
+staged_uninstaller=$data_root/.uninstall.new.$$
 staged_link=$bin_dir/.fidim.link.$$
 cp "$work_dir/fidim" "$staged_binary"
 chmod 755 "$staged_binary"
 mv -f "$staged_binary" "$data_root/fidim"
+cp "$work_dir/uninstall.sh" "$staged_uninstaller"
+chmod 755 "$staged_uninstaller"
+mv -f "$staged_uninstaller" "$data_root/uninstall.sh"
 rm -f -- "$link_path"
 ln -s "$data_root/fidim" "$staged_link"
 mv -f "$staged_link" "$link_path"

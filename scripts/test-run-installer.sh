@@ -37,6 +37,7 @@ HOME=$home "$installer" --yes --data-dir "$home/.local/share/fine-ill-do-it-myse
 test "$("$home/.local/bin/fidim" --version)" = "fidim 1.0"
 test -x "$home/.local/share/fine-ill-do-it-myself/fidim"
 test "$(readlink "$home/.local/bin/fidim")" = "$home/.local/share/fine-ill-do-it-myself/fidim"
+test -x "$home/.local/share/fine-ill-do-it-myself/uninstall.sh"
 
 make_fake_fidim 2.0 "$fake_binary"
 "$repo_root/scripts/build-run-installer.sh" "$fake_binary" "$installer"
@@ -49,22 +50,36 @@ test "$("$home/.local/bin/fidim" --version)" = "fidim 1.0"
 HOME=$home "$installer" --yes --data-dir "$home/.local/share/fine-ill-do-it-myself" --bin-dir "$home/.local/bin"
 test "$("$home/.local/bin/fidim" --version)" = "fidim 2.0"
 
+data_root=$home/.local/share/fine-ill-do-it-myself
+mkdir -p "$data_root/projects/sample" "$data_root/runtimes/php"
+printf 'keep project data\n' > "$data_root/projects/sample/index.php"
+printf 'keep runtime data\n' > "$data_root/runtimes/php/version"
+"$data_root/uninstall.sh" --data-dir "$data_root" --bin-dir "$home/.local/bin"
+test ! -e "$home/.local/bin/fidim"
+test ! -e "$data_root/fidim"
+test ! -e "$data_root/uninstall.sh"
+test -f "$data_root/projects/sample/index.php"
+test -f "$data_root/runtimes/php/version"
+
+make_fake_fidim 3.0 "$fake_binary"
+"$repo_root/scripts/build-run-installer.sh" "$fake_binary" "$installer"
+HOME=$home "$installer" --yes --data-dir "$data_root" --bin-dir "$home/.local/bin"
 mkdir "$test_root/link-target"
 rm -f "$home/.local/bin/fidim"
 ln -s "$test_root/link-target" "$home/.local/bin/fidim"
-HOME=$home "$installer" --yes --data-dir "$home/.local/share/fine-ill-do-it-myself" --bin-dir "$home/.local/bin"
-test "$(readlink "$home/.local/bin/fidim")" = "$home/.local/share/fine-ill-do-it-myself/fidim"
+"$data_root/uninstall.sh" --data-dir "$data_root" --bin-dir "$home/.local/bin"
+test "$(readlink "$home/.local/bin/fidim")" = "$test_root/link-target"
 test -z "$(find "$test_root/link-target" -mindepth 1 -print -quit)"
 
 default_home=$test_root/default-home
 mkdir -p "$default_home"
 HOME=$default_home "$installer" --yes
-test "$("$default_home/.local/bin/fidim" --version)" = "fidim 2.0"
+test "$("$default_home/.local/bin/fidim" --version)" = "fidim 3.0"
 test -x "$default_home/.local/share/fine-ill-do-it-myself/fidim"
 
 xdg_home=$test_root/xdg-home
 mkdir -p "$xdg_home"
 HOME=$xdg_home XDG_DATA_HOME=$test_root/xdg-data "$installer" --yes
-test "$("$xdg_home/.local/bin/fidim" --version)" = "fidim 2.0"
+test "$("$xdg_home/.local/bin/fidim" --version)" = "fidim 3.0"
 test -x "$test_root/xdg-data/fine-ill-do-it-myself/fidim"
 printf 'Installer tests passed.\n'

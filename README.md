@@ -42,6 +42,12 @@ To build a `.run` installer locally after a release build, use
 `scripts/build-run-installer.sh`. The portable tarball and `cargo install`
 remain available as alternatives.
 
+To uninstall, run
+`~/.local/share/fine-ill-do-it-myself/uninstall.sh`. It removes the managed
+`fidim` executable and its matching `~/.local/bin/fidim` symlink, while keeping
+projects, downloaded runtimes, configuration, and logs. If you installed with
+custom directories, pass the same `--data-dir DIR` and `--bin-dir DIR` options.
+
 ```sh
 cargo build --release
 cargo install --path crates/fidim
