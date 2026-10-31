@@ -811,17 +811,11 @@ pub fn status_all<R: Runner + Clone>(
         ports: ports.clone(),
         runner: runner.clone(),
     };
-    let web = web_server(env);
     let mut names = sup.known_services();
-    names.retain(|name| {
-        ![CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str())
-            || name == &web
-            || web_bin_path(env, name).exists()
-            || sup.status(name).state == crate::service::ServiceState::Running
-    });
-    // show every installed web server, plus the chosen one, php and mariadb
+    // Keep every supported web server visible, including those not installed,
+    // so the TUI can expose their install/use actions.
     for w in [CADDY, APACHE, NGINX, LIGHTTPD] {
-        if web_bin_path(env, w).exists() && !names.iter().any(|n| n == w) {
+        if !names.iter().any(|n| n == w) {
             names.push(w.to_string());
         }
     }
@@ -832,6 +826,7 @@ pub fn status_all<R: Runner + Clone>(
         }
     }
     let lock = Lock::load(&env.lock_path()).unwrap_or_default();
+    let web = web_server(env);
     let php = format!("php-{}", default_php(&lock));
     for n in [web.as_str(), php.as_str(), MARIADB] {
         if !names.iter().any(|e| e == n) {
@@ -1300,6 +1295,7 @@ mod tests {
         let st = status_all(&env, &PortPlan::default(), &f);
         assert!(st
             .iter()
+            .filter(|s| { [CADDY, APACHE, NGINX, LIGHTTPD].contains(&s.name.as_str()) })
             .all(|s| s.state == crate::service::ServiceState::Stopped));
     }
 
@@ -1347,8 +1343,8 @@ mod tests {
     }
 
     #[test]
-    fn status_all_shows_chosen_web_only() {
-        // apache binary is absent in the temp env, yet the chosen one is listed
+    fn status_all_shows_every_supported_web_server() {
+        // Apache is absent in the temp env, but all choices remain listed.
         let (env, _t) = env();
         let lock = Lock {
             web_default: Some(APACHE.into()),
@@ -1358,27 +1354,26 @@ mod tests {
         let f = FakeRunner::default();
         let st = status_all(&env, &PortPlan::default(), &f);
         let names: Vec<_> = st.iter().map(|s| s.name.as_str().to_string()).collect();
-        assert!(
-            names.contains(&"httpd".to_string()),
-            "chosen apache shows as httpd"
-        );
-        assert!(
-            !names.contains(&"caddy".to_string()),
-            "caddy hidden when not chosen"
-        );
+        for web in [CADDY, APACHE, NGINX, LIGHTTPD] {
+            assert!(
+                names.iter().any(|name| name == web),
+                "{web} should be listed"
+            );
+        }
     }
 
     #[test]
-    fn status_all_hides_uninstalled_web_server_with_stale_pid_file() {
+    fn status_all_shows_uninstalled_web_server_with_stale_pid_file() {
         let (env, _t) = env();
         env.ensure_dirs().unwrap();
         std::fs::write(env.paths.pids().join("nginx.pid"), "999").unwrap();
 
         let statuses = status_all(&env, &PortPlan::default(), &FakeRunner::default());
+        let nginx = statuses.iter().find(|status| status.name == NGINX);
 
         assert!(
-            !statuses.iter().any(|status| status.name == NGINX),
-            "an uninstalled web server with a stale pid file must not appear"
+            nginx.is_some(),
+            "an uninstalled web server must still appear in the list"
         );
     }
 
