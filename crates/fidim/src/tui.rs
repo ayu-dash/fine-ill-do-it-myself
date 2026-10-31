@@ -7,11 +7,11 @@ pub enum Action {
     /// Restart every service (stop_all + start_all).
     RestartAll,
     /// Start the service under the cursor.
-    StartService(usize),
+    StartService(String),
     /// Stop the service under the cursor.
-    StopService(usize),
+    StopService(String),
     /// Restart the service under the cursor.
-    RestartService(usize),
+    RestartService(String),
     /// Switch the default PHP version.
     UsePhp(String),
     /// Switch the chosen web server.
@@ -631,12 +631,13 @@ impl App {
                 // services: toggle under cursor (start when stopped, stop when running)
                 "services" => {
                     let i = self.cursor();
+                    let name = self.services[i].name.clone();
                     if self.services[i].state == ServiceState::Running {
                         self.message = "stop requested".into();
-                        self.actions.push(Action::StopService(i));
+                        self.actions.push(Action::StopService(name));
                     } else {
                         self.message = "start requested".into();
-                        self.actions.push(Action::StartService(i));
+                        self.actions.push(Action::StartService(name));
                     }
                 }
                 // Language rows open their version list; Enter never toggles a runtime.
@@ -675,16 +676,22 @@ impl App {
             }
             _ if cursor_is_service_row(self, key, self.keybinds.start) => {
                 self.message = "start requested".into();
-                self.actions.push(Action::StartService(self.cursor()));
+                self.actions.push(Action::StartService(
+                    self.services[self.cursor()].name.clone(),
+                ));
             }
             _ if cursor_is_service_row(self, key, self.keybinds.stop) => {
                 self.message = "stop requested".into();
-                self.actions.push(Action::StopService(self.cursor()));
+                self.actions.push(Action::StopService(
+                    self.services[self.cursor()].name.clone(),
+                ));
             }
             _ if key == self.keybinds.restart => {
                 if !self.panel_right && self.cursor() < self.services.len() {
                     self.message = "service restart requested".into();
-                    self.actions.push(Action::RestartService(self.cursor()));
+                    self.actions.push(Action::RestartService(
+                        self.services[self.cursor()].name.clone(),
+                    ));
                 } else {
                     self.message = "stop+start all requested".into();
                     self.actions.push(Action::RestartAll);
@@ -1784,22 +1791,15 @@ struct Outcome {
 /// Read-only view of the app that the worker needs. Captured before spawning so
 /// the worker never touches UI state.
 struct ActionContext {
-    services: Vec<String>,
     editor: Option<fine_ill_do_it_myself::editor::Editor>,
 }
 
-fn action_label(action: &Action, ctx: &ActionContext) -> String {
-    let svc = |i: usize| {
-        ctx.services
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("#{i}"))
-    };
+fn action_label(action: &Action) -> String {
     match action {
         Action::RestartAll => "restarting everything".into(),
-        Action::StartService(i) => format!("starting {}", svc(*i)),
-        Action::StopService(i) => format!("stopping {}", svc(*i)),
-        Action::RestartService(i) => format!("restarting {}", svc(*i)),
+        Action::StartService(name) => format!("starting {name}"),
+        Action::StopService(name) => format!("stopping {name}"),
+        Action::RestartService(name) => format!("restarting {name}"),
         Action::UsePhp(v) => format!("switching php to {v}"),
         Action::UseWeb(n) => format!("switching web server to {n}"),
         Action::SetPort { key, value } => format!("setting {key} = {value}"),
@@ -1827,10 +1827,9 @@ fn start_job(
     tx: std::sync::mpsc::Sender<WorkerMsg>,
 ) {
     let ctx = ActionContext {
-        services: app.services.iter().map(|s| s.name.clone()).collect(),
         editor: app.editor.clone(),
     };
-    let job = Job::new(action_label(&action, &ctx));
+    let job = Job::new(action_label(&action));
     let cancel = job.cancel.clone();
     let label = job.label.clone();
     app.job = Some(job);
@@ -1964,30 +1963,15 @@ where
         Action::RestartAll => fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, runner)
             .and_then(|_| fine_ill_do_it_myself::orchestrator::start_all(env, &ports, runner, &php))
             .map(|_| ()),
-        Action::StartService(i) => match ctx.services.get(*i) {
-            Some(name) => {
-                fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
-                    .map(|_| ())
-            }
-            None => Err(fine_ill_do_it_myself::Error::Other(format!(
-                "service row {i} no longer exists"
-            ))),
-        },
-        Action::StopService(i) => match ctx.services.get(*i) {
-            Some(name) => stop_named(env, &ports, runner, name),
-            None => Err(fine_ill_do_it_myself::Error::Other(format!(
-                "service row {i} no longer exists"
-            ))),
-        },
-        Action::RestartService(i) => match ctx.services.get(*i) {
-            Some(name) => stop_named(env, &ports, runner, name).and_then(|_| {
-                fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
-                    .map(|_| ())
-            }),
-            None => Err(fine_ill_do_it_myself::Error::Other(format!(
-                "service row {i} no longer exists"
-            ))),
-        },
+        Action::StartService(name) => {
+            fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
+                .map(|_| ())
+        }
+        Action::StopService(name) => stop_named(env, &ports, runner, name),
+        Action::RestartService(name) => stop_named(env, &ports, runner, name).and_then(|_| {
+            fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
+                .map(|_| ())
+        }),
         Action::UsePhp(v) => {
             let cli_env = crate::cli::CliEnv {
                 env: env.clone(),
@@ -2257,7 +2241,6 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
     action: &Action,
 ) {
     let ctx = ActionContext {
-        services: app.services.iter().map(|s| s.name.clone()).collect(),
         editor: app.editor.clone(),
     };
     let outcome = execute_action(
@@ -3200,14 +3183,14 @@ mod tests {
             vec!["blog".into()],
         );
         a.on_key(KeyCode::Char('s'));
-        assert_eq!(a.actions[0], Action::StartService(0));
+        assert_eq!(a.actions[0], Action::StartService("caddy".into()));
         a.actions.clear();
         a.on_key(KeyCode::Tab); // services -> languages (php-8.4)
         a.on_key(KeyCode::Char('x'));
-        assert_eq!(a.actions[0], Action::StopService(1));
+        assert_eq!(a.actions[0], Action::StopService("php-8.4".into()));
         a.actions.clear();
         a.on_key(KeyCode::Char('r'));
-        assert_eq!(a.actions[0], Action::RestartService(1));
+        assert_eq!(a.actions[0], Action::RestartService("php-8.4".into()));
         // on the projects container `r` restarts everything
         a.actions.clear();
         a.on_key(KeyCode::Tab); // languages -> projects
@@ -3816,7 +3799,7 @@ mod tests {
                 value: 8290,
             },
         );
-        act(&mut app, &Action::RestartService(0));
+        act(&mut app, &Action::RestartService("nginx".into()));
         let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/blog.conf")).unwrap();
         assert!(
             site.contains("listen 8290;"),
@@ -4460,7 +4443,25 @@ url = "https://example.test/nginx.tar.gz"
         let mut a = App::new(vec![svc("caddy", false)], vec![]);
         a.on_key(KeyCode::Enter);
 
-        assert_eq!(a.actions, vec![Action::StartService(0)]);
+        assert_eq!(a.actions, vec![Action::StartService("caddy".into())]);
+    }
+
+    #[test]
+    fn queued_service_start_keeps_the_selected_name_when_status_order_changes() {
+        let mut app = App::new(
+            vec![
+                svc("caddy", false),
+                svc("httpd", false),
+                svc("nginx", false),
+            ],
+            vec![],
+        );
+        app.cursor_left = 1;
+        app.on_key(KeyCode::Enter);
+        let action = app.actions.pop().expect("Enter must queue a start");
+
+        app.services.swap(0, 1);
+        assert_eq!(action_label(&action), "starting httpd");
     }
 
     #[test]
@@ -4847,10 +4848,13 @@ url = "https://example.test/nginx.tar.gz"
 
     #[test]
     fn queued_actions_are_taken_first_in_first_out() {
-        let mut queue = vec![Action::RestartAll, Action::StopService(0)];
+        let mut queue = vec![Action::RestartAll, Action::StopService("caddy".into())];
 
         assert_eq!(take_next(&mut queue), Some(Action::RestartAll));
-        assert_eq!(take_next(&mut queue), Some(Action::StopService(0)));
+        assert_eq!(
+            take_next(&mut queue),
+            Some(Action::StopService("caddy".into()))
+        );
         assert_eq!(take_next(&mut queue), None);
     }
 
