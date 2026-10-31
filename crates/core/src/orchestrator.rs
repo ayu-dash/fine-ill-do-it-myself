@@ -536,7 +536,7 @@ pub fn web_version(env: &Env, web: &str) -> Option<String> {
         }
     };
     let out = match web {
-        NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
+        APACHE | NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
         _ => std::process::Command::new(&bin)
             .arg("--version")
             .output()
@@ -1149,6 +1149,24 @@ mod tests {
         let got = crate::orchestrator::web_version(&env, CADDY);
 
         assert_eq!(got.as_deref(), Some("2.10.2"));
+    }
+
+    #[test]
+    fn web_version_parses_apache_version_from_dash_v() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let bin = env.paths.bin().join("httpd/httpd");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = \"-v\" ]; then echo 'Server version: Apache/2.4.67'; else exit 1; fi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let got = crate::orchestrator::web_version(&env, APACHE);
+
+        assert_eq!(got.as_deref(), Some("2.4.67"));
     }
 
     #[test]

@@ -1173,17 +1173,33 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
 }
 
 fn web_install_rows(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
-    if fine_ill_do_it_myself::orchestrator::web_bin_path(env, server).exists() {
+    if fine_ill_do_it_myself::orchestrator::web_bin_path(env, server).is_file() {
         return Vec::new();
     }
 
-    let manifest =
-        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
-            .expect("bundled installer manifest must be valid");
+    let manifest = effective_manifest(env);
     manifest
         .find(server)
         .map(|source| vec![format!("  {server}.install {}", source.version)])
         .unwrap_or_default()
+}
+
+fn effective_manifest(env: &fine_ill_do_it_myself::Env) -> fine_ill_do_it_myself::Manifest {
+    let defaults =
+        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+            .expect("bundled installer manifest must be valid");
+    let mut manifest =
+        fine_ill_do_it_myself::Manifest::load(&env.manifest_path()).unwrap_or_default();
+    for source in defaults.binaries {
+        if !manifest
+            .binaries
+            .iter()
+            .any(|existing| existing.name == source.name)
+        {
+            manifest.binaries.push(source);
+        }
+    }
+    manifest
 }
 
 /// Discovered alternate versions of a web server in `bin/` or `bin/<server>/` (e.g. caddy-2.9.1).
@@ -1343,6 +1359,14 @@ fn mgmt_panel_for(
             ConfigRow::Port { key, value } => format!("  port {key} = {value}"),
         })
         .collect();
+    for server in [
+        fine_ill_do_it_myself::orchestrator::CADDY,
+        fine_ill_do_it_myself::orchestrator::APACHE,
+        fine_ill_do_it_myself::orchestrator::NGINX,
+        fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+    ] {
+        lines.extend(web_install_rows(env, server));
+    }
     lines.push(composer_row(env));
     lines.extend(php_install_rows(env));
     for lang in ["node", "python", "go", "java"] {
@@ -3390,6 +3414,30 @@ mod tests {
     }
 
     #[test]
+    fn rendered_selected_httpd_panel_contains_httpd_install_action() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mut app = App::new(vec![svc("httpd", false)], vec![]);
+        app.detail = Some("detail: httpd".into());
+        app.panel_right = true;
+        let (_, lines) = mgmt_panel_for(&env, &app.services, 0, &[]);
+        app.mgmt_lines = lines;
+        app.mgmt_title = " httpd management ".into();
+
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| render(&app, f, f.area())).unwrap();
+
+        assert!(
+            rendered_text(term.backend().buffer()).contains("httpd.install"),
+            "the rendered management panel must show httpd.install"
+        );
+    }
+
+    #[test]
     fn template_picker_options_show_all_templates_with_useful_descriptions() {
         let options = quick_create_template_options();
 
@@ -3965,6 +4013,40 @@ mod tests {
     }
 
     #[test]
+    fn web_management_panel_only_lists_selected_web_server_install_action() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("caddy", false)], 0, &[]);
+
+        assert!(
+            lines.iter().any(|line| line.contains("caddy.install")),
+            "selected server must expose its installer: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("httpd.install")),
+            "unselected server installers must not be mixed into this panel: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn web_management_panel_offers_httpd_install_when_httpd_is_selected() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("httpd", false)], 0, &[]);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("httpd.install 2.4.67")),
+            "selected httpd must expose its installer: {lines:?}"
+        );
+    }
+
+    #[test]
     fn web_management_panel_offers_apache_install_and_hides_unavailable_installers() {
         let t = tempfile::tempdir().unwrap();
         let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
@@ -3977,8 +4059,96 @@ mod tests {
         assert!(apache
             .iter()
             .any(|line| line.contains("httpd.install 2.4.67")));
-        assert!(!nginx.iter().any(|line| line.contains(".install")));
-        assert!(!lighttpd.iter().any(|line| line.contains(".install")));
+        assert!(nginx
+            .iter()
+            .any(|line| line.contains("nginx.install 1.31.6")));
+        assert!(lighttpd
+            .iter()
+            .any(|line| line.contains("lighttpd.install 1.4.83")));
+    }
+
+    #[test]
+    fn web_management_panel_uses_local_manifest_entries() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::write(
+            env.manifest_path(),
+            r#"
+[[binaries]]
+name = "nginx"
+version = "1.29.2"
+url = "https://example.test/nginx.tar.gz"
+"#,
+        )
+        .unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("nginx", false)], 0, &[]);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("nginx.install 1.29.2")));
+    }
+
+    #[test]
+    fn web_management_panel_offers_httpd_install_when_only_its_directory_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::create_dir_all(env.paths.bin().join("httpd")).unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("httpd", false)], 0, &[]);
+
+        assert!(lines.iter().any(|line| line.contains("httpd.install")));
+    }
+
+    #[test]
+    fn global_management_panel_offers_uninstalled_httpd() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(
+            &env,
+            &[],
+            0,
+            &[ConfigRow::UseWeb {
+                name: "httpd".into(),
+                ver: None,
+            }],
+        );
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("httpd.install 2.4.67")));
+    }
+
+    #[test]
+    fn global_management_panel_offers_httpd_when_runtime_directory_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::create_dir_all(env.paths.bin().join("httpd")).unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[], 0, &[]);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("httpd.install 2.4.67")));
+    }
+
+    #[test]
+    fn bundled_manifest_includes_nginx_and_lighttpd_install_sources() {
+        let manifest =
+            fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+                .unwrap();
+
+        for server in ["nginx", "lighttpd"] {
+            assert!(
+                manifest.find(server).is_some(),
+                "missing bundled source for {server}"
+            );
+        }
     }
 
     #[test]

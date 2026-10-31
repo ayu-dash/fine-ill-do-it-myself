@@ -16,6 +16,22 @@ sha256 = "5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd"
 tar_gz = true
 files = ["caddy"]
 
+[[binaries]]
+name = "nginx"
+version = "1.31.6"
+url = "https://jirutka.github.io/nginx-binaries/nginx-1.31.6-x86_64-linux"
+sha256 = "ed87d0f5752c83b3178f5dc3c2b75aaef74ff03c1898078af9d72a5e537c4db3"
+tar_gz = false
+files = []
+
+[[binaries]]
+name = "lighttpd"
+version = "1.4.83"
+url = "https://download.lighttpd.net/lighttpd/releases-1.4.x/lighttpd-1.4.83.tar.gz"
+sha256 = "54f9598f6c07df0e9607c74bf6d2f6a45b0f420bcb0590bc5a01c5a6e3355f1a"
+tar_gz = true
+files = ["lighttpd"]
+
 # ─── MariaDB (portable Linux x86_64 binary tarball) ──────────────────────────
 [[binaries]]
 name = "mariadb"
