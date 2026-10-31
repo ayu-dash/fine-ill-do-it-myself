@@ -1,7 +1,8 @@
 # Default download manifest for fidim.
-# Update versions here without touching code. sha256 left empty = recorded on
-# first install into lock.toml and verified on later (re)installs.
+# Update versions here without touching code. Every entry pins a sha256; an
+# artifact that does not match is rejected before anything is extracted.
 #
+# debs: assemble the runtime from these pinned Debian packages instead of a url
 # install_dir: extract tarball into <data_root>/runtimes/<install_dir>/
 # strip_components: strip N leading path components (1 for version-prefixed tarballs)
 # files: which binaries to symlink from the runtime dir into bin/<lang>/
@@ -42,6 +43,33 @@ install_dir = "phpmyadmin/5.2.3"
 strip_components = 1
 files = []
 
+# ─── Apache httpd (assembled from pinned Debian bookworm packages) ───────────
+# Apache has no portable Linux binary and fidim's config loads modules/ from
+# the server root, so the runtime tree (libexec/httpd, lib/, modules/) is built
+# from these packages. glibc 2.36+ (Debian 12+, Ubuntu 24.04+).
+[[binaries]]
+name = "httpd"
+version = "2.4.67"
+url = ""
+sha256 = ""
+debs = [
+  { url = "https://security.debian.org/debian-security/pool/updates/main/a/apache2/apache2-bin_2.4.67-1~deb12u3_amd64.deb", sha256 = "e5035727e9aeefe550787c53d854af7960047193eb7f92f3f0430a6175539478" },
+  { url = "https://deb.debian.org/debian/pool/main/a/apr/libapr1_1.7.2-3+deb12u1_amd64.deb", sha256 = "4d4c2cbf2cd9652063b8a72fb8a5e434d4cde097454157e4428f036136a4be3e" },
+  { url = "https://security.debian.org/debian-security/pool/updates/main/a/apr-util/libaprutil1_1.6.3-1+deb12u1_amd64.deb", sha256 = "7415e4ca945533d855e7eb4b0b6c93b89a0edd88a32a55aca98dca86312a2e40" },
+  { url = "https://security.debian.org/debian-security/pool/updates/main/p/pcre2/libpcre2-8-0_10.42-1+deb12u2_amd64.deb", sha256 = "d2f7edfcc7689b9e0761c2742cc824ac86a20768bc5e8057818dc6875291fe76" },
+  { url = "https://security.debian.org/debian-security/pool/updates/main/o/openssl/libssl3_3.0.22-1~deb12u2_amd64.deb", sha256 = "cb4784740daa9b3b0eaea2b444bbefa686794afbbf3d678d238c1fd9875f2efd" },
+  { url = "https://security.debian.org/debian-security/pool/updates/main/s/systemd/libsystemd0_252.38-1~deb12u1_amd64.deb", sha256 = "a77825fd9043c5e01c65aea2f7893b30749f98501da681f861517ab255ad80e2" },
+  { url = "https://deb.debian.org/debian/pool/main/libx/libxcrypt/libcrypt1_4.4.33-2_amd64.deb", sha256 = "f5f60a5cdfd4e4eaa9438ade5078a57741a7a78d659fcb0c701204f523e8bd29" },
+  { url = "https://deb.debian.org/debian/pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_amd64.deb", sha256 = "8d684c673e7483802a5c447834b0df6fce006eb3a7109e1be412f5ad425bb24f" },
+  { url = "https://deb.debian.org/debian/pool/main/l/lz4/liblz4-1_1.9.4-1_amd64.deb", sha256 = "64cde86cef1deaf828bd60297839b59710b5cd8dc50efd4f12643caaee9389d3" },
+  { url = "https://security.debian.org/debian-security/pool/updates/main/x/xz-utils/liblzma5_5.4.1-1+deb12u2_amd64.deb", sha256 = "3d8c29c8c21ec6007635e1b2591edf98b771c9572a085968f47452b33040f384" },
+  { url = "https://deb.debian.org/debian/pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_amd64.deb", sha256 = "6315b5ac38b724a710fb96bf1042019398cb656718b1522279a5185ed39318fa" },
+  { url = "https://security.debian.org/debian-security/pool/updates/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_amd64.deb", sha256 = "e7a56552139c693904a6f9712234c05fe918353273a7cbdb5e62f423ad71bb97" },
+  { url = "https://deb.debian.org/debian/pool/main/libg/libgpg-error/libgpg-error0_1.46-1_amd64.deb", sha256 = "89944ee11d7370ce6ef46fc52f094c4a6512eff8943ec4c6ebefeae6360ceada" },
+  { url = "https://deb.debian.org/debian/pool/main/x/xxhash/libxxhash0_0.8.1-1_amd64.deb", sha256 = "6c19a5d18c8350744581fbd25d5d29e2b7101053e25aafa4e1ffcc2b505b2f1c" },
+  { url = "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb", sha256 = "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4" },
+]
+
 # ─── Composer (PHP dependency manager, single .phar file) ────────────────────
 [[binaries]]
 name = "composer"
@@ -56,7 +84,7 @@ files = []
 name = "php-fpm-8.1"
 version = "8.1.34"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.1.34-fpm-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "c20b1283a4a635d4c062b473858a46d687e94bf8ef623f26e356592557065b15"
 tar_gz = true
 files = ["php-fpm:php/php-fpm-8.1"]
 
@@ -64,7 +92,7 @@ files = ["php-fpm:php/php-fpm-8.1"]
 name = "php-fpm-8.2"
 version = "8.2.32"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.2.32-fpm-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "e324b63d961bedb7273c1a3585f9b209cc1e057016056ed34b8bb1b32526db3e"
 tar_gz = true
 files = ["php-fpm:php/php-fpm-8.2"]
 
@@ -72,7 +100,7 @@ files = ["php-fpm:php/php-fpm-8.2"]
 name = "php-fpm-8.3"
 version = "8.3.32"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.3.32-fpm-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "02964d89c54810471c35bbd3877e1a420693305cb2e33aab18636d0db29ff7bc"
 tar_gz = true
 files = ["php-fpm:php/php-fpm-8.3"]
 
@@ -80,7 +108,7 @@ files = ["php-fpm:php/php-fpm-8.3"]
 name = "php-fpm-8.4"
 version = "8.4.23"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.4.23-fpm-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "40e341db82e5e90450122462aa6038fe653b63da951c1da1f10b15d0da4a26a0"
 tar_gz = true
 files = ["php-fpm:php/php-fpm-8.4"]
 
@@ -88,7 +116,7 @@ files = ["php-fpm:php/php-fpm-8.4"]
 name = "php-8.1"
 version = "8.1.34"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.1.34-cli-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "e2932192836731163bf8d16d634f4bdda76c422ceb40c2c4d7c55ae63680f1aa"
 tar_gz = true
 files = ["php:php/php-8.1"]
 
@@ -96,7 +124,7 @@ files = ["php:php/php-8.1"]
 name = "php-8.2"
 version = "8.2.32"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.2.32-cli-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "866532d2b463ff256d063432d529e966cc53e4a039109ccbfc4ee4dc51d649f1"
 tar_gz = true
 files = ["php:php/php-8.2"]
 
@@ -104,7 +132,7 @@ files = ["php:php/php-8.2"]
 name = "php-8.3"
 version = "8.3.32"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.3.32-cli-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "7928396c17aabcd5bb074fe82e07b4cb693c6d04360a4415799a143a9f9686c6"
 tar_gz = true
 files = ["php:php/php-8.3"]
 
@@ -112,7 +140,7 @@ files = ["php:php/php-8.3"]
 name = "php-8.4"
 version = "8.4.23"
 url = "https://dl.static-php.dev/static-php-cli/bulk/php-8.4.23-cli-linux-x86_64.tar.gz"
-sha256 = ""
+sha256 = "5fa2b5f1cc9d7f79b19718926b4f4f0bb6949db52073b2fabf8ae52de3993af5"
 tar_gz = true
 files = ["php:php/php-8.4"]
 

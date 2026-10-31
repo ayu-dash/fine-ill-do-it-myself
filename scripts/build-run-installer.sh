@@ -30,7 +30,7 @@ mkdir "$work_dir/payload"
 cp "$binary" "$work_dir/payload/fidim"
 cp "$repo_root/scripts/uninstall-fidim.sh" "$work_dir/payload/uninstall.sh"
 chmod 755 "$work_dir/payload/uninstall.sh"
-tar -czf "$work_dir/payload.tar.gz" -C "$work_dir/payload" fidim uninstall.sh
+tar -czf "$work_dir/payload.tar.gz" -C "$work_dir/payload" .
 
 cat > "$temporary_output" <<'INSTALLER'
 #!/bin/sh

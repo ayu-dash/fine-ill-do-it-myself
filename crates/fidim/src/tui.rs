@@ -30,6 +30,12 @@ pub enum Action {
     OpenEditor(String),
     /// Download/refresh the managed composer.phar.
     InstallComposer,
+    /// Install a PHP runtime and activate it.
+    InstallPhp(String),
+    /// Install a language runtime and activate it.
+    InstallLang { lang: String, version: String },
+    /// Install an optional managed component such as MariaDB or phpMyAdmin.
+    InstallManaged(String),
     /// Create a new project from the TUI quick-create flow.
     CreateProject {
         name: String,
@@ -702,6 +708,25 @@ impl App {
             let v = v.trim();
             self.message = format!("composer.install {v} requested");
             self.actions.push(Action::InstallComposer);
+        } else if let Some(version) = text.strip_prefix("php.install ") {
+            self.message = format!("php.install {version} requested");
+            self.actions.push(Action::InstallPhp(version.to_string()));
+        } else if let Some(rest) = text.strip_prefix("mariadb.install ") {
+            self.message = format!("mariadb.install {} requested", rest.trim());
+            self.actions
+                .push(Action::InstallManaged("mariadb".to_string()));
+        } else if let Some(rest) = text.strip_prefix("phpmyadmin.install ") {
+            self.message = format!("phpmyadmin.install {} requested", rest.trim());
+            self.actions
+                .push(Action::InstallManaged("phpmyadmin".to_string()));
+        } else if let Some((lang, version)) = text.split_once(".install ") {
+            if ["node", "python", "go", "java"].contains(&lang) {
+                self.message = format!("{lang}.install {version} requested");
+                self.actions.push(Action::InstallLang {
+                    lang: lang.to_string(),
+                    version: version.to_string(),
+                });
+            }
         } else if let Some(v) = text.strip_prefix("php.use ") {
             self.message = format!("php.use {v} requested");
             self.actions.push(Action::UsePhp(v.to_string()));
@@ -942,32 +967,17 @@ impl App {
         if self.detail.is_none() {
             return self.config_rows.len().max(1);
         }
-        if let Some(svc) = self.services.get(self.cursor_left) {
-            if [
-                fine_ill_do_it_myself::orchestrator::CADDY,
-                fine_ill_do_it_myself::orchestrator::APACHE,
-                fine_ill_do_it_myself::orchestrator::NGINX,
-                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
-            ]
-            .contains(&svc.name.as_str())
-            {
-                // Use the cached line count so the cursor can reach
-                // all rows including dynamically discovered versions.
-                return self.mgmt_line_count.max(4);
-            }
-            if svc.name == "mariadb" {
-                return 4;
-            }
-            if svc.name.starts_with("php-") {
-                let n = self
-                    .config_rows
-                    .iter()
-                    .filter(|r| matches!(r, ConfigRow::UsePhp(_)))
-                    .count();
-                return n.max(1);
-            }
+        // The rendered management panel is a dynamic, cached list: installed
+        // runtimes, installable versions, composer, ports, managed components.
+        // Its own line count is the only source of truth for the cursor. Deriving
+        // it from `config_rows` (as PHP and MariaDB used to) hid the extra rows
+        // and trapped navigation on the first line.
+        if self.mgmt_line_count == 0 && self.mgmt_lines.is_empty() {
+            // The panel is still loading; keep the cursor usable until the
+            // worker publishes the real row count.
+            return self.config_rows.len().max(1);
         }
-        self.config_rows.len().max(1)
+        self.mgmt_line_count.max(self.mgmt_lines.len()).max(1)
     }
 
     fn clamp_cursor(&mut self) {
@@ -1221,16 +1231,17 @@ fn mgmt_panel_for(
 
     if let Some(svc) = services.get(cursor_left) {
         if svc.name.starts_with("php-") || svc.name == "php" {
-            return (
-                format!(" php versions (current: {cur_php}) "),
+            let mut lines: Vec<String> =
                 fine_ill_do_it_myself::orchestrator::installed_php_versions(env)
                     .into_iter()
                     .map(|v| {
                         let mark = if v == cur_php { "▶ " } else { "  " };
                         format!("{mark}php.use {v}")
                     })
-                    .collect(),
-            );
+                    .collect();
+            lines.extend(php_install_rows(env));
+            lines.push(composer_row(env));
+            return (format!(" php versions (current: {cur_php}) "), lines);
         }
         for lang in ["node", "python", "go", "java"] {
             if svc.name == lang || svc.name.starts_with(&format!("{lang}-")) {
@@ -1240,7 +1251,6 @@ fn mgmt_panel_for(
                 let mut lines = Vec::new();
                 if versions.is_empty() {
                     lines.push("  no versions installed:".to_string());
-                    lines.push(format!("  install with: fidim {lang} install <v>:"));
                 } else {
                     for v in &versions {
                         let is_active = v == &cur
@@ -1249,6 +1259,7 @@ fn mgmt_panel_for(
                         lines.push(format!("{mark}{lang}.use {v}"));
                     }
                 }
+                lines.extend(lang_install_rows(env, lang));
                 return (format!(" {lang} versions (current: {cur}) "), lines);
             }
         }
@@ -1279,15 +1290,14 @@ fn mgmt_panel_for(
             return (format!(" {} management ", svc.name), lines);
         }
         if svc.name == "mariadb" {
-            return (
-                " ports ".to_string(),
-                vec![
-                    format!("  port http = {}", ports.http),
-                    format!("  port https = {}", ports.https),
-                    format!("  port fpm_base = {}", ports.fpm_base),
-                    format!("  port mariadb = {}", ports.mariadb),
-                ],
-            );
+            let mut lines = vec![
+                format!("  port http = {}", ports.http),
+                format!("  port https = {}", ports.https),
+                format!("  port fpm_base = {}", ports.fpm_base),
+                format!("  port mariadb = {}", ports.mariadb),
+            ];
+            lines.extend(managed_install_rows(env));
+            return (" ports ".to_string(), lines);
         }
     }
     // no service focused: the global config list
@@ -1307,6 +1317,11 @@ fn mgmt_panel_for(
         })
         .collect();
     lines.push(composer_row(env));
+    lines.extend(php_install_rows(env));
+    for lang in ["node", "python", "go", "java"] {
+        lines.extend(lang_install_rows(env, lang));
+    }
+    lines.extend(managed_install_rows(env));
     (" config (select service) ".to_string(), lines)
 }
 
@@ -1320,6 +1335,58 @@ fn composer_row(env: &fine_ill_do_it_myself::Env) -> String {
     } else {
         format!("  composer.install {version}")
     }
+}
+
+fn php_install_rows(env: &fine_ill_do_it_myself::Env) -> Vec<String> {
+    let manifest =
+        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+            .expect("bundled installer manifest must be valid");
+    let installed = fine_ill_do_it_myself::orchestrator::installed_php_versions(env);
+    manifest
+        .binaries
+        .iter()
+        .filter_map(|binary| {
+            let version = binary.name.strip_prefix("php-fpm-")?;
+            manifest.find(&format!("php-{version}"))?;
+            (!installed.iter().any(|current| current == version))
+                .then(|| format!("  php.install {version}"))
+        })
+        .collect()
+}
+
+fn lang_install_rows(env: &fine_ill_do_it_myself::Env, lang: &str) -> Vec<String> {
+    let manifest =
+        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+            .expect("bundled installer manifest must be valid");
+    let prefix = format!("{lang}-");
+    let installed = fine_ill_do_it_myself::lang::installed_lang_versions(env, lang);
+    manifest
+        .binaries
+        .iter()
+        .filter_map(|binary| {
+            let version = binary.name.strip_prefix(&prefix)?;
+            (!installed.iter().any(|current| current == version))
+                .then(|| format!("  {lang}.install {version}"))
+        })
+        .collect()
+}
+
+fn managed_install_rows(env: &fine_ill_do_it_myself::Env) -> Vec<String> {
+    let manifest =
+        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+            .expect("bundled installer manifest must be valid");
+    let mut rows = Vec::new();
+    if fine_ill_do_it_myself::orchestrator::find_mariadbd(env).is_none() {
+        if let Some(binary) = manifest.find("mariadb") {
+            rows.push(format!("  mariadb.install {}", binary.version));
+        }
+    }
+    if fine_ill_do_it_myself::phpmyadmin::install_dir(env).is_none() {
+        if let Some(binary) = manifest.find("phpmyadmin") {
+            rows.push(format!("  phpmyadmin.install {}", binary.version));
+        }
+    }
+    rows
 }
 
 /// Template preselected in the modal: a plain PHP page needs no Composer or
@@ -1691,6 +1758,9 @@ fn action_label(action: &Action, ctx: &ActionContext) -> String {
         Action::OpenProject(p) => format!("opening {p}.test"),
         Action::OpenEditor(p) => format!("opening {p} in the editor"),
         Action::InstallComposer => "downloading composer".into(),
+        Action::InstallPhp(version) => format!("installing PHP {version}"),
+        Action::InstallLang { lang, version } => format!("installing {lang} {version}"),
+        Action::InstallManaged(name) => format!("installing {name}"),
         Action::CreateProject { name, .. } => format!("creating {name}"),
     }
 }
@@ -2001,7 +2071,40 @@ where
                     fine_ill_do_it_myself::Lock::load(&env.lock_path()).unwrap_or_default();
                 fine_ill_do_it_myself::composer::ensure(env, &manifest, &mut lock, fetcher)
                     .map(|_| ())
+                    .and_then(|_| crate::cli::install_shims(&cli).map(|_| ()))
             })
+        }
+        Action::InstallPhp(version) => {
+            let cli = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: php.clone(),
+            };
+            crate::cli::php_install(&cli, version).and_then(|_| crate::cli::php_use(&cli, version))
+        }
+        Action::InstallLang { lang, version } => {
+            let cli = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: php.clone(),
+            };
+            crate::cli::lang_install(&cli, lang, version)
+                .and_then(|_| crate::cli::lang_use(&cli, lang, version))
+        }
+        Action::InstallManaged(name) => {
+            if !["mariadb", "phpmyadmin"].contains(&name.as_str()) {
+                Err(fine_ill_do_it_myself::Error::Other(format!(
+                    "unsupported managed component: {name}"
+                )))
+            } else {
+                let cli = crate::cli::CliEnv {
+                    env: env.clone(),
+                    ports: ports.clone(),
+                    php_default: php.clone(),
+                };
+                crate::cli::install(&cli, name)
+                    .and_then(|_| crate::cli::install_shims(&cli).map(|_| ()))
+            }
         }
         Action::CreateProject { name, template, db } => {
             let cli = crate::cli::CliEnv {
@@ -2043,13 +2146,33 @@ where
                 .unwrap_or_else(|| "editor".into());
             format!("opening {p} in {editor}")
         }
-        (Ok(()), Action::InstallComposer) => "composer installed".into(),
+        (Ok(()), Action::InstallComposer) => {
+            "composer installed; PATH setup: fidim env --install --shell".into()
+        }
+        (Ok(()), Action::InstallPhp(version)) => {
+            format!(
+                "PHP {version} installed and activated; PATH setup: fidim env --install --shell"
+            )
+        }
+        (Ok(()), Action::InstallLang { lang, version }) => {
+            format!(
+                "{lang} {version} installed and activated; PATH setup: fidim env --install --shell"
+            )
+        }
+        (Ok(()), Action::InstallManaged(name)) => {
+            format!("{name} installed; PATH setup: fidim env --install --shell")
+        }
         (Ok(()), Action::CreateProject { name, template, .. }) => {
             format!("created {name} ({})", template.label())
         }
         (Ok(()), _) => format!("{action:?} ok").to_lowercase(),
         (Err(e), Action::OpenEditor(p)) => format!("{p}: {e}"),
         (Err(e), Action::InstallComposer) => format!("composer install: {e}"),
+        (Err(e), Action::InstallPhp(version)) => format!("PHP {version} install: {e}"),
+        (Err(e), Action::InstallLang { lang, version }) => {
+            format!("{lang} {version} install: {e}")
+        }
+        (Err(e), Action::InstallManaged(name)) => format!("{name} install: {e}"),
         (Err(e), Action::CreateProject { name, .. }) => format!("create {name}: {e}"),
         (Err(e), _) => format!("{action:?}: {e}").to_lowercase(),
     };
@@ -4190,6 +4313,77 @@ mod tests {
             lines.iter().any(|l| l.contains("composer.install")),
             "composer must be installable from the panel: {lines:?}"
         );
+        for component in ["php.install", "mariadb.install", "phpmyadmin.install"] {
+            assert!(
+                lines.iter().any(|line| line.contains(component)),
+                "{component} must be installable from the panel: {lines:?}"
+            );
+        }
+        assert!(
+            lines.iter().any(|line| line.contains("node.install 24")),
+            "language runtimes must be installable from the panel: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn php_management_panel_offers_uninstalled_versions() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("php", false)], 0, &[]);
+
+        assert!(
+            lines.iter().any(|line| line.contains("php.install 8.4")),
+            "PHP install options should be shown alongside installed versions: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn php_management_panel_does_not_offer_database_components() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("php", false)], 0, &[]);
+
+        for component in ["mariadb.install", "phpmyadmin.install"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(component)),
+                "the PHP panel must not offer database components ({component}): {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_install_rows_hide_mariadb_when_a_runtime_is_available() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mariadbd = env.paths.runtimes().join("mariadb/11.4.13/bin/mariadbd");
+        std::fs::create_dir_all(mariadbd.parent().unwrap()).unwrap();
+        std::fs::write(&mariadbd, "binary").unwrap();
+
+        let rows = managed_install_rows(&env);
+
+        assert!(
+            !rows.iter().any(|row| row.contains("mariadb.install")),
+            "an installed managed runtime must not be offered for installation: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn language_management_panel_offers_uninstalled_versions() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("node", false)], 0, &[]);
+
+        assert!(
+            lines.iter().any(|line| line.contains("node.install 24")),
+            "Node.js install options should be shown in its management panel: {lines:?}"
+        );
     }
 
     #[test]
@@ -4221,6 +4415,34 @@ mod tests {
         a.mgmt_enter(&["  composer.install 2.10.3".to_string()]);
 
         assert_eq!(a.actions, vec![Action::InstallComposer]);
+    }
+
+    #[test]
+    fn enter_on_install_rows_queues_runtime_and_component_actions() {
+        let cases = [
+            ("  php.install 8.4", Action::InstallPhp("8.4".into())),
+            (
+                "  node.install 24",
+                Action::InstallLang {
+                    lang: "node".into(),
+                    version: "24".into(),
+                },
+            ),
+            (
+                "  mariadb.install 11.4.13",
+                Action::InstallManaged("mariadb".into()),
+            ),
+            (
+                "  phpmyadmin.install 5.2.3",
+                Action::InstallManaged("phpmyadmin".into()),
+            ),
+        ];
+
+        for (row, expected) in cases {
+            let mut app = App::new(vec![], vec![]);
+            app.mgmt_enter(&[row.into()]);
+            assert_eq!(app.actions, vec![expected], "row {row}");
+        }
     }
 
     // ---- `o` opens the project in the code editor -------------------------
@@ -4687,6 +4909,32 @@ mod tests {
             matches!(result, Ok(WorkerMsg::ManagementDone { .. })),
             "management worker did not return its result"
         );
+    }
+
+    #[test]
+    fn php_detail_panel_navigates_through_every_rendered_row() {
+        let mut app = App::new(vec![svc("php-8.4", false)], vec![]);
+        app.detail = Some("detail: php-8.4".into());
+        app.panel_right = true;
+        // Only one installed PHP version drives `config_rows`, while the
+        // visible panel also lists installable versions and managed components.
+        app.config_rows = vec![ConfigRow::UsePhp("8.4".into())];
+        app.mgmt_lines = vec![
+            "▶ php.use 8.4".into(),
+            "  php.install 8.3".into(),
+            "  composer.install 2.10.3".into(),
+            "  mariadb.install 11.4.13".into(),
+        ];
+        app.mgmt_line_count = app.mgmt_lines.len();
+        app.mgmt_for = Some(app.mgmt_key());
+
+        for expected in 1..app.mgmt_lines.len() {
+            app.on_key(KeyCode::Down);
+            assert_eq!(
+                app.cursor_right, expected,
+                "the cursor must reach every rendered PHP panel row"
+            );
+        }
     }
 
     #[test]

@@ -20,8 +20,8 @@ with real HTTPS.
 - Download manager with sha256 verification for managed binaries and runtimes
 - Optional MariaDB 11.4.13 Linux x86_64 runtime, downloaded with curl into the
   project data root; a system `mariadbd` on `PATH` remains supported
-- phpMyAdmin 5.2.3 as a managed site (`https://phpmyadmin.test`), installed on
-  demand and pointed at the fidim-managed MariaDB
+- phpMyAdmin 5.2.3 as a managed site (`https://phpmyadmin.test`), bundled in
+  the Linux `.run` installer and pointed at the fidim-managed MariaDB
 - A TUI (`fidim` default command), status CLI, unix-socket daemon
 
 ## Install
@@ -38,9 +38,19 @@ chmod +x fine-ill-do-it-myself-<version>-x86_64-linux.run
 
 The installer asks before replacing an existing `~/.local/bin/fidim`; pass
 `--yes` to replace it without prompting. Ensure `~/.local/bin` is on `PATH`.
-To build a `.run` installer locally after a release build, use
-`scripts/build-run-installer.sh`. The portable tarball and `cargo install`
-remain available as alternatives.
+It also unpacks the bundled phpMyAdmin 5.2.3 (with its license files) into
+`runtimes/phpmyadmin/`, the bundled Composer 2.10.3 into `bin/composer`, and
+the bundled PHP 8.4 (FPM + CLI) into `bin/php/`, so none of them needs a
+download; existing trees, binaries, a generated `config.inc.php` or an updated
+Composer are left untouched on reinstall. The PHP License 3.01 text is written
+to `licenses/php-3.01.txt`. To build a `.run` installer locally after a
+release build, use `scripts/build-run-installer.sh`;
+`FIDIM_BUNDLE_PHPMYADMIN=0`, `FIDIM_BUNDLE_COMPOSER=0` and
+`FIDIM_BUNDLE_PHP=0` leave those components out. Apache is not bundled: run
+`fidim install httpd`, which assembles Apache 2.4.67 from the pinned Debian
+bookworm packages in `sources.toml` (it needs glibc 2.36+: Debian 12+, Ubuntu
+24.04+, current Fedora/Arch), then `fidim web use apache`. The portable tarball
+and `cargo install` remain available as alternatives.
 
 To uninstall, run
 `~/.local/share/fine-ill-do-it-myself/uninstall.sh`. It removes the managed
@@ -60,6 +70,7 @@ Bootstrap binaries from the manifest (defaults ship inside the binary):
 
 ```sh
 fidim install caddy
+fidim install httpd     # Apache from the pinned Debian package recipe in sources.toml
 fidim install mariadb   # optional, portable Linux x86_64 runtime (downloaded with curl)
 fidim install composer  # optional: pinned composer.phar, run through the managed PHP
 fidim install phpmyadmin   # optional: served at https://phpmyadmin.test
@@ -81,8 +92,11 @@ fidim node list             # installed versions (plus `system` when found)
 Each runtime is extracted under the data root (`runtimes/<lang>/<major>/`) with
 its binaries symlinked into `bin/<lang>/`; `fidim <lang> use <version>` switches
 the active `bin/<lang>/<lang>` symlink. Checksums are pinned in the manifest.
-Run `fidim env --install` after selecting a version so `node`, `python3`, `go`,
-`java`, ... resolve to the managed runtime from any directory.
+Selecting a version refreshes fidim's command shims automatically. The first
+PHP version and each language's first managed version are activated
+automatically; additional versions can be selected with
+`fidim <lang> use <version>`. PHP and language management panels in the TUI
+also list installable versions.
 
 `fidim <lang> remove <version>` deletes the extracted runtime tree, drops the
 version from `lock.toml` and re-points the active `bin/<lang>/<lang>` link (or
@@ -115,6 +129,7 @@ terminal** — two options:
 ```sh
 eval "$(fidim env)"     # per shell, inside this data root
 fidim env --install     # everywhere: writes wrappers to ~/.local/bin
+fidim env --install --shell  # offer a confirmed Bash/Zsh startup-file update
 ```
 
 `fidim env` prepends the managed client dirs to `PATH` (mariadb, php, node,
@@ -126,8 +141,14 @@ server.
 `python3`, `pip3`, `go`, `java`, `javac`, ... wrappers into `~/.local/bin`
 (override with `$FIDIM_SHIM_DIR`). They follow the active
 `fidim <lang> use <version>` selection and point at this data root, so they work
-from any directory; re-run it after moving the project or installing a new
-language. `~/.local/bin` must be on your `PATH`.
+from any directory. Installing or switching a runtime refreshes these wrappers
+automatically; re-run `fidim env --install` after moving the data root.
+If you opted into persistent shell integration, re-run
+`fidim env --install --shell` to update its managed block.
+`~/.local/bin` must be on your `PATH`; by default fidim does not edit shell
+startup files. The optional `--shell` flow asks for confirmation before adding
+a managed PATH block to `.bashrc` or `.zshrc`, and backs up an existing file as
+`<rc-file>.fidim.bak`. Non-interactive runs never edit shell startup files.
 
 ## Create a project
 
@@ -192,8 +213,10 @@ fidim hosts --dry-run  # print them, change nothing
 `~/.local/share/fine-ill-do-it-myself/php/<version>/` and `fidim php list`
 picks it up automatically (`fidim php use <version>` selects it).
 
-**phpMyAdmin**: `fidim install phpmyadmin` extracts phpMyAdmin 5.2.3 under
-`runtimes/phpmyadmin/` and links it into the managed `projects/phpmyadmin`,
+**phpMyAdmin**: the `.run` installer already extracts phpMyAdmin 5.2.3 (with
+`--strip-components=1`) under `runtimes/phpmyadmin/<version>/`; installs from
+the tarball or `cargo install` get it with `fidim install phpmyadmin`. Either
+way fidim links it into the managed `projects/phpmyadmin`,
 so the usual
 vhost/certificate/hosts generation serves it at
 `https://phpmyadmin.test` (plus the HTTP variant). Its `config.inc.php` points
@@ -203,12 +226,17 @@ setup; otherwise add the entry once via `fidim hosts`. The symlink is only
 replaced when it is a fidim symlink, never when a real project folder has that
 name.
 
-**Composer**: `fidim install composer` downloads the pinned `composer.phar`
-(currently 2.10.3) into `bin/composer` and never relies on a system-wide
+**Composer**: the `.run` installer already places the pinned `composer.phar`
+(currently 2.10.3) in `bin/composer`; other installs fetch it with
+`fidim install composer`. Either way fidim never relies on a system-wide
 Composer. `fidim env --install` writes a shim that runs it through the managed
 PHP (`bin/php/php`), with `COMPOSER_HOME` and `COMPOSER_CACHE_DIR` kept under
 the data root instead of `$HOME`. In the TUI the same install is available from
-the management panel (`composer.install <version>`).
+the management panel (`composer.install <version>`). The PHP management panel
+also offers installation of available PHP versions; MariaDB and phpMyAdmin are
+offered from the MariaDB panel and the global config list. Language panels list
+installable Node, Python, Go and Java versions. These optional components are
+installed only when selected.
 
 Inside `~/.local/share/fine-ill-do-it-myself/etc/keys.toml` you can remap TUI
 keys (defaults q/r/s/x/a/o):
@@ -266,6 +294,7 @@ automatically.
   projects/  web projects created and served by fidim
   runtimes/   extracted language/web runtimes (node/24, phpmyadmin/5.2.3, ...)
   etc/        generated configs (Caddyfile, php-fpm conf, my.cnf, certs/)
+  licenses/   license texts of components bundled with the installer
   run/        pid files + sockets
   logs/       service logs
   lock.toml   what is installed + sha256 pins
@@ -290,10 +319,15 @@ Everything network/process-dependent lives behind small traits (`Fetcher`,
 ## Third-party binaries and licenses
 
 `fidim` does not ship third-party binaries in its repository or in its release
-tarball. `fidim install <name>` downloads them from the upstream URLs listed in
-`default_manifest.toml`, verifies the pinned sha256, and extracts the license
-files that ship with each archive, so every component stays under its own
-license:
+tarball. The Linux `.run` installer is the exception: it embeds the unmodified
+phpMyAdmin 5.2.3 tarball (license files included), the Composer 2.10.3 phar,
+and the PHP 8.4 static builds with the PHP License 3.01 text, so they work
+without network access (`FIDIM_BUNDLE_PHPMYADMIN=0`,
+`FIDIM_BUNDLE_COMPOSER=0` and `FIDIM_BUNDLE_PHP=0` exclude them). Apache is
+fetched by `fidim install httpd` from the pinned Debian packages listed in
+`default_manifest.toml`. Everything else is fetched by `fidim install <name>`
+from the upstream URLs listed there, where every entry pins a sha256; a
+mismatch aborts before extraction. Each archive keeps its own license:
 
 | Component | License |
 |---|---|

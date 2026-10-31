@@ -107,6 +107,7 @@ mod tests {
                 version: "2.10.3".into(),
                 url: "https://example.test/composer.phar".into(),
                 sha256: String::new(),
+                debs: Vec::new(),
                 tar_gz: false,
                 files: Vec::new(),
                 install_dir: String::new(),

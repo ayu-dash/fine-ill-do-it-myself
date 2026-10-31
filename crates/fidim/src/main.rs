@@ -35,6 +35,9 @@ enum Commands {
         /// Install wrappers into ~/.local/bin (or $FIDIM_SHIM_DIR) instead
         #[arg(long)]
         install: bool,
+        /// Offer to add the command paths to the current shell's startup file.
+        #[arg(long, requires = "install")]
+        shell: bool,
     },
     /// Manage /etc/hosts entries for .test projects (fallback when DNS is unavailable)
     Hosts {
@@ -187,6 +190,58 @@ fn resolve(cli: &Cli) -> cli::CliEnv {
     }
 }
 
+fn enable_shell_path(env: &cli::CliEnv) -> AResult<()> {
+    use std::io::{IsTerminal, Write};
+
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME"))?;
+    let shell = std::env::var("SHELL")
+        .map_err(|_| anyhow::anyhow!("cannot resolve $SHELL; no shell config was changed"))?;
+    let rc_path = fine_ill_do_it_myself::shell::shell_rc_path(&home, &shell)?;
+
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "not interactive; no shell config changed. Rerun `fidim env --install --shell` in a terminal to confirm editing {}",
+            rc_path.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "This will add fidim command paths to {}. An existing file is backed up first.",
+        rc_path.display()
+    );
+    print!("Continue? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("no shell config changed");
+        return Ok(());
+    }
+
+    let mut shim_dirs = vec![home.join(".local/bin")];
+    let configured_shim_dir = cli::shim_dir()?;
+    if !shim_dirs.contains(&configured_shim_dir) {
+        shim_dirs.push(configured_shim_dir);
+    }
+    let backup = fine_ill_do_it_myself::shell::install_shell_integration(
+        &rc_path,
+        &shim_dirs,
+        env.env.paths.root(),
+    )?;
+    if let Some(backup) = backup {
+        println!(
+            "shell integration enabled; backup saved to {}",
+            backup.display()
+        );
+    } else {
+        println!("shell integration enabled");
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let env = resolve(&cli);
@@ -233,7 +288,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                 println!("{s}");
             }
         }
-        Some(Commands::Env { install }) => {
+        Some(Commands::Env { install, shell }) => {
             if install {
                 let written = cli::install_shims(&env)?;
                 if written.is_empty() {
@@ -244,6 +299,13 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
                     for p in written {
                         println!("{}", p.display());
                     }
+                }
+                if shell {
+                    enable_shell_path(&env)?;
+                } else {
+                    println!(
+                        "To add managed command paths to bash/zsh startup after confirmation, rerun `fidim env --install --shell`."
+                    );
                 }
             } else {
                 print!("{}", cli::shell_env(&env));
@@ -293,6 +355,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
         Some(Commands::Install { name }) => {
             let p = cli::install(&env, &name)?;
             println!("installed {name} -> {}", p.display());
+            println!("For PATH setup in new shells, run `fidim env --install --shell`.");
             if name == fine_ill_do_it_myself::phpmyadmin::SITE {
                 println!(
                     "phpMyAdmin: {}",
@@ -352,6 +415,7 @@ fn run(cli: Cli, env: cli::CliEnv) -> AResult<()> {
             PhpCommands::Install { version } => {
                 cli::php_install(&env, &version)?;
                 println!("php {version} installed");
+                println!("For PATH setup in new shells, run `fidim env --install --shell`.");
             }
             PhpCommands::List => {
                 for v in cli::php_list(&env)? {
@@ -437,6 +501,7 @@ fn handle_lang_cmd(
         LangCommands::Install { version } => {
             cli::lang_install(env, lang, &version)?;
             println!("{lang} {version} installed");
+            println!("For PATH setup in new shells, run `fidim env --install --shell`.");
         }
         LangCommands::List => {
             for v in cli::lang_list(env, lang)? {
@@ -517,6 +582,35 @@ mod tests {
         assert!(body.contains("MYSQL_UNIX_PORT='"), "{body}");
         let node = std::fs::read_to_string(shims.path().join("node")).unwrap();
         assert!(!node.contains("MYSQL_UNIX_PORT"), "{node}");
+    }
+
+    #[test]
+    fn env_shell_setup_is_not_written_without_interactive_confirmation() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let shims = tempfile::tempdir().unwrap();
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("SHELL", "/bin/bash")
+            .env("FIDIM_SHIM_DIR", shims.path())
+            .arg("--data-root")
+            .arg(data.path())
+            .args(["env", "--install", "--shell"])
+            .output()
+            .unwrap();
+
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!home.path().join(".bashrc").exists());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("no shell config changed"),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     #[test]

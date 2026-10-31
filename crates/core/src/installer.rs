@@ -418,6 +418,11 @@ pub fn install<F: Fetcher>(
         .find(name)
         .ok_or_else(|| Error::MissingBinary(name.to_string()))?
         .clone();
+    // Recipes made of pinned packages (Apache) build a runtime tree instead of
+    // extracting the single `url` artifact.
+    if !src.debs.is_empty() {
+        return crate::web::apache_bundle::install(env, &src, lock, fetcher);
+    }
     let staging = env.paths.bin().join(format!(".{name}-staging"));
     let bytes = fetcher.fetch(&src.url)?;
     let hex = sha256_hex(&bytes);

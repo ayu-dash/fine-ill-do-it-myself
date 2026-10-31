@@ -13,10 +13,22 @@ pub struct Manifest {
 /// One downloadable artifact. `tar_gz = true` means the URL is a tarball whose
 /// only file is the binary (or tools after extraction into `dest`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebSource {
+    pub url: String,
+    #[serde(default)]
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinarySource {
     pub name: String,
     pub version: String,
     pub url: String,
+    /// When set, the artifact is assembled from these Debian packages instead
+    /// of `url` (Apache has no portable Linux binary). Every package must pin
+    /// its sha256.
+    #[serde(default)]
+    pub debs: Vec<DebSource>,
     /// Optional fixed checksum; empty = accept and record on first download
     /// (recorded download instance is validated against it thereafter).
     #[serde(default)]
@@ -266,6 +278,21 @@ files = ["caddy"]
     }
 
     #[test]
+    fn bundled_manifest_offers_httpd_from_pinned_packages() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let httpd = m.find("httpd").expect("httpd missing");
+
+        assert_eq!(httpd.version, "2.4.67");
+        assert!(httpd.url.is_empty());
+        assert_eq!(httpd.debs.len(), 15);
+        for deb in &httpd.debs {
+            assert!(deb.url.starts_with("https://"), "{}", deb.url);
+            assert_eq!(deb.sha256.len(), 64, "{} must pin a sha256", deb.url);
+            assert!(deb.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
     fn bundled_manifest_offers_phpmyadmin_with_a_pinned_checksum() {
         let m = Manifest::parse(crate::installer_defaults()).unwrap();
         let pma = m.find("phpmyadmin").expect("phpmyadmin missing");
@@ -277,6 +304,44 @@ files = ["caddy"]
         assert_eq!(pma.install_dir, "phpmyadmin/5.2.3");
         assert_eq!(pma.strip_components, 1);
         assert!(pma.files.is_empty(), "phpMyAdmin is a tree, not a binary");
+    }
+
+    #[test]
+    fn bundled_manifest_pins_a_checksum_for_every_artifact() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+
+        assert!(!m.binaries.is_empty());
+        for b in &m.binaries {
+            if !b.debs.is_empty() {
+                for deb in &b.debs {
+                    assert_eq!(
+                        deb.sha256.len(),
+                        64,
+                        "{} package {} must pin a sha256",
+                        b.name,
+                        deb.url
+                    );
+                    assert!(
+                        deb.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                        "{} package sha256 must be hex",
+                        b.name
+                    );
+                }
+                continue;
+            }
+            assert_eq!(
+                b.sha256.len(),
+                64,
+                "{} must pin a sha256, got {:?}",
+                b.name,
+                b.sha256
+            );
+            assert!(
+                b.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{} sha256 must be hex",
+                b.name
+            );
+        }
     }
 
     #[test]

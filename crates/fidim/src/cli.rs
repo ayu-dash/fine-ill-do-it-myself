@@ -128,6 +128,9 @@ pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
         fine_ill_do_it_myself::phpmyadmin::ensure_site(&cli.env, &cli.ports)?;
         let _ = orchestrator::generate_configs(&cli.env, &cli.ports, &cli.php_default);
     }
+    if name == "mariadb" || name == "composer" || name.starts_with("php-") {
+        install_shims(cli)?;
+    }
     Ok(out)
 }
 
@@ -155,16 +158,30 @@ pub fn load_or_default_manifest(cli: &CliEnv) -> Result<Manifest> {
 
 /// Install a php version from the manifest (download static build).
 pub fn php_install(cli: &CliEnv, version: &str) -> Result<()> {
-    install(cli, &format!("php-fpm-{version}"))?;
     let manifest = load_or_default_manifest(cli)?;
-    if manifest.find(&format!("php-{version}")).is_some() {
-        let _ = install(cli, &format!("php-{version}"));
+    if manifest.find(&format!("php-{version}")).is_none() {
+        return Err(Error::Other(format!(
+            "PHP {version} CLI binary is missing from the manifest"
+        )));
     }
+    if manifest.find(&format!("php-fpm-{version}")).is_none() {
+        return Err(Error::Other(format!(
+            "PHP {version} FPM binary is missing from the manifest"
+        )));
+    }
+    install(cli, &format!("php-fpm-{version}"))?;
+    install(cli, &format!("php-{version}"))?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
     lock.php.push(version.to_string());
     lock.php.sort();
     lock.php.dedup();
+    let activate = lock.php_default.is_none();
     lock.save(&cli.env.lock_path())?;
+    if activate {
+        php_use(cli, version)?;
+    } else {
+        install_shims(cli)?;
+    }
     Ok(())
 }
 
@@ -193,7 +210,13 @@ pub fn lang_install(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
         list.push(version.to_string());
         list.sort();
     }
+    let activate = !lock.language_defaults.contains_key(lang);
     lock.save(&cli.env.lock_path())?;
+    if activate {
+        lang_use(cli, lang, version)?;
+    } else {
+        install_shims(cli)?;
+    }
     Ok(())
 }
 
@@ -268,6 +291,11 @@ pub fn php_use(cli: &CliEnv, version: &str) -> Result<()> {
     let ports =
         fine_ill_do_it_myself::PortPlan::resolve(&cli.env.paths.etc(), |k| std::env::var(k).ok());
     let _ = fine_ill_do_it_myself::orchestrator::generate_configs(&cli.env, &ports, version);
+    install_shims(&CliEnv {
+        env: cli.env.clone(),
+        ports,
+        php_default: version.to_string(),
+    })?;
     Ok(())
 }
 
@@ -373,6 +401,7 @@ pub fn lang_use(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
             }
         }
     }
+    install_shims(cli)?;
     Ok(())
 }
 
@@ -894,6 +923,35 @@ pub fn dns_uninstall(apply: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    static SHIM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ShimEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ShimEnvGuard {
+        fn new(path: &std::path::Path) -> Self {
+            let lock = SHIM_ENV_LOCK.lock().unwrap();
+            let previous = std::env::var_os("FIDIM_SHIM_DIR");
+            std::env::set_var("FIDIM_SHIM_DIR", path);
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ShimEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("FIDIM_SHIM_DIR", previous);
+            } else {
+                std::env::remove_var("FIDIM_SHIM_DIR");
+            }
+        }
+    }
+
     #[test]
     fn port_set_accepts_per_web_server_keys() {
         let t = tempfile::tempdir().unwrap();
@@ -916,6 +974,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let t = tempfile::tempdir().unwrap();
+        let _shim_env = ShimEnvGuard::new(&t.path().join("shims"));
         let cli = CliEnv::with_data_root(t.path().to_path_buf());
         let lang_dir = cli.env.paths.bin().join("python");
         std::fs::create_dir_all(&lang_dir).unwrap();
@@ -950,6 +1009,7 @@ mod tests {
 
         let t = tempfile::tempdir().unwrap();
         let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        let _shim_env = ShimEnvGuard::new(&t.path().join("shims"));
         for (lang, version, tools) in [
             ("node", "24", &["node", "npm", "npx", "corepack"][..]),
             ("java", "25", &["java", "javac", "jar"][..]),
@@ -996,6 +1056,7 @@ mod tests {
     #[test]
     fn lang_remove_deletes_the_runtime_and_relinks_the_remaining_version() {
         let t = tempfile::tempdir().unwrap();
+        let _shim_env = ShimEnvGuard::new(&t.path().join("shims"));
         let cli = CliEnv::with_data_root(t.path().to_path_buf());
         let lang_dir = cli.env.paths.bin().join("python");
         std::fs::create_dir_all(&lang_dir).unwrap();
