@@ -811,7 +811,14 @@ pub fn status_all<R: Runner + Clone>(
         ports: ports.clone(),
         runner: runner.clone(),
     };
+    let web = web_server(env);
     let mut names = sup.known_services();
+    names.retain(|name| {
+        ![CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str())
+            || name == &web
+            || web_bin_path(env, name).exists()
+            || sup.status(name).state == crate::service::ServiceState::Running
+    });
     // show every installed web server, plus the chosen one, php and mariadb
     for w in [CADDY, APACHE, NGINX, LIGHTTPD] {
         if web_bin_path(env, w).exists() && !names.iter().any(|n| n == w) {
@@ -824,7 +831,6 @@ pub fn status_all<R: Runner + Clone>(
             names.push(n);
         }
     }
-    let web = web_server(env);
     let lock = Lock::load(&env.lock_path()).unwrap_or_default();
     let php = format!("php-{}", default_php(&lock));
     for n in [web.as_str(), php.as_str(), MARIADB] {
@@ -1359,6 +1365,20 @@ mod tests {
         assert!(
             !names.contains(&"caddy".to_string()),
             "caddy hidden when not chosen"
+        );
+    }
+
+    #[test]
+    fn status_all_hides_uninstalled_web_server_with_stale_pid_file() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.paths.pids().join("nginx.pid"), "999").unwrap();
+
+        let statuses = status_all(&env, &PortPlan::default(), &FakeRunner::default());
+
+        assert!(
+            !statuses.iter().any(|status| status.name == NGINX),
+            "an uninstalled web server with a stale pid file must not appear"
         );
     }
 
