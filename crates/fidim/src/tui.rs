@@ -7,11 +7,11 @@ pub enum Action {
     /// Restart every service (stop_all + start_all).
     RestartAll,
     /// Start the service under the cursor.
-    StartService(usize),
+    StartService(String),
     /// Stop the service under the cursor.
-    StopService(usize),
+    StopService(String),
     /// Restart the service under the cursor.
-    RestartService(usize),
+    RestartService(String),
     /// Switch the default PHP version.
     UsePhp(String),
     /// Switch the chosen web server.
@@ -22,6 +22,8 @@ pub enum Action {
     ShowDetail(String),
     /// Switch a web server's active binary version (e.g. caddy -> caddy-2.9.1).
     UseServerVersion { server: String, version: String },
+    /// Install a web server from the bundled manifest.
+    InstallWeb(String),
     /// Switch a programming language version (e.g. node -> node-22).
     UseLang { lang: String, version: String },
     /// Open a project in the default browser.
@@ -629,12 +631,13 @@ impl App {
                 // services: toggle under cursor (start when stopped, stop when running)
                 "services" => {
                     let i = self.cursor();
+                    let name = self.services[i].name.clone();
                     if self.services[i].state == ServiceState::Running {
                         self.message = "stop requested".into();
-                        self.actions.push(Action::StopService(i));
+                        self.actions.push(Action::StopService(name));
                     } else {
                         self.message = "start requested".into();
-                        self.actions.push(Action::StartService(i));
+                        self.actions.push(Action::StartService(name));
                     }
                 }
                 // Language rows open their version list; Enter never toggles a runtime.
@@ -673,16 +676,22 @@ impl App {
             }
             _ if cursor_is_service_row(self, key, self.keybinds.start) => {
                 self.message = "start requested".into();
-                self.actions.push(Action::StartService(self.cursor()));
+                self.actions.push(Action::StartService(
+                    self.services[self.cursor()].name.clone(),
+                ));
             }
             _ if cursor_is_service_row(self, key, self.keybinds.stop) => {
                 self.message = "stop requested".into();
-                self.actions.push(Action::StopService(self.cursor()));
+                self.actions.push(Action::StopService(
+                    self.services[self.cursor()].name.clone(),
+                ));
             }
             _ if key == self.keybinds.restart => {
                 if !self.panel_right && self.cursor() < self.services.len() {
                     self.message = "service restart requested".into();
-                    self.actions.push(Action::RestartService(self.cursor()));
+                    self.actions.push(Action::RestartService(
+                        self.services[self.cursor()].name.clone(),
+                    ));
                 } else {
                     self.message = "stop+start all requested".into();
                     self.actions.push(Action::RestartAll);
@@ -719,11 +728,21 @@ impl App {
             self.message = format!("phpmyadmin.install {} requested", rest.trim());
             self.actions
                 .push(Action::InstallManaged("phpmyadmin".to_string()));
-        } else if let Some((lang, version)) = text.split_once(".install ") {
-            if ["node", "python", "go", "java"].contains(&lang) {
-                self.message = format!("{lang}.install {version} requested");
+        } else if let Some((server, version)) = text.split_once(".install ") {
+            if [
+                fine_ill_do_it_myself::orchestrator::CADDY,
+                fine_ill_do_it_myself::orchestrator::APACHE,
+                fine_ill_do_it_myself::orchestrator::NGINX,
+                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+            ]
+            .contains(&server)
+            {
+                self.message = format!("{server}.install requested");
+                self.actions.push(Action::InstallWeb(server.to_string()));
+            } else if ["node", "python", "go", "java"].contains(&server) {
+                self.message = format!("{server}.install {version} requested");
                 self.actions.push(Action::InstallLang {
-                    lang: lang.to_string(),
+                    lang: server.to_string(),
                     version: version.to_string(),
                 });
             }
@@ -1160,6 +1179,36 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
     out
 }
 
+fn web_install_rows(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
+    if fine_ill_do_it_myself::orchestrator::web_bin_path(env, server).is_file() {
+        return Vec::new();
+    }
+
+    let manifest = effective_manifest(env);
+    manifest
+        .find(server)
+        .map(|source| vec![format!("  {server}.install {}", source.version)])
+        .unwrap_or_default()
+}
+
+fn effective_manifest(env: &fine_ill_do_it_myself::Env) -> fine_ill_do_it_myself::Manifest {
+    let defaults =
+        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+            .expect("bundled installer manifest must be valid");
+    let mut manifest =
+        fine_ill_do_it_myself::Manifest::load(&env.manifest_path()).unwrap_or_default();
+    for source in defaults.binaries {
+        if !manifest
+            .binaries
+            .iter()
+            .any(|existing| existing.name == source.name)
+        {
+            manifest.binaries.push(source);
+        }
+    }
+    manifest
+}
+
 /// Discovered alternate versions of a web server in `bin/` or `bin/<server>/` (e.g. caddy-2.9.1).
 pub fn installed_server_versions(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
     let mut vers = Vec::new();
@@ -1273,6 +1322,7 @@ fn mgmt_panel_for(
         {
             let ver = fine_ill_do_it_myself::orchestrator::web_version(env, &svc.name);
             let mut lines = web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports);
+            lines.extend(web_install_rows(env, &svc.name));
             let vers = installed_server_versions(env, &svc.name);
             if !vers.is_empty() {
                 lines.push(String::new());
@@ -1316,6 +1366,14 @@ fn mgmt_panel_for(
             ConfigRow::Port { key, value } => format!("  port {key} = {value}"),
         })
         .collect();
+    for server in [
+        fine_ill_do_it_myself::orchestrator::CADDY,
+        fine_ill_do_it_myself::orchestrator::APACHE,
+        fine_ill_do_it_myself::orchestrator::NGINX,
+        fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+    ] {
+        lines.extend(web_install_rows(env, server));
+    }
     lines.push(composer_row(env));
     lines.extend(php_install_rows(env));
     for lang in ["node", "python", "go", "java"] {
@@ -1733,27 +1791,21 @@ struct Outcome {
 /// Read-only view of the app that the worker needs. Captured before spawning so
 /// the worker never touches UI state.
 struct ActionContext {
-    services: Vec<String>,
     editor: Option<fine_ill_do_it_myself::editor::Editor>,
 }
 
-fn action_label(action: &Action, ctx: &ActionContext) -> String {
-    let svc = |i: usize| {
-        ctx.services
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("#{i}"))
-    };
+fn action_label(action: &Action) -> String {
     match action {
         Action::RestartAll => "restarting everything".into(),
-        Action::StartService(i) => format!("starting {}", svc(*i)),
-        Action::StopService(i) => format!("stopping {}", svc(*i)),
-        Action::RestartService(i) => format!("restarting {}", svc(*i)),
+        Action::StartService(name) => format!("starting {name}"),
+        Action::StopService(name) => format!("stopping {name}"),
+        Action::RestartService(name) => format!("restarting {name}"),
         Action::UsePhp(v) => format!("switching php to {v}"),
         Action::UseWeb(n) => format!("switching web server to {n}"),
         Action::SetPort { key, value } => format!("setting {key} = {value}"),
         Action::ShowDetail(n) => format!("loading {n}"),
         Action::UseServerVersion { server, version } => format!("switching {server} to {version}"),
+        Action::InstallWeb(server) => format!("installing {server}"),
         Action::UseLang { lang, version } => format!("switching {lang} to {version}"),
         Action::OpenProject(p) => format!("opening {p}.test"),
         Action::OpenEditor(p) => format!("opening {p} in the editor"),
@@ -1775,10 +1827,9 @@ fn start_job(
     tx: std::sync::mpsc::Sender<WorkerMsg>,
 ) {
     let ctx = ActionContext {
-        services: app.services.iter().map(|s| s.name.clone()).collect(),
         editor: app.editor.clone(),
     };
-    let job = Job::new(action_label(&action, &ctx));
+    let job = Job::new(action_label(&action));
     let cancel = job.cancel.clone();
     let label = job.label.clone();
     app.job = Some(job);
@@ -1912,30 +1963,15 @@ where
         Action::RestartAll => fine_ill_do_it_myself::orchestrator::stop_all(env, &ports, runner)
             .and_then(|_| fine_ill_do_it_myself::orchestrator::start_all(env, &ports, runner, &php))
             .map(|_| ()),
-        Action::StartService(i) => match ctx.services.get(*i) {
-            Some(name) => {
-                fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
-                    .map(|_| ())
-            }
-            None => Err(fine_ill_do_it_myself::Error::Other(format!(
-                "service row {i} no longer exists"
-            ))),
-        },
-        Action::StopService(i) => match ctx.services.get(*i) {
-            Some(name) => stop_named(env, &ports, runner, name),
-            None => Err(fine_ill_do_it_myself::Error::Other(format!(
-                "service row {i} no longer exists"
-            ))),
-        },
-        Action::RestartService(i) => match ctx.services.get(*i) {
-            Some(name) => stop_named(env, &ports, runner, name).and_then(|_| {
-                fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
-                    .map(|_| ())
-            }),
-            None => Err(fine_ill_do_it_myself::Error::Other(format!(
-                "service row {i} no longer exists"
-            ))),
-        },
+        Action::StartService(name) => {
+            fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
+                .map(|_| ())
+        }
+        Action::StopService(name) => stop_named(env, &ports, runner, name),
+        Action::RestartService(name) => stop_named(env, &ports, runner, name).and_then(|_| {
+            fine_ill_do_it_myself::orchestrator::start_service(env, &ports, runner, &php, name)
+                .map(|_| ())
+        }),
         Action::UsePhp(v) => {
             let cli_env = crate::cli::CliEnv {
                 env: env.clone(),
@@ -2106,6 +2142,14 @@ where
                     .and_then(|_| crate::cli::install_shims(&cli).map(|_| ()))
             }
         }
+        Action::InstallWeb(server) => {
+            let cli = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: php.clone(),
+            };
+            crate::cli::install(&cli, server).map(|_| ())
+        }
         Action::CreateProject { name, template, db } => {
             let cli = crate::cli::CliEnv {
                 env: env.clone(),
@@ -2162,6 +2206,7 @@ where
         (Ok(()), Action::InstallManaged(name)) => {
             format!("{name} installed; PATH setup: fidim env --install --shell")
         }
+        (Ok(()), Action::InstallWeb(server)) => format!("{server} installed"),
         (Ok(()), Action::CreateProject { name, template, .. }) => {
             format!("created {name} ({})", template.label())
         }
@@ -2173,6 +2218,7 @@ where
             format!("{lang} {version} install: {e}")
         }
         (Err(e), Action::InstallManaged(name)) => format!("{name} install: {e}"),
+        (Err(e), Action::InstallWeb(server)) => format!("{server} install: {e}"),
         (Err(e), Action::CreateProject { name, .. }) => format!("create {name}: {e}"),
         (Err(e), _) => format!("{action:?}: {e}").to_lowercase(),
     };
@@ -2195,7 +2241,6 @@ fn perform_action<R: fine_ill_do_it_myself::Runner + Clone>(
     action: &Action,
 ) {
     let ctx = ActionContext {
-        services: app.services.iter().map(|s| s.name.clone()).collect(),
         editor: app.editor.clone(),
     };
     let outcome = execute_action(
@@ -3138,14 +3183,14 @@ mod tests {
             vec!["blog".into()],
         );
         a.on_key(KeyCode::Char('s'));
-        assert_eq!(a.actions[0], Action::StartService(0));
+        assert_eq!(a.actions[0], Action::StartService("caddy".into()));
         a.actions.clear();
         a.on_key(KeyCode::Tab); // services -> languages (php-8.4)
         a.on_key(KeyCode::Char('x'));
-        assert_eq!(a.actions[0], Action::StopService(1));
+        assert_eq!(a.actions[0], Action::StopService("php-8.4".into()));
         a.actions.clear();
         a.on_key(KeyCode::Char('r'));
-        assert_eq!(a.actions[0], Action::RestartService(1));
+        assert_eq!(a.actions[0], Action::RestartService("php-8.4".into()));
         // on the projects container `r` restarts everything
         a.actions.clear();
         a.on_key(KeyCode::Tab); // languages -> projects
@@ -3348,6 +3393,30 @@ mod tests {
         assert!(
             text.contains("New project"),
             "the new-project modal must remain visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rendered_selected_httpd_panel_contains_httpd_install_action() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        let mut app = App::new(vec![svc("httpd", false)], vec![]);
+        app.detail = Some("detail: httpd".into());
+        app.panel_right = true;
+        let (_, lines) = mgmt_panel_for(&env, &app.services, 0, &[]);
+        app.mgmt_lines = lines;
+        app.mgmt_title = " httpd management ".into();
+
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| render(&app, f, f.area())).unwrap();
+
+        assert!(
+            rendered_text(term.backend().buffer()).contains("httpd.install"),
+            "the rendered management panel must show httpd.install"
         );
     }
 
@@ -3730,7 +3799,7 @@ mod tests {
                 value: 8290,
             },
         );
-        act(&mut app, &Action::RestartService(0));
+        act(&mut app, &Action::RestartService("nginx".into()));
         let site = std::fs::read_to_string(env.paths.etc().join("nginx/sites/blog.conf")).unwrap();
         assert!(
             site.contains("listen 8290;"),
@@ -3908,6 +3977,161 @@ mod tests {
         assert!(!caddy.iter().any(|l| l.contains("web.use")), "{caddy:?}");
         // panels differ per server, not one shared list
         assert_ne!(nginx, caddy);
+    }
+
+    #[test]
+    fn web_management_panel_offers_manifest_backed_install_for_uninstalled_server() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("caddy", false)], 0, &[]);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("caddy.install 2.10.2")),
+            "uninstalled manifest-backed web server should have an install action: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn web_management_panel_only_lists_selected_web_server_install_action() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("caddy", false)], 0, &[]);
+
+        assert!(
+            lines.iter().any(|line| line.contains("caddy.install")),
+            "selected server must expose its installer: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("httpd.install")),
+            "unselected server installers must not be mixed into this panel: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn web_management_panel_offers_httpd_install_when_httpd_is_selected() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("httpd", false)], 0, &[]);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("httpd.install 2.4.67")),
+            "selected httpd must expose its installer: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn web_management_panel_offers_apache_install_and_hides_unavailable_installers() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, apache) = mgmt_panel_for(&env, &[svc("httpd", false)], 0, &[]);
+        let (_, nginx) = mgmt_panel_for(&env, &[svc("nginx", false)], 0, &[]);
+        let (_, lighttpd) = mgmt_panel_for(&env, &[svc("lighttpd", false)], 0, &[]);
+
+        assert!(apache
+            .iter()
+            .any(|line| line.contains("httpd.install 2.4.67")));
+        assert!(nginx
+            .iter()
+            .any(|line| line.contains("nginx.install 1.31.6")));
+        assert!(lighttpd
+            .iter()
+            .any(|line| line.contains("lighttpd.install 1.4.83")));
+    }
+
+    #[test]
+    fn web_management_panel_uses_local_manifest_entries() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::write(
+            env.manifest_path(),
+            r#"
+[[binaries]]
+name = "nginx"
+version = "1.29.2"
+url = "https://example.test/nginx.tar.gz"
+"#,
+        )
+        .unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("nginx", false)], 0, &[]);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("nginx.install 1.29.2")));
+    }
+
+    #[test]
+    fn web_management_panel_offers_httpd_install_when_only_its_directory_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::create_dir_all(env.paths.bin().join("httpd")).unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("httpd", false)], 0, &[]);
+
+        assert!(lines.iter().any(|line| line.contains("httpd.install")));
+    }
+
+    #[test]
+    fn global_management_panel_offers_uninstalled_httpd() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(
+            &env,
+            &[],
+            0,
+            &[ConfigRow::UseWeb {
+                name: "httpd".into(),
+                ver: None,
+            }],
+        );
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("httpd.install 2.4.67")));
+    }
+
+    #[test]
+    fn global_management_panel_offers_httpd_when_runtime_directory_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+        std::fs::create_dir_all(env.paths.bin().join("httpd")).unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[], 0, &[]);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("httpd.install 2.4.67")));
+    }
+
+    #[test]
+    fn bundled_manifest_includes_nginx_and_lighttpd_install_sources() {
+        let manifest =
+            fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+                .unwrap();
+
+        for server in ["nginx", "lighttpd"] {
+            assert!(
+                manifest.find(server).is_some(),
+                "missing bundled source for {server}"
+            );
+        }
     }
 
     #[test]
@@ -4219,7 +4443,25 @@ mod tests {
         let mut a = App::new(vec![svc("caddy", false)], vec![]);
         a.on_key(KeyCode::Enter);
 
-        assert_eq!(a.actions, vec![Action::StartService(0)]);
+        assert_eq!(a.actions, vec![Action::StartService("caddy".into())]);
+    }
+
+    #[test]
+    fn queued_service_start_keeps_the_selected_name_when_status_order_changes() {
+        let mut app = App::new(
+            vec![
+                svc("caddy", false),
+                svc("httpd", false),
+                svc("nginx", false),
+            ],
+            vec![],
+        );
+        app.cursor_left = 1;
+        app.on_key(KeyCode::Enter);
+        let action = app.actions.pop().expect("Enter must queue a start");
+
+        app.services.swap(0, 1);
+        assert_eq!(action_label(&action), "starting httpd");
     }
 
     #[test]
@@ -4421,6 +4663,8 @@ mod tests {
     fn enter_on_install_rows_queues_runtime_and_component_actions() {
         let cases = [
             ("  php.install 8.4", Action::InstallPhp("8.4".into())),
+            ("  caddy.install 2.10.2", Action::InstallWeb("caddy".into())),
+            ("  httpd.install 2.4.67", Action::InstallWeb("httpd".into())),
             (
                 "  node.install 24",
                 Action::InstallLang {
@@ -4604,10 +4848,13 @@ mod tests {
 
     #[test]
     fn queued_actions_are_taken_first_in_first_out() {
-        let mut queue = vec![Action::RestartAll, Action::StopService(0)];
+        let mut queue = vec![Action::RestartAll, Action::StopService("caddy".into())];
 
         assert_eq!(take_next(&mut queue), Some(Action::RestartAll));
-        assert_eq!(take_next(&mut queue), Some(Action::StopService(0)));
+        assert_eq!(
+            take_next(&mut queue),
+            Some(Action::StopService("caddy".into()))
+        );
         assert_eq!(take_next(&mut queue), None);
     }
 

@@ -20,15 +20,21 @@ struct Cli {
 enum Commands {
     /// Open the interactive TUI
     Tui,
+    /// Start all services or one named service
     Start {
         /// Start a single service instead of everything
+        #[arg(value_name = "SERVICE")]
         service: Option<String>,
     },
+    /// Stop all services or one named service
     Stop {
         /// Stop a single service instead of everything
+        #[arg(value_name = "SERVICE")]
         service: Option<String>,
     },
+    /// Restart all managed services
     Restart,
+    /// Show status for all managed services
     Status,
     /// Print shell exports so managed clients (mysql, php, node, python, go, java) work here
     Env {
@@ -57,21 +63,24 @@ enum Commands {
     Trust,
     /// Run the background daemon exposing a unix socket
     Daemon,
+    /// List projects and their local URLs
     Projects,
     /// Create a project under Sites from a template
     New {
         /// Project name, or template followed by a project name
         #[arg(value_name = "NAME_OR_TEMPLATE", num_args = 1..=2)]
         args: Vec<String>,
-        /// laravel, wordpress, php, html, blank, node or python
+        /// laravel, wordpress, php, html, blank, node, or python
         #[arg(long, short)]
         template: Option<String>,
         /// Also create a MariaDB database with the same name
         #[arg(long)]
         db: bool,
     },
-    /// Download and install a managed binary (caddy, php-fpm-8.4, ...)
+    /// Install a managed component such as caddy, httpd, nginx, lighttpd,
+    /// php-fpm-8.4, mariadb, composer, or phpmyadmin
     Install {
+        #[arg(value_name = "COMPONENT")]
         name: String,
     },
     /// Manage PHP versions
@@ -104,7 +113,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: PortCommands,
     },
-    /// Choose the web server: caddy, apache (httpd) or nginx
+    /// Choose the web server: caddy, httpd (apache), nginx, or lighttpd
     Web {
         #[command(subcommand)]
         cmd: WebCommands,
@@ -113,17 +122,24 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PortCommands {
-    /// Show current ports (shared base + each web server's own pair)
+    /// Show shared ports and each web server's own port pair
     Show,
-    /// Set a port key: http, https, fpm_base, mariadb, or a per-server
-    /// pair like caddy_http / caddy_https / httpd_http / nginx_https / ...
-    Set { key: String, value: u16 },
+    /// Set http, https, fpm_base, mariadb, or a per-server port pair
+    Set {
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(value_name = "PORT")]
+        value: u16,
+    },
 }
 
 #[derive(Subcommand)]
 enum WebCommands {
-    /// Use one of: caddy, apache, nginx
-    Use { server: String },
+    /// Use caddy, httpd (apache), nginx, or lighttpd
+    Use {
+        #[arg(value_name = "SERVER")]
+        server: String,
+    },
     /// Show currently selected web server
     Show,
 }
@@ -151,34 +167,46 @@ enum DnsCommands {
 
 #[derive(Subcommand)]
 enum PhpCommands {
+    /// Install a PHP CLI and PHP-FPM version
     Install {
+        #[arg(value_name = "VERSION")]
         version: String,
     },
+    /// List installed PHP versions
     List,
     #[clap(name = "use")]
+    /// Select the default PHP version
     Use {
+        #[arg(value_name = "VERSION")]
         version: String,
     },
+    /// Remove an installed PHP version
     Remove {
+        #[arg(value_name = "VERSION")]
         version: String,
     },
     /// Show the path to the php.ini configuration file
-    Ini {
-        version: Option<String>,
-    },
+    Ini { version: Option<String> },
 }
 
 #[derive(Subcommand)]
 enum LangCommands {
+    /// Install a runtime version
     Install {
+        #[arg(value_name = "VERSION")]
         version: String,
     },
+    /// List installed runtime versions
     List,
     #[clap(name = "use")]
+    /// Select the default runtime version
     Use {
+        #[arg(value_name = "VERSION")]
         version: String,
     },
+    /// Remove an installed runtime version
     Remove {
+        #[arg(value_name = "VERSION")]
         version: String,
     },
 }
@@ -523,6 +551,39 @@ fn handle_lang_cmd(
 #[cfg(test)]
 mod tests {
     use assert_cmd::Command;
+
+    #[test]
+    fn help_documents_all_supported_web_servers_and_main_commands() {
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        for expected in [
+            "Start all services or one named service",
+            "List projects and their local URLs",
+            "caddy, httpd (apache), nginx, or lighttpd",
+            "Install a managed component",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn web_help_documents_supported_server_names() {
+        let out = Command::cargo_bin("fidim")
+            .unwrap()
+            .args(["web", "--help"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        for expected in ["caddy", "httpd", "apache", "nginx", "lighttpd"] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
 
     #[test]
     fn env_command_prints_shell_exports() {

@@ -536,7 +536,7 @@ pub fn web_version(env: &Env, web: &str) -> Option<String> {
         }
     };
     let out = match web {
-        NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
+        APACHE | NGINX | LIGHTTPD => std::process::Command::new(&bin).arg("-v").output().ok()?,
         _ => std::process::Command::new(&bin)
             .arg("--version")
             .output()
@@ -812,9 +812,10 @@ pub fn status_all<R: Runner + Clone>(
         runner: runner.clone(),
     };
     let mut names = sup.known_services();
-    // show every installed web server, plus the chosen one, php and mariadb
+    // Keep every supported web server visible, including those not installed,
+    // so the TUI can expose their install/use actions.
     for w in [CADDY, APACHE, NGINX, LIGHTTPD] {
-        if web_bin_path(env, w).exists() && !names.iter().any(|n| n == w) {
+        if !names.iter().any(|n| n == w) {
             names.push(w.to_string());
         }
     }
@@ -824,8 +825,8 @@ pub fn status_all<R: Runner + Clone>(
             names.push(n);
         }
     }
-    let web = web_server(env);
     let lock = Lock::load(&env.lock_path()).unwrap_or_default();
+    let web = web_server(env);
     let php = format!("php-{}", default_php(&lock));
     for n in [web.as_str(), php.as_str(), MARIADB] {
         if !names.iter().any(|e| e == n) {
@@ -1151,6 +1152,24 @@ mod tests {
     }
 
     #[test]
+    fn web_version_parses_apache_version_from_dash_v() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::new(t.path().join("app"), t.path().join("Sites"));
+        let bin = env.paths.bin().join("httpd/httpd");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = \"-v\" ]; then echo 'Server version: Apache/2.4.67'; else exit 1; fi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let got = crate::orchestrator::web_version(&env, APACHE);
+
+        assert_eq!(got.as_deref(), Some("2.4.67"));
+    }
+
+    #[test]
     fn generate_configs_binds_nginx_to_its_own_ports() {
         let (env, _t) = env();
         std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
@@ -1294,6 +1313,7 @@ mod tests {
         let st = status_all(&env, &PortPlan::default(), &f);
         assert!(st
             .iter()
+            .filter(|s| { [CADDY, APACHE, NGINX, LIGHTTPD].contains(&s.name.as_str()) })
             .all(|s| s.state == crate::service::ServiceState::Stopped));
     }
 
@@ -1341,8 +1361,8 @@ mod tests {
     }
 
     #[test]
-    fn status_all_shows_chosen_web_only() {
-        // apache binary is absent in the temp env, yet the chosen one is listed
+    fn status_all_shows_every_supported_web_server() {
+        // Apache is absent in the temp env, but all choices remain listed.
         let (env, _t) = env();
         let lock = Lock {
             web_default: Some(APACHE.into()),
@@ -1352,13 +1372,26 @@ mod tests {
         let f = FakeRunner::default();
         let st = status_all(&env, &PortPlan::default(), &f);
         let names: Vec<_> = st.iter().map(|s| s.name.as_str().to_string()).collect();
+        for web in [CADDY, APACHE, NGINX, LIGHTTPD] {
+            assert!(
+                names.iter().any(|name| name == web),
+                "{web} should be listed"
+            );
+        }
+    }
+
+    #[test]
+    fn status_all_shows_uninstalled_web_server_with_stale_pid_file() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.paths.pids().join("nginx.pid"), "999").unwrap();
+
+        let statuses = status_all(&env, &PortPlan::default(), &FakeRunner::default());
+        let nginx = statuses.iter().find(|status| status.name == NGINX);
+
         assert!(
-            names.contains(&"httpd".to_string()),
-            "chosen apache shows as httpd"
-        );
-        assert!(
-            !names.contains(&"caddy".to_string()),
-            "caddy hidden when not chosen"
+            nginx.is_some(),
+            "an uninstalled web server must still appear in the list"
         );
     }
 
