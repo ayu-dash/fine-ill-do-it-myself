@@ -22,6 +22,8 @@ pub enum Action {
     ShowDetail(String),
     /// Switch a web server's active binary version (e.g. caddy -> caddy-2.9.1).
     UseServerVersion { server: String, version: String },
+    /// Install a web server from the bundled manifest.
+    InstallWeb(String),
     /// Switch a programming language version (e.g. node -> node-22).
     UseLang { lang: String, version: String },
     /// Open a project in the default browser.
@@ -719,11 +721,21 @@ impl App {
             self.message = format!("phpmyadmin.install {} requested", rest.trim());
             self.actions
                 .push(Action::InstallManaged("phpmyadmin".to_string()));
-        } else if let Some((lang, version)) = text.split_once(".install ") {
-            if ["node", "python", "go", "java"].contains(&lang) {
-                self.message = format!("{lang}.install {version} requested");
+        } else if let Some((server, version)) = text.split_once(".install ") {
+            if [
+                fine_ill_do_it_myself::orchestrator::CADDY,
+                fine_ill_do_it_myself::orchestrator::APACHE,
+                fine_ill_do_it_myself::orchestrator::NGINX,
+                fine_ill_do_it_myself::orchestrator::LIGHTTPD,
+            ]
+            .contains(&server)
+            {
+                self.message = format!("{server}.install requested");
+                self.actions.push(Action::InstallWeb(server.to_string()));
+            } else if ["node", "python", "go", "java"].contains(&server) {
+                self.message = format!("{server}.install {version} requested");
                 self.actions.push(Action::InstallLang {
-                    lang: lang.to_string(),
+                    lang: server.to_string(),
                     version: version.to_string(),
                 });
             }
@@ -1160,6 +1172,20 @@ pub fn footer_hints(app: &App) -> Vec<(String, &'static str)> {
     out
 }
 
+fn web_install_rows(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
+    if fine_ill_do_it_myself::orchestrator::web_bin_path(env, server).exists() {
+        return Vec::new();
+    }
+
+    let manifest =
+        fine_ill_do_it_myself::Manifest::parse(fine_ill_do_it_myself::installer_defaults())
+            .expect("bundled installer manifest must be valid");
+    manifest
+        .find(server)
+        .map(|source| vec![format!("  {server}.install {}", source.version)])
+        .unwrap_or_default()
+}
+
 /// Discovered alternate versions of a web server in `bin/` or `bin/<server>/` (e.g. caddy-2.9.1).
 pub fn installed_server_versions(env: &fine_ill_do_it_myself::Env, server: &str) -> Vec<String> {
     let mut vers = Vec::new();
@@ -1273,6 +1299,7 @@ fn mgmt_panel_for(
         {
             let ver = fine_ill_do_it_myself::orchestrator::web_version(env, &svc.name);
             let mut lines = web_mgmt_lines(&svc.name, &cur_web, ver.as_deref(), &ports);
+            lines.extend(web_install_rows(env, &svc.name));
             let vers = installed_server_versions(env, &svc.name);
             if !vers.is_empty() {
                 lines.push(String::new());
@@ -1754,6 +1781,7 @@ fn action_label(action: &Action, ctx: &ActionContext) -> String {
         Action::SetPort { key, value } => format!("setting {key} = {value}"),
         Action::ShowDetail(n) => format!("loading {n}"),
         Action::UseServerVersion { server, version } => format!("switching {server} to {version}"),
+        Action::InstallWeb(server) => format!("installing {server}"),
         Action::UseLang { lang, version } => format!("switching {lang} to {version}"),
         Action::OpenProject(p) => format!("opening {p}.test"),
         Action::OpenEditor(p) => format!("opening {p} in the editor"),
@@ -2106,6 +2134,14 @@ where
                     .and_then(|_| crate::cli::install_shims(&cli).map(|_| ()))
             }
         }
+        Action::InstallWeb(server) => {
+            let cli = crate::cli::CliEnv {
+                env: env.clone(),
+                ports: ports.clone(),
+                php_default: php.clone(),
+            };
+            crate::cli::install(&cli, server).map(|_| ())
+        }
         Action::CreateProject { name, template, db } => {
             let cli = crate::cli::CliEnv {
                 env: env.clone(),
@@ -2162,6 +2198,7 @@ where
         (Ok(()), Action::InstallManaged(name)) => {
             format!("{name} installed; PATH setup: fidim env --install --shell")
         }
+        (Ok(()), Action::InstallWeb(server)) => format!("{server} installed"),
         (Ok(()), Action::CreateProject { name, template, .. }) => {
             format!("created {name} ({})", template.label())
         }
@@ -2173,6 +2210,7 @@ where
             format!("{lang} {version} install: {e}")
         }
         (Err(e), Action::InstallManaged(name)) => format!("{name} install: {e}"),
+        (Err(e), Action::InstallWeb(server)) => format!("{server} install: {e}"),
         (Err(e), Action::CreateProject { name, .. }) => format!("create {name}: {e}"),
         (Err(e), _) => format!("{action:?}: {e}").to_lowercase(),
     };
@@ -3911,6 +3949,39 @@ mod tests {
     }
 
     #[test]
+    fn web_management_panel_offers_manifest_backed_install_for_uninstalled_server() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, lines) = mgmt_panel_for(&env, &[svc("caddy", false)], 0, &[]);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("caddy.install 2.10.2")),
+            "uninstalled manifest-backed web server should have an install action: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn web_management_panel_offers_apache_install_and_hides_unavailable_installers() {
+        let t = tempfile::tempdir().unwrap();
+        let env = fine_ill_do_it_myself::Env::new(t.path().join("app"), t.path().join("Sites"));
+        env.ensure_dirs().unwrap();
+
+        let (_, apache) = mgmt_panel_for(&env, &[svc("httpd", false)], 0, &[]);
+        let (_, nginx) = mgmt_panel_for(&env, &[svc("nginx", false)], 0, &[]);
+        let (_, lighttpd) = mgmt_panel_for(&env, &[svc("lighttpd", false)], 0, &[]);
+
+        assert!(apache
+            .iter()
+            .any(|line| line.contains("httpd.install 2.4.67")));
+        assert!(!nginx.iter().any(|line| line.contains(".install")));
+        assert!(!lighttpd.iter().any(|line| line.contains(".install")));
+    }
+
+    #[test]
     fn ports_label_shows_overridden_ports_from_ports_toml() {
         let t = tempfile::tempdir().unwrap();
         std::fs::write(t.path().join("ports.toml"), "nginx_http = 9090\n").unwrap();
@@ -4421,6 +4492,8 @@ mod tests {
     fn enter_on_install_rows_queues_runtime_and_component_actions() {
         let cases = [
             ("  php.install 8.4", Action::InstallPhp("8.4".into())),
+            ("  caddy.install 2.10.2", Action::InstallWeb("caddy".into())),
+            ("  httpd.install 2.4.67", Action::InstallWeb("httpd".into())),
             (
                 "  node.install 24",
                 Action::InstallLang {
