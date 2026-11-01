@@ -4647,10 +4647,16 @@ url = "https://example.test/nginx.tar.gz"
             lines.iter().any(|l| l.contains("composer.install")),
             "composer must be installable from the panel: {lines:?}"
         );
-        for component in ["php.install", "mariadb.install", "phpmyadmin.install"] {
+        for component in ["php.install", "phpmyadmin.install"] {
             assert!(
                 lines.iter().any(|line| line.contains(component)),
                 "{component} must be installable from the panel: {lines:?}"
+            );
+        }
+        if fine_ill_do_it_myself::orchestrator::find_mariadbd(&env).is_none() {
+            assert!(
+                lines.iter().any(|line| line.contains("mariadb.install")),
+                "mariadb must be installable when no server is available: {lines:?}"
             );
         }
         assert!(
