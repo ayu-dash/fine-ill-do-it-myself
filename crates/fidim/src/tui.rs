@@ -1142,7 +1142,7 @@ pub fn web_mgmt_lines(
     let ver_txt = ver.unwrap_or("not installed");
     let mut out = Vec::new();
     if name == cur_web {
-        out.push("  default web (this one)".to_string());
+        out.push("web.use caddy".to_string());
     } else {
         out.push(format!("web.use {name}"));
     }
@@ -4054,12 +4054,19 @@ mod tests {
         );
         assert!(!nginx.iter().any(|l| l.contains("caddy")), "{nginx:?}");
         // caddy panel: marked as default, caddy's own ports
-        assert!(caddy.iter().any(|l| l.contains("default web")), "{caddy:?}");
+        assert!(
+            caddy.iter().any(|l| l.contains("web.use caddy")),
+            "{caddy:?}"
+        );
         assert!(
             caddy.iter().any(|l| l.contains("port http = 8080")),
             "{caddy:?}"
         );
-        assert!(!caddy.iter().any(|l| l.contains("web.use")), "{caddy:?}");
+        assert_eq!(
+            caddy.iter().filter(|l| l.contains("web.use")).count(),
+            1,
+            "{caddy:?}"
+        );
         // panels differ per server, not one shared list
         assert_ne!(nginx, caddy);
     }
@@ -4371,10 +4378,10 @@ url = "https://example.test/nginx.tar.gz"
 
         // mgmt lines as caddy web_mgmt_lines returns (default ports)
         let caddy_lines = vec![
-            "  default web (this one)".to_string(), // 0
-            "  version not installed".to_string(),  // 1
-            "  port http = 8080".to_string(),       // 2
-            "  port https = 8443".to_string(),      // 3
+            "  web.use caddy".to_string(),         // 0
+            "  version not installed".to_string(), // 1
+            "  port http = 8080".to_string(),      // 2
+            "  port https = 8443".to_string(),     // 3
         ];
 
         // dispatch_enter mirrors the fixed run_tui logic
