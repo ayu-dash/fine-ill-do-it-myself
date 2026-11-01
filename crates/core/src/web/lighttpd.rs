@@ -187,6 +187,32 @@ mod tests {
     }
 
     #[test]
+    fn main_conf_omits_openssl_when_tls_is_not_configured() {
+        let t = tempfile::tempdir().unwrap();
+        let etc = t.path().join("etc");
+
+        regenerate(
+            &etc,
+            &t.path().join("dashboard"),
+            "/run/lighttpd.pid",
+            "/logs/error.log",
+            "/logs/access.log",
+            &[],
+            9004,
+            8080,
+            8443,
+            None,
+        )
+        .unwrap();
+
+        let conf = std::fs::read_to_string(etc.join("lighttpd/lighttpd.conf")).unwrap();
+        assert!(
+            !conf.contains("mod_openssl"),
+            "openssl must not load without a TLS socket\n{conf}"
+        );
+    }
+
+    #[test]
     fn site_conf_has_fastcgi_and_leaves_tls_to_the_shared_socket() {
         let c = lighttpd_site_conf(&site("blog", "/Sites/blog"), 9004).unwrap();
         assert!(c.contains("server.document-root = \"/Sites/blog\""));

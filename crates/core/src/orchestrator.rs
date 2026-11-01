@@ -1207,6 +1207,139 @@ mod tests {
     }
 
     #[test]
+    fn caddy_serves_dashboard_when_no_projects_exist() {
+        let (env, _t) = env();
+        let ports = PortPlan::default();
+
+        generate_configs(&env, &ports, "8.4").unwrap();
+
+        let cf = std::fs::read_to_string(env.caddyfile_path()).unwrap();
+        let dashboard = env.paths.etc().join("dashboard");
+        assert!(
+            cf.contains(&format!("http://:{}", ports.caddy_http)),
+            "caddy needs a catch-all listener for the dashboard\n{cf}"
+        );
+        assert!(
+            cf.contains(&format!("root * {}", dashboard.display())),
+            "dashboard document root missing\n{cf}"
+        );
+        assert!(
+            dashboard.join("index.html").exists(),
+            "shared dashboard asset missing"
+        );
+    }
+
+    #[test]
+    fn nginx_serves_dashboard_when_no_projects_exist() {
+        let (env, _t) = env();
+        let lock = Lock {
+            web_default: Some(NGINX.into()),
+            ..Lock::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+        let ports = PortPlan::default();
+
+        generate_configs(&env, &ports, "8.4").unwrap();
+
+        let conf = std::fs::read_to_string(env.paths.etc().join("nginx/nginx.conf")).unwrap();
+        let dashboard = env.paths.etc().join("dashboard");
+        assert!(
+            conf.contains(&format!("listen {} default_server;", ports.nginx_http)),
+            "nginx needs a default server for the dashboard\n{conf}"
+        );
+        assert!(
+            conf.contains(&format!("root {};", dashboard.display())),
+            "dashboard document root missing\n{conf}"
+        );
+        assert!(
+            dashboard.join("index.html").exists(),
+            "shared dashboard asset missing"
+        );
+    }
+
+    #[test]
+    fn lighttpd_serves_dashboard_when_no_projects_exist() {
+        let (env, _t) = env();
+        let lock = Lock {
+            web_default: Some(LIGHTTPD.into()),
+            ..Lock::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+        let ports = PortPlan::default();
+
+        generate_configs(&env, &ports, "8.4").unwrap();
+
+        let conf = std::fs::read_to_string(env.paths.etc().join("lighttpd/lighttpd.conf")).unwrap();
+        let dashboard = env.paths.etc().join("dashboard");
+        assert!(
+            conf.contains(&format!(
+                "server.document-root = \"{}\"",
+                dashboard.display()
+            )),
+            "lighttpd must fall back to the dashboard\n{conf}"
+        );
+        assert!(
+            conf.contains("index-file.names = ( \"index.html\" )"),
+            "dashboard index must be served\n{conf}"
+        );
+        assert!(
+            dashboard.join("index.html").exists(),
+            "shared dashboard asset missing"
+        );
+    }
+
+    #[test]
+    fn lighttpd_skips_tls_when_openssl_module_is_missing() {
+        let (env, _t) = env();
+        std::fs::create_dir_all(env.paths.sites().join("blog")).unwrap();
+        let lock = Lock {
+            web_default: Some(LIGHTTPD.into()),
+            ..Lock::default()
+        };
+        lock.save(&env.lock_path()).unwrap();
+
+        generate_configs(&env, &PortPlan::default(), "8.4").unwrap();
+
+        let conf = std::fs::read_to_string(env.paths.etc().join("lighttpd/lighttpd.conf")).unwrap();
+        assert!(
+            !conf.contains("mod_openssl"),
+            "openssl must not load when the module is unavailable\n{conf}"
+        );
+        assert!(
+            !conf.contains("_ssl.conf"),
+            "TLS socket include must be skipped without the module\n{conf}"
+        );
+    }
+
+    #[test]
+    fn lighttpd_module_dir_prefers_the_nested_lib_directory() {
+        let (env, _t) = env();
+        let nested = env.paths.root().join("lighttpd/lib/lighttpd");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let args = web_args(&env, LIGHTTPD);
+
+        assert!(
+            args.contains(&nested.display().to_string()),
+            "lighttpd modules live in lib/lighttpd: {args:?}"
+        );
+    }
+
+    #[test]
+    fn lighttpd_module_dir_falls_back_to_the_flat_lib_directory() {
+        let (env, _t) = env();
+        let flat = env.paths.root().join("lighttpd/lib");
+        std::fs::create_dir_all(&flat).unwrap();
+
+        let args = web_args(&env, LIGHTTPD);
+
+        assert!(
+            args.contains(&flat.display().to_string()),
+            "flat module directory must keep working: {args:?}"
+        );
+    }
+
+    #[test]
     fn generate_configs_serves_framework_projects_from_public() {
         let (env, _t) = env();
         std::fs::create_dir_all(env.paths.sites().join("shop/public")).unwrap();
