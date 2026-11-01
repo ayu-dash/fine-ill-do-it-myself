@@ -8,7 +8,7 @@ usage() {
         'Usage: uninstall.sh [--data-dir DIR] [--bin-dir DIR] [--shim-dir DIR]' \
         '' \
         'This removes the installed executable, its uninstaller, and the matching' \
-        'fidim command symlink. Managed projects, runtimes, config, and logs are kept.' \
+        'fidim command symlink. Projects and the MariaDB data directory are kept.' \
         '' \
         'Options:' \
         '  --data-dir DIR  Installed fidim data root (overrides XDG default)' \
@@ -64,6 +64,11 @@ case "$data_root:$bin_dir:$shim_dir" in
         ;;
 esac
 
+if [ "$data_root" = "/" ]; then
+    printf 'error: refusing to uninstall from filesystem root\n' >&2
+    exit 1
+fi
+
 binary=$data_root/fidim
 uninstaller=$data_root/uninstall.sh
 link=$bin_dir/fidim
@@ -113,4 +118,12 @@ elif [ -e "$uninstaller" ] || [ -L "$uninstaller" ]; then
     printf 'Keeping non-regular uninstaller path %s\n' "$uninstaller"
 fi
 
-printf 'Kept managed data in %s (projects, runtimes, config, and logs).\n' "$data_root"
+if [ -d "$data_root/data" ]; then
+    find "$data_root/data" -mindepth 1 -maxdepth 1 ! -name mariadb -exec rm -rf -- {} +
+fi
+find "$data_root" -mindepth 1 -maxdepth 1 \
+    ! -name projects \
+    ! -name data \
+    -exec rm -rf -- {} +
+
+printf 'Kept projects and MariaDB data in %s.\n' "$data_root"

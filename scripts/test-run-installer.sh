@@ -56,15 +56,16 @@ if HOME=$home "$installer" --data-dir "$home/.local/share/fine-ill-do-it-myself"
     printf 'error: installer replaced an existing link without confirmation\n' >&2
     exit 1
 fi
-test "$("$home/.local/bin/fidim" --version)" = "fidim 1.0"
+test "$(cat "$home/.local/share/fine-ill-do-it-myself/fidim")" = "keep this"
 
 HOME=$home "$installer" --yes --data-dir "$home/.local/share/fine-ill-do-it-myself" --bin-dir "$home/.local/bin"
 test "$("$home/.local/bin/fidim" --version)" = "fidim 2.0"
 
 data_root=$home/.local/share/fine-ill-do-it-myself
-mkdir -p "$data_root/projects/sample" "$data_root/runtimes/php"
+mkdir -p "$data_root/projects/sample" "$data_root/data/mariadb/mysql" "$data_root/runtimes/php"
 printf 'keep project data\n' > "$data_root/projects/sample/index.php"
-printf 'keep runtime data\n' > "$data_root/runtimes/php/version"
+printf 'keep database data\n' > "$data_root/data/mariadb/mysql/schema"
+printf 'remove runtime data\n' > "$data_root/runtimes/php/version"
 for shim in \
     mysql mariadb mysqladmin mariadb-admin mysqldump mariadb-dump \
     php composer node npm npx corepack python python3 pip pip3 go gofmt \
@@ -91,7 +92,8 @@ test -x "$home/.local/bin/npm"
 test ! -e "$data_root/fidim"
 test ! -e "$data_root/uninstall.sh"
 test -f "$data_root/projects/sample/index.php"
-test -f "$data_root/runtimes/php/version"
+test -f "$data_root/data/mariadb/mysql/schema"
+test ! -e "$data_root/runtimes"
 
 make_fake_fidim 3.0 "$fake_binary"
 "$repo_root/scripts/build-run-installer.sh" "$fake_binary" "$installer"
