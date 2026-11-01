@@ -45,7 +45,6 @@ impl Paths {
             self.etc(),
             self.logs(),
             self.pids(),
-            self.data(),
             self.runtimes(),
             self.sites.clone(),
         ] {
@@ -86,7 +85,7 @@ mod tests {
         assert!(p.etc().exists());
         assert!(p.logs().exists());
         assert!(p.pids().exists());
-        assert!(p.data().exists());
+        assert!(!p.data().exists());
         assert_eq!(p.sites(), std::path::Path::new(t.path()).join("Sites"));
     }
 

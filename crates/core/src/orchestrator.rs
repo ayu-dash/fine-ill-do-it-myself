@@ -349,39 +349,35 @@ fn start_service_with<R: Runner + Clone>(
         ensure_started(&sup, MARIADB, pid, &log, Some(ports.mariadb))?;
         return Ok(sup.status(MARIADB));
     }
-    generate_configs(env, ports, php_version)?;
     let sup = Supervisor {
         env: env.clone(),
         ports: ports.clone(),
         runner: runner.clone(),
     };
     let fpm_port = fpm_port_for(php_version, ports.fpm_base, ports);
-    let spec = service_cmds(env, ports, php_version)?
-        .into_iter()
-        .find(|(n, ..)| n == name);
-    // a web server that is installed but not the chosen default: regenerate
-    // ITS OWN config set (its own ports) before spawning
-    let spec = match spec {
-        Some(s) => Some(s),
-        None => {
-            if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name) {
-                generate_web_configs(env, ports, php_version, name)?;
-                resolve_web_bin(env, name).ok().map(|bin| {
-                    (
-                        name.to_string(),
-                        bin.display().to_string(),
-                        web_args(env, name),
-                        env.paths.logs().join(format!("{name}.log")),
-                    )
-                })
-            } else {
-                None
-            }
-        }
+    let spec = if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name) {
+        // Starting a named web server must not depend on the selected default
+        // server being installed. Generate and resolve only this server.
+        generate_web_configs(env, ports, php_version, name)?;
+        resolve_web_bin(env, name).ok().map(|bin| {
+            (
+                name.to_string(),
+                bin.display().to_string(),
+                web_args(env, name),
+                env.paths.logs().join(format!("{name}.log")),
+            )
+        })
+    } else {
+        generate_configs(env, ports, php_version)?;
+        service_cmds(env, ports, php_version)?
+            .into_iter()
+            .find(|(n, ..)| n == name)
     };
     let (name, bin, args, log) =
         spec.ok_or_else(|| Error::Other(format!("unknown service {name}")))?;
-    if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str()) {
+    if [CADDY, APACHE, NGINX, LIGHTTPD].contains(&name.as_str())
+        && php_binary_for(env, php_version).is_some()
+    {
         ensure_php_fpm_started(env, ports, runner, php_version, scan)?;
     }
     sup.reap_orphans(&name, scan)?;
@@ -592,7 +588,7 @@ pub fn resolve_web_bin(env: &Env, web: &str) -> Result<std::path::PathBuf> {
 /// Absolute `PATH`-resolved binary name (httpd/nginx/caddy); None when absent
 /// from PATH or data/bin.
 /// php-fpm binary for `version`: `bin/php/php-fpm-<v>` or `bin/php-fpm-<v>` first,
-/// then a drop-in folder under `data/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
+/// then a drop-in folder under `<root>/php/<v>/` (php-fpm / bin/php-fpm / sbin/php-fpm).
 pub fn php_binary_for(env: &Env, version: &str) -> Option<std::path::PathBuf> {
     for dir in [env.paths.bin().join("php"), env.paths.bin()] {
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -1290,6 +1286,20 @@ mod tests {
     }
 
     #[test]
+    fn starting_named_web_does_not_require_missing_default_web() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        let nginx = env.paths.bin().join("nginx");
+        std::fs::write(&nginx, "#!/bin/sh\n").unwrap();
+
+        let runner = FakeRunner::default();
+        let status = start_service(&env, &PortPlan::default(), &runner, "8.4", NGINX).unwrap();
+
+        assert_eq!(status.name, NGINX);
+        assert!(!env.paths.pids().join("caddy.pid").exists());
+    }
+
+    #[test]
     fn starting_web_server_reports_automatic_php_fpm_start_failure() {
         let (env, _t) = env();
         env.ensure_dirs().unwrap();
@@ -1303,6 +1313,23 @@ mod tests {
         assert!(
             result.is_err(),
             "starting the web server must report if its automatic PHP-FPM start fails"
+        );
+    }
+
+    #[test]
+    fn starting_web_server_without_php_starts_the_web_service() {
+        let (env, _t) = env();
+        env.ensure_dirs().unwrap();
+        std::fs::write(env.caddy_bin(), "#!/bin/sh\n").unwrap();
+
+        let runner = FakeRunner::default();
+        let status = start_service(&env, &PortPlan::default(), &runner, "8.4", CADDY).unwrap();
+
+        assert_eq!(status.name, CADDY);
+        assert_eq!(status.state, crate::service::ServiceState::Running);
+        assert!(
+            !env.paths.pids().join("php-8.4.pid").exists(),
+            "PHP-FPM must remain stopped when it is not installed"
         );
     }
 
@@ -1888,27 +1915,24 @@ fn service_cmds(env: &Env, ports: &PortPlan, php_version: &str) -> Result<Vec<Cm
         web_args(env, &web),
         env.paths.logs().join(format!("{web}.log")),
     ));
-    let php_bin = php_binary_for(env, php_version).ok_or_else(|| {
-        Error::Other(format!(
-            "php {php_version} not installed (fidim install php-fpm-{php_version}              or drop an extracted build into data/php/{php_version})"
-        ))
-    })?;
-    let mut fpm_args = vec![
-        "-F".to_string(),
-        "-y".to_string(),
-        env.fpm_conf_path(php_version).display().to_string(),
-    ];
-    let ini_path = env.php_ini_path(php_version);
-    if ini_path.exists() {
-        fpm_args.push("-c".to_string());
-        fpm_args.push(ini_path.display().to_string());
+    if let Some(php_bin) = php_binary_for(env, php_version) {
+        let mut fpm_args = vec![
+            "-F".to_string(),
+            "-y".to_string(),
+            env.fpm_conf_path(php_version).display().to_string(),
+        ];
+        let ini_path = env.php_ini_path(php_version);
+        if ini_path.exists() {
+            fpm_args.push("-c".to_string());
+            fpm_args.push(ini_path.display().to_string());
+        }
+        cmds.push((
+            format!("php-{php_version}"),
+            php_bin.display().to_string(),
+            fpm_args,
+            env.paths.logs().join(format!("php-{php_version}.log")),
+        ));
     }
-    cmds.push((
-        format!("php-{php_version}"),
-        php_bin.display().to_string(),
-        fpm_args,
-        env.paths.logs().join(format!("php-{php_version}.log")),
-    ));
     // mariadb (system binary) when available
     if mariadb_available(env).unwrap_or(false) {
         let mariadb_cnf = env.paths.etc().join("my.cnf");
