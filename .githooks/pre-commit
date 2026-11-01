@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Fast checks for every commit. Integration tests stay out on purpose; CI runs
+# the full workspace test suite.
+set -eu
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --lib --bins
