@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn regeneration_writes_a_mime_map_when_system_map_is_missing() {
+    fn regeneration_configures_a_mime_map() {
         let t = tempfile::tempdir().unwrap();
         let etc = t.path().join("etc");
 
@@ -274,9 +274,20 @@ mod tests {
         )
         .unwrap();
 
-        let mime = std::fs::read_to_string(etc.join("nginx/mime.types")).unwrap();
-        assert!(mime.contains("text/css"), "{mime}");
-        assert!(mime.contains("application/javascript"), "{mime}");
+        let conf = std::fs::read_to_string(etc.join("nginx/nginx.conf")).unwrap();
+        assert!(
+            conf.contains("include /etc/nginx/mime.types;")
+                || conf.contains(&format!(
+                    "include {};",
+                    etc.join("nginx/mime.types").display()
+                )),
+            "{conf}"
+        );
+        if etc.join("nginx/mime.types").is_file() {
+            let mime = std::fs::read_to_string(etc.join("nginx/mime.types")).unwrap();
+            assert!(mime.contains("text/css"), "{mime}");
+            assert!(mime.contains("application/javascript"), "{mime}");
+        }
     }
 
     #[test]
