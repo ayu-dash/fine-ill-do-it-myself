@@ -112,6 +112,7 @@ mod tests {
                 files: Vec::new(),
                 install_dir: String::new(),
                 strip_components: 0,
+                source_build: false,
             }],
         }
     }

@@ -147,6 +147,9 @@ pub fn generate_web_configs(
     let certs_str = certs_dir.display().to_string();
     // each web server binds its OWN http/https pair, never the shared global one
     let (http_port, https_port) = ports.web_ports(web);
+    // Every server gets the same dashboard so `fidim start` is useful before a
+    // first project exists (and for unknown hostnames afterwards).
+    let dashboard_dir = crate::web::dashboard::write(&env.paths.etc(), &projects, http_port)?;
     let certs_pair = |p: &str| {
         let crt = certs_dir.join(format!("{p}.crt"));
         let key = certs_dir.join(format!("{p}.key"));
@@ -155,9 +158,12 @@ pub fn generate_web_configs(
     let web = web.to_string();
     match web.as_str() {
         LIGHTTPD => {
+            // A build without OpenSSL ships no mod_openssl.so; advertising TLS
+            // then makes lighttpd fail at startup, so fall back to HTTP only.
+            let tls_certs = lighttpd_has_openssl(env).then_some(certs_str.as_str());
             crate::web::lighttpd::regenerate(
                 &env.paths.etc(),
-                &env.paths.root().join("lighttpd/default"),
+                &dashboard_dir,
                 &env.paths.pids().join("lighttpd.pid").display().to_string(),
                 &env.paths.logs().join("lighttpd.log").display().to_string(),
                 &env.paths
@@ -169,7 +175,7 @@ pub fn generate_web_configs(
                 fpm_port,
                 http_port,
                 https_port,
-                Some(&certs_str),
+                tls_certs,
             )?;
         }
         APACHE => {
@@ -211,10 +217,13 @@ pub fn generate_web_configs(
                     "\ttls internal\n".to_string()
                 }
             };
-            std::fs::write(
-                env.caddyfile_path(),
-                generate_caddyfile_for_sites(&sites, fpm_port, http_port, https_port, &tls_line)?,
-            )?;
+            let mut caddyfile =
+                generate_caddyfile_for_sites(&sites, fpm_port, http_port, https_port, &tls_line)?;
+            caddyfile.push_str(&crate::web::caddyfile::dashboard_block(
+                &dashboard_dir,
+                http_port,
+            ));
+            std::fs::write(env.caddyfile_path(), caddyfile)?;
         }
     }
     let _ = certs_pair;
@@ -664,10 +673,26 @@ pub fn web_args(env: &Env, web: &str) -> Vec<String> {
             "-f".into(),
             conf,
             "-m".into(),
-            env.paths.root().join("lighttpd/lib").display().to_string(),
+            lighttpd_module_dir(env).display().to_string(),
         ],
         _ => vec!["run".into(), "--config".into(), conf],
     }
+}
+
+/// Resolve Lighttpd's dynamic module directory across source-build layouts.
+/// CMake installs modules below `lib/lighttpd`, while older/manual installs
+/// may place them directly below `lib`.
+pub fn lighttpd_module_dir(env: &Env) -> PathBuf {
+    let nested = env.paths.root().join("lighttpd/lib/lighttpd");
+    if nested.is_dir() {
+        nested
+    } else {
+        env.paths.root().join("lighttpd/lib")
+    }
+}
+
+fn lighttpd_has_openssl(env: &Env) -> bool {
+    lighttpd_module_dir(env).join("mod_openssl.so").is_file()
 }
 
 /// How long a freshly spawned service must stay alive before it is treated as

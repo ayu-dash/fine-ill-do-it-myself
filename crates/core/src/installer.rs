@@ -4,6 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io, path::PathBuf};
@@ -19,9 +20,9 @@ pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &str) -> Result<Vec<u8>>;
 }
 
-/// Download progress callback: `(done, total)`. `total == 0` means the server
-/// did not report a size, so the UI shows an indeterminate bar.
-pub type ProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
+/// Download progress callback: `(done, total, bytes_per_second)`. `total == 0`
+/// means curl has not reported enough information to estimate the size yet.
+pub type ProgressSink = Arc<dyn Fn(u64, u64, u64) + Send + Sync>;
 
 /// `curl`-backed fetcher. Plain construction keeps the original blocking
 /// behaviour; [`CurlFetcher::with_progress`] adds a progress meter and lets a
@@ -47,11 +48,11 @@ impl CurlFetcher {
         Self::default()
     }
 
-    /// Fetcher whose transfer reports percentages and stops when `cancel` is
+    /// Fetcher whose transfer reports byte progress and stops when `cancel` is
     /// set (the curl child is killed within ~40 ms).
     pub fn with_progress(
         cancel: CancelToken,
-        sink: impl Fn(u64, u64) + Send + Sync + 'static,
+        sink: impl Fn(u64, u64, u64) + Send + Sync + 'static,
     ) -> Self {
         Self {
             cancel: Some(cancel),
@@ -73,7 +74,7 @@ impl CurlFetcher {
 
     fn fetch_streaming(&self, url: &str) -> Result<Vec<u8>> {
         let mut child = Command::new("curl")
-            .args(["-fsSL", "--progress-bar", "--", url])
+            .args(["-fL", "--progress-bar", "--", url])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -89,11 +90,30 @@ impl CurlFetcher {
 
         // Body and progress meter are two pipes: drain them concurrently so
         // neither side can fill its buffer and stall curl.
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let started = std::time::Instant::now();
+        let body_downloaded = downloaded.clone();
+        let body_sink = self.progress.clone();
         let body = std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                let n = stdout.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                let done = body_downloaded.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                if let Some(sink) = &body_sink {
+                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                    sink(done, 0, (done as f64 / elapsed) as u64);
+                }
+            }
+            Ok::<_, io::Error>(bytes)
         });
         let sink = self.progress.clone();
+        let meter_downloaded = downloaded.clone();
+        let meter_started = started;
         let meter = std::thread::spawn(move || {
             let mut err = stderr;
             let mut buf = [0u8; 512];
@@ -108,7 +128,14 @@ impl CurlFetcher {
                             if last != Some(pct) {
                                 last = Some(pct);
                                 if let Some(sink) = &sink {
-                                    sink(pct, 100);
+                                    let done = meter_downloaded.load(Ordering::Relaxed);
+                                    let total = if pct > 0 {
+                                        done.saturating_mul(100).checked_div(pct).unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    let elapsed = meter_started.elapsed().as_secs_f64().max(0.001);
+                                    sink(done, total, (done as f64 / elapsed) as u64);
                                 }
                             }
                         }
@@ -146,6 +173,11 @@ impl CurlFetcher {
             .map_err(|_| Error::Other("curl reader panicked".into()))?
             .map_err(Error::Io)?;
         let tail = meter.join().unwrap_or_default();
+        if let Some(sink) = &self.progress {
+            let done = bytes.len() as u64;
+            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            sink(done, done, (done as f64 / elapsed) as u64);
+        }
         if !status.success() {
             let detail = tail
                 .rsplit(['\r', '\n'])
@@ -285,6 +317,81 @@ fn make_executable(path: &Path) -> Result<()> {
         fs::set_permissions(path, perm)?;
     }
     Ok(())
+}
+
+fn build_source_binary(
+    bytes: &[u8],
+    src: &crate::manifest::BinarySource,
+    env: &Env,
+    staging: &Path,
+) -> Result<PathBuf> {
+    let source = staging.join("source");
+    let build = staging.join("build");
+    let prefix = env.paths.root().join(&src.name);
+    fs::create_dir_all(&source)?;
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz);
+    archive.unpack(&source)?;
+
+    let source_root = find_file_in_dir(&source, "CMakeLists.txt")
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .ok_or_else(|| {
+            Error::Other(format!("{} source archive has no CMakeLists.txt", src.name))
+        })?;
+    let output = Command::new("cmake")
+        .args([
+            "-S",
+            &source_root.display().to_string(),
+            "-B",
+            &build.display().to_string(),
+            "-DCMAKE_BUILD_TYPE=Release",
+            &format!("-DCMAKE_INSTALL_PREFIX={}", prefix.display()),
+        ])
+        .output()
+        .map_err(|e| Error::Other(format!("lighttpd build requires cmake: {e}")))?;
+    if !output.status.success() {
+        return Err(Error::Other(format!(
+            "{} configure failed: {}",
+            src.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let output = Command::new("cmake")
+        .args([
+            "--build",
+            &build.display().to_string(),
+            "--target",
+            "install",
+            "--",
+            "-j2",
+        ])
+        .output()
+        .map_err(|e| Error::Other(format!("{} build failed to start: {e}", src.name)))?;
+    if !output.status.success() {
+        return Err(Error::Other(format!(
+            "{} build failed: {}",
+            src.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let installed = [
+        prefix.join("sbin").join(&src.name),
+        prefix.join("bin").join(&src.name),
+        prefix.join(&src.name),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+    .ok_or_else(|| {
+        Error::Other(format!(
+            "{} build completed without an executable",
+            src.name
+        ))
+    })?;
+    let dest = env.paths.bin().join(&src.name);
+    fs::create_dir_all(env.paths.bin())?;
+    fs::copy(&installed, &dest)?;
+    make_executable(&dest)?;
+    Ok(dest)
 }
 
 /// Extract a tarball into `dest_dir`, stripping `strip` leading path components.
@@ -452,6 +559,10 @@ pub fn install<F: Fetcher>(
     if !src.install_dir.is_empty() {
         let primary = install_to_dir::<F>(env, &src, &bytes)?;
         return Ok(primary);
+    }
+
+    if src.source_build {
+        return build_source_binary(&bytes, &src, env, &staging);
     }
 
     // Single-binary / selected-files install (Caddy, PHP-FPM, ...)
@@ -752,7 +863,7 @@ files = ["bin/node:node/node-20", "bin/npm:node/npm-20"]
         let seen = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
         let sink = seen.clone();
 
-        let fetcher = CurlFetcher::with_progress(CancelToken::new(), move |done, total| {
+        let fetcher = CurlFetcher::with_progress(CancelToken::new(), move |done, total, _speed| {
             sink.lock().unwrap().push((done, total));
         });
         let data = fetcher.fetch(&url).unwrap();
@@ -760,8 +871,13 @@ files = ["bin/node:node/node-20", "bin/npm:node/npm-20"]
         assert_eq!(data.len(), 64 * 1024, "the whole body must arrive");
         let seen = seen.lock().unwrap();
         assert!(
-            seen.iter().all(|(_, total)| *total == 100),
-            "progress is reported as a percentage: {seen:?}"
+            seen.iter().any(|(done, _)| *done > 0),
+            "progress reports downloaded bytes: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(done, total)| *done == 64 * 1024 && *total == 64 * 1024),
+            "progress reports the completed size: {seen:?}"
         );
     }
 
@@ -774,7 +890,7 @@ files = ["bin/node:node/node-20", "bin/npm:node/npm-20"]
         let cancel = CancelToken::new();
         cancel.cancel();
 
-        let fetcher = CurlFetcher::with_progress(cancel, |_, _| {});
+        let fetcher = CurlFetcher::with_progress(cancel, |_, _, _| {});
         let err = fetcher.fetch(&url).unwrap_err();
 
         assert!(
