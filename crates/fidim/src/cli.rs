@@ -115,12 +115,20 @@ pub fn install_shims(cli: &CliEnv) -> Result<Vec<std::path::PathBuf>> {
 }
 
 pub fn install(cli: &CliEnv, name: &str) -> Result<std::path::PathBuf> {
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::default();
+    install_with_fetcher(cli, name, &fetcher)
+}
+
+pub fn install_with_fetcher<F: fine_ill_do_it_myself::installer::Fetcher>(
+    cli: &CliEnv,
+    name: &str,
+    fetcher: &F,
+) -> Result<std::path::PathBuf> {
     cli.env.ensure_dirs()?;
     let manifest = load_or_default_manifest(cli)?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
-    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::default();
     let out =
-        fine_ill_do_it_myself::installer::install(&cli.env, &manifest, &mut lock, name, &fetcher)?;
+        fine_ill_do_it_myself::installer::install(&cli.env, &manifest, &mut lock, name, fetcher)?;
     if name == fine_ill_do_it_myself::phpmyadmin::SITE {
         // Expose the freshly extracted tree as a site and refresh vhosts so it
         // is reachable right away. Config generation is best-effort: installing
@@ -145,19 +153,38 @@ pub fn load_or_default_manifest(cli: &CliEnv) -> Result<Manifest> {
     let mut manifest = Manifest::load(&path).map_err(fine_ill_do_it_myself::Error::Io)?;
     let bundled = Manifest::parse(defaults)?;
     for source in bundled.binaries {
-        if !manifest
+        match manifest
             .binaries
-            .iter()
-            .any(|existing| existing.name == source.name)
+            .iter_mut()
+            .find(|existing| existing.name == source.name)
         {
-            manifest.binaries.push(source);
+            Some(existing) if existing.name == "lighttpd" && !existing.source_build => {
+                existing.version = source.version;
+                existing.url = source.url;
+                existing.sha256 = source.sha256;
+                existing.tar_gz = source.tar_gz;
+                existing.source_build = source.source_build;
+                existing.files = source.files;
+            }
+            None => manifest.binaries.push(source),
+            _ => {}
         }
     }
+    Manifest::save(&manifest, &path).map_err(fine_ill_do_it_myself::Error::Io)?;
     Ok(manifest)
 }
 
 /// Install a php version from the manifest (download static build).
 pub fn php_install(cli: &CliEnv, version: &str) -> Result<()> {
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::default();
+    php_install_with_fetcher(cli, version, &fetcher)
+}
+
+pub fn php_install_with_fetcher<F: fine_ill_do_it_myself::installer::Fetcher>(
+    cli: &CliEnv,
+    version: &str,
+    fetcher: &F,
+) -> Result<()> {
     let manifest = load_or_default_manifest(cli)?;
     if manifest.find(&format!("php-{version}")).is_none() {
         return Err(Error::Other(format!(
@@ -169,8 +196,8 @@ pub fn php_install(cli: &CliEnv, version: &str) -> Result<()> {
             "PHP {version} FPM binary is missing from the manifest"
         )));
     }
-    install(cli, &format!("php-fpm-{version}"))?;
-    install(cli, &format!("php-{version}"))?;
+    install_with_fetcher(cli, &format!("php-fpm-{version}"), fetcher)?;
+    install_with_fetcher(cli, &format!("php-{version}"), fetcher)?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
     lock.php.push(version.to_string());
     lock.php.sort();
@@ -202,8 +229,21 @@ pub fn lang_install(cli: &CliEnv, lang: &str, version: &str) -> Result<()> {
     if lang == "php" {
         return php_install(cli, version);
     }
+    let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::default();
+    lang_install_with_fetcher(cli, lang, version, &fetcher)
+}
+
+pub fn lang_install_with_fetcher<F: fine_ill_do_it_myself::installer::Fetcher>(
+    cli: &CliEnv,
+    lang: &str,
+    version: &str,
+    fetcher: &F,
+) -> Result<()> {
+    if lang == "php" {
+        return php_install_with_fetcher(cli, version, fetcher);
+    }
     let name = format!("{lang}-{version}");
-    install(cli, &name)?;
+    install_with_fetcher(cli, &name, fetcher)?;
     let mut lock = Lock::load(&cli.env.lock_path())?;
     let list = lock.languages.entry(lang.to_string()).or_default();
     if !list.contains(&version.to_string()) {
@@ -950,6 +990,33 @@ mod tests {
                 std::env::remove_var("FIDIM_SHIM_DIR");
             }
         }
+    }
+
+    #[test]
+    fn load_manifest_migrates_legacy_lighttpd_file_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let cli = CliEnv::with_data_root(t.path().to_path_buf());
+        cli.env.ensure_dirs().unwrap();
+        std::fs::write(
+            cli.env.manifest_path(),
+            r#"
+[[binaries]]
+name = "lighttpd"
+version = "1.4.83"
+url = "https://download.lighttpd.net/lighttpd/releases-1.4.x/lighttpd-1.4.83.tar.gz"
+sha256 = "old"
+tar_gz = true
+files = ["lighttpd"]
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_or_default_manifest(&cli).unwrap();
+        let lighttpd = manifest.find("lighttpd").unwrap();
+
+        assert!(lighttpd.source_build);
+        assert!(lighttpd.files.is_empty());
+        assert_eq!(lighttpd.sha256.len(), 64);
     }
 
     #[test]

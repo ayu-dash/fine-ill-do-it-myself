@@ -50,6 +50,9 @@ pub struct BinarySource {
     /// Go tarballs have a `go/` prefix, so also use 1.
     #[serde(default)]
     pub strip_components: u32,
+    /// Build an extracted source tree with CMake instead of copying files.
+    #[serde(default)]
+    pub source_build: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -290,6 +293,16 @@ files = ["caddy"]
             assert_eq!(deb.sha256.len(), 64, "{} must pin a sha256", deb.url);
             assert!(deb.sha256.chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    #[test]
+    fn bundled_manifest_marks_lighttpd_as_source_build() {
+        let m = Manifest::parse(crate::installer_defaults()).unwrap();
+        let lighttpd = m.find("lighttpd").expect("lighttpd missing");
+
+        assert!(lighttpd.source_build);
+        assert!(lighttpd.tar_gz);
+        assert!(lighttpd.files.is_empty());
     }
 
     #[test]

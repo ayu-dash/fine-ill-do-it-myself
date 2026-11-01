@@ -30,7 +30,7 @@ version = "1.4.83"
 url = "https://download.lighttpd.net/lighttpd/releases-1.4.x/lighttpd-1.4.83.tar.gz"
 sha256 = "54f9598f6c07df0e9607c74bf6d2f6a45b0f420bcb0590bc5a01c5a6e3355f1a"
 tar_gz = true
-files = ["lighttpd"]
+source_build = true
 
 # ─── MariaDB (portable Linux x86_64 binary tarball) ──────────────────────────
 [[binaries]]

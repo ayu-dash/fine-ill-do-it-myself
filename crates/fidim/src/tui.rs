@@ -172,6 +172,32 @@ pub fn progress_bar(done: u64, total: u64, width: usize) -> String {
     s
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn update_progress(app: &mut App, done: u64, total: u64, speed: u64) {
+    let total = if total == 0 {
+        app.progress
+            .map(|(_, known_total, _)| known_total)
+            .unwrap_or(0)
+    } else {
+        total
+    };
+    app.progress = Some((done, total, speed));
+}
+
 /// True when the cursor sits on a service row (not a language runtime) and the
 /// key matches the binding. `node`/`python`/`go`/`java` are runtimes, not
 /// long-running services, so they have nothing to start or stop.
@@ -303,7 +329,7 @@ pub struct App {
     pub edit_dirty: bool,
     pub detail: Option<String>, // detail view content
     #[allow(dead_code)]
-    pub progress: Option<(u64, u64)>,
+    pub progress: Option<(u64, u64, u64)>,
     /// Cached line count of the right management panel (updated each render
     /// cycle and before Enter dispatch so the cursor clamp is accurate).
     pub mgmt_line_count: usize,
@@ -1027,8 +1053,14 @@ pub fn preview(app: &App) -> String {
     for p in &app.projects {
         out.push_str(&format!("  {p}\n"));
     }
-    if let Some((d, t)) = app.progress {
-        out.push_str(&format!("{}\n", progress_bar(d, t, 20)));
+    if let Some((d, t, speed)) = app.progress {
+        out.push_str(&format!(
+            "{} {} / {} at {}/s\n",
+            progress_bar(d, t, 20),
+            format_bytes(d),
+            format_bytes(t),
+            format_bytes(speed)
+        ));
     }
     out.push_str("press q to quit\n");
     out
@@ -1738,14 +1770,24 @@ pub struct Job {
     pub label: String,
     pub started: std::time::Instant,
     pub cancel: fine_ill_do_it_myself::CancelToken,
+    pub download: bool,
 }
 
 impl Job {
     pub fn new(label: impl Into<String>) -> Self {
+        Self::with_download(label, false)
+    }
+
+    pub fn new_download(label: impl Into<String>) -> Self {
+        Self::with_download(label, true)
+    }
+
+    fn with_download(label: impl Into<String>, download: bool) -> Self {
         Self {
             label: label.into(),
             started: std::time::Instant::now(),
             cancel: fine_ill_do_it_myself::CancelToken::new(),
+            download,
         }
     }
 
@@ -1756,10 +1798,11 @@ impl Job {
 
 /// Messages the worker thread sends back to the UI loop.
 enum WorkerMsg {
-    /// Download progress as (done, total); total 0 means "unknown".
+    /// Download progress as (done, total, bytes/sec); total 0 means "unknown".
     Progress {
         done: u64,
         total: u64,
+        speed: u64,
     },
     Done(Outcome),
     RefreshDone(std::result::Result<RefreshData, String>),
@@ -1829,7 +1872,11 @@ fn start_job(
     let ctx = ActionContext {
         editor: app.editor.clone(),
     };
-    let job = Job::new(action_label(&action));
+    let job = if action_uses_download(&action) {
+        Job::new_download(action_label(&action))
+    } else {
+        Job::new(action_label(&action))
+    };
     let cancel = job.cancel.clone();
     let label = job.label.clone();
     app.job = Some(job);
@@ -1842,8 +1889,8 @@ fn start_job(
             let progress = tx.clone();
             let fetcher = fine_ill_do_it_myself::installer::CurlFetcher::with_progress(
                 cancel.clone(),
-                move |done, total| {
-                    let _ = progress.send(WorkerMsg::Progress { done, total });
+                move |done, total, speed| {
+                    let _ = progress.send(WorkerMsg::Progress { done, total, speed });
                 },
             );
             // A panic in one action must surface as a message, never as a
@@ -1868,6 +1915,18 @@ fn start_job(
     if let Err(e) = spawned {
         app.job = None;
         app.message = format!("cannot start worker: {e}");
+    }
+
+    fn action_uses_download(action: &Action) -> bool {
+        match action {
+            Action::InstallComposer
+            | Action::InstallPhp(_)
+            | Action::InstallLang { .. }
+            | Action::InstallManaged(_)
+            | Action::InstallWeb(_) => true,
+            Action::CreateProject { template, .. } => template.needs_network(),
+            _ => false,
+        }
     }
 }
 
@@ -2116,7 +2175,8 @@ where
                 ports: ports.clone(),
                 php_default: php.clone(),
             };
-            crate::cli::php_install(&cli, version).and_then(|_| crate::cli::php_use(&cli, version))
+            crate::cli::php_install_with_fetcher(&cli, version, fetcher)
+                .and_then(|_| crate::cli::php_use(&cli, version))
         }
         Action::InstallLang { lang, version } => {
             let cli = crate::cli::CliEnv {
@@ -2124,7 +2184,7 @@ where
                 ports: ports.clone(),
                 php_default: php.clone(),
             };
-            crate::cli::lang_install(&cli, lang, version)
+            crate::cli::lang_install_with_fetcher(&cli, lang, version, fetcher)
                 .and_then(|_| crate::cli::lang_use(&cli, lang, version))
         }
         Action::InstallManaged(name) => {
@@ -2138,7 +2198,7 @@ where
                     ports: ports.clone(),
                     php_default: php.clone(),
                 };
-                crate::cli::install(&cli, name)
+                crate::cli::install_with_fetcher(&cli, name, fetcher)
                     .and_then(|_| crate::cli::install_shims(&cli).map(|_| ()))
             }
         }
@@ -2148,7 +2208,7 @@ where
                 ports: ports.clone(),
                 php_default: php.clone(),
             };
-            crate::cli::install(&cli, server).map(|_| ())
+            crate::cli::install_with_fetcher(&cli, server, fetcher).map(|_| ())
         }
         Action::CreateProject { name, template, db } => {
             let cli = crate::cli::CliEnv {
@@ -2593,10 +2653,12 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     if let Some(status_area) = status_area {
         let mut spans: Vec<Span> = Vec::new();
         if let Some(job) = &app.job {
-            spans.push(Span::styled(
-                format!(" {} ", spinner(job.elapsed())),
-                Style::default().fg(Color::Yellow),
-            ));
+            if !job.download {
+                spans.push(Span::styled(
+                    format!(" {} ", spinner(job.elapsed())),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             spans.push(Span::styled(
                 format!("{} {:.0}s ", job.label, job.elapsed().as_secs_f32()),
                 Style::default()
@@ -2604,9 +2666,15 @@ pub fn render(app: &App, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if let Some((done, total)) = app.progress {
+        if let Some((done, total, speed)) = app.progress {
             spans.push(Span::styled(
-                format!("{} ", progress_bar(done, total, 10)),
+                format!(
+                    "{} {} / {} at {}/s ",
+                    progress_bar(done, total, 10),
+                    format_bytes(done),
+                    format_bytes(total),
+                    format_bytes(speed)
+                ),
                 Style::default().fg(Color::Green),
             ));
         }
@@ -2688,7 +2756,9 @@ pub fn run_tui(
         // 1. Results and progress from the worker thread.
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                WorkerMsg::Progress { done, total } => app.progress = Some((done, total)),
+                WorkerMsg::Progress { done, total, speed } => {
+                    update_progress(&mut app, done, total, speed)
+                }
                 WorkerMsg::Done(outcome) => {
                     apply_outcome(&mut app, outcome);
                     app.job = None;
@@ -3156,6 +3226,21 @@ mod tests {
         assert_eq!(progress_bar(50, 100, 10), "[#####.....]  50%");
         assert_eq!(progress_bar(100, 100, 10), "[##########] 100%");
         assert_eq!(progress_bar(5, 0, 4), "[....]   0%");
+    }
+
+    #[test]
+    fn progress_updates_keep_known_total_when_body_event_has_unknown_total() {
+        let mut app = App::new(vec![], vec![]);
+        app.progress = Some((10, 100, 20));
+        update_progress(&mut app, 20, 0, 30);
+        assert_eq!(app.progress, Some((20, 100, 30)));
+    }
+
+    #[test]
+    fn format_bytes_uses_readable_binary_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
     }
 
     #[test]
@@ -4932,6 +5017,12 @@ url = "https://example.test/nginx.tar.gz"
     }
 
     #[test]
+    fn download_jobs_do_not_use_a_spinner_before_progress_arrives() {
+        let job = Job::new_download("downloading composer");
+        assert!(job.download);
+    }
+
+    #[test]
     fn applying_a_detail_outcome_opens_the_cached_panel() {
         let mut app = App::new(vec![svc("caddy", true)], vec![]);
 
@@ -4964,7 +5055,7 @@ url = "https://example.test/nginx.tar.gz"
         app.php_row = "8.4".into();
         app.lang_versions.insert("node".into(), "24".into());
         app.job = Some(Job::new("downloading composer"));
-        app.progress = Some((50, 100));
+        app.progress = Some((50, 100, 1024));
         app.message = "working".into();
         let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
 

@@ -9,11 +9,27 @@ pub fn generate_nginx_conf(
     error_log: &str,
     mime_types: Option<&str>,
 ) -> Result<String> {
+    generate_nginx_conf_with_dashboard(includes, pid, error_log, mime_types, None)
+}
+
+pub fn generate_nginx_conf_with_dashboard(
+    includes: &[String],
+    pid: &str,
+    error_log: &str,
+    mime_types: Option<&str>,
+    dashboard: Option<(&std::path::Path, u16)>,
+) -> Result<String> {
     let mut http = String::from(
         "http {\n    default_type application/octet-stream;\n    sendfile on;\n    index index.php index.html;\n",
     );
     if let Some(mime) = mime_types {
         http.push_str(&format!("    include {mime};\n"));
+    }
+    if let Some((root, port)) = dashboard {
+        http.push_str(&format!(
+            "    server {{\n        listen {port} default_server;\n        root {};\n        index index.html;\n    }}\n",
+            root.display()
+        ));
     }
     for inc in includes {
         http.push_str(&format!("    include {inc};\n"));
@@ -84,6 +100,9 @@ pub fn nginx_server_conf(
     location / {{
         {try_files}
     }}
+    location ~* \.(?:css|js|map|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|otf)$ {{
+        add_header Cache-Control "no-store" always;
+    }}
 {php_location}"#
         )
     };
@@ -124,6 +143,19 @@ pub fn regenerate(
 ) -> Result<()> {
     let conf_dir = etc.join("nginx");
     let sites_dir = conf_dir.join("sites");
+    let prefix = etc
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("nginx");
+    for temp in [
+        "client_body_temp",
+        "proxy_temp",
+        "fastcgi_temp",
+        "uwsgi_temp",
+        "scgi_temp",
+    ] {
+        std::fs::create_dir_all(prefix.join(temp))?;
+    }
     std::fs::create_dir_all(&sites_dir)?;
     if let Ok(rd) = std::fs::read_dir(&sites_dir) {
         for e in rd.flatten() {
@@ -158,7 +190,18 @@ pub fn regenerate(
             let alt = etc.join("nginx/mime.types");
             alt.exists().then(|| alt.display().to_string())
         });
-    let conf = generate_nginx_conf(&includes, pid, error_log, mime.as_deref())?;
+    let mime = mime.or_else(|| {
+        let alt = etc.join("nginx/mime.types");
+        std::fs::write(&alt, MINIMAL_MIME_TYPES).ok()?;
+        Some(alt.display().to_string())
+    });
+    let conf = generate_nginx_conf_with_dashboard(
+        &includes,
+        pid,
+        error_log,
+        mime.as_deref(),
+        Some((etc.join("dashboard").as_path(), http_port)),
+    )?;
     std::fs::write(conf_dir.join("nginx.conf"), conf)
         .map_err(|e| Error::Other(format!("write nginx.conf: {e}")))
 }
@@ -178,6 +221,21 @@ fastcgi_param  REMOTE_PORT        $remote_port;
 fastcgi_param  SERVER_ADDR        $server_addr;
 fastcgi_param  SERVER_PORT        $server_port;
 fastcgi_param  SERVER_NAME        $server_name;
+"#;
+
+const MINIMAL_MIME_TYPES: &str = r#"types {
+    text/html                             html htm;
+    text/css                              css;
+    application/javascript                js;
+    application/json                      json;
+    image/gif                             gif;
+    image/jpeg                            jpeg jpg;
+    image/png                             png;
+    image/svg+xml                         svg;
+    image/x-icon                          ico;
+    font/woff                             woff;
+    font/woff2                            woff2;
+}
 "#;
 
 #[cfg(test)]
@@ -200,6 +258,28 @@ mod tests {
     }
 
     #[test]
+    fn regeneration_writes_a_mime_map_when_system_map_is_missing() {
+        let t = tempfile::tempdir().unwrap();
+        let etc = t.path().join("etc");
+
+        regenerate(
+            &etc,
+            "/run/nginx.pid",
+            "/logs/nginx.log",
+            &[],
+            9001,
+            8082,
+            8445,
+            None,
+        )
+        .unwrap();
+
+        let mime = std::fs::read_to_string(etc.join("nginx/mime.types")).unwrap();
+        assert!(mime.contains("text/css"), "{mime}");
+        assert!(mime.contains("application/javascript"), "{mime}");
+    }
+
+    #[test]
     fn server_block_has_php_pass_and_optional_tls() {
         let site = site("blog", "/Sites/blog");
         let c = nginx_server_conf(
@@ -216,6 +296,7 @@ mod tests {
         assert!(c.contains("server_name blog.test;"));
         assert!(c.contains("root /Sites/blog;"));
         assert!(c.contains("fastcgi_pass 127.0.0.1:9004;"));
+        assert!(c.contains("add_header Cache-Control \"no-store\" always;"));
         assert!(c.contains("SCRIPT_FILENAME $document_root$fastcgi_script_name;"));
         assert!(c.contains("listen 8443 ssl;"));
         assert!(c.contains("ssl_certificate /c/blog.crt;"));

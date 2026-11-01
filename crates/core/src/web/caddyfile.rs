@@ -176,6 +176,21 @@ mod perfolder_tests {
     }
 
     #[test]
+    fn hides_caddy_server_header_from_sites_and_dashboard() {
+        let sites = vec![crate::site::Site {
+            name: "blog".into(),
+            docroot: "/x/blog".into(),
+            proxy: None,
+        }];
+        let out =
+            generate_caddyfile_for_sites(&sites, 9004, 8080, 8443, &|_| String::new()).unwrap();
+
+        assert!(out.contains("\theader -Server"), "{out}");
+        assert!(dashboard_block(std::path::Path::new("/x/dashboard"), 8080)
+            .contains("\theader -Server"));
+    }
+
+    #[test]
     fn proxy_site_uses_reverse_proxy_instead_of_root() {
         let sites = vec![crate::site::Site {
             name: "app".into(),
@@ -214,6 +229,15 @@ mod perfolder_tests {
     }
 }
 
+/// Catch-all HTTP listener serving the shared dashboard. Caddy sorts
+/// hostname matchers before hostless ones, so project vhosts keep priority.
+pub fn dashboard_block(dashboard: &std::path::Path, http_port: u16) -> String {
+    format!(
+        "http://:{http_port} {{\n\theader -Server\n\troot * {}\n\tfile_server\n}}\n",
+        dashboard.display()
+    )
+}
+
 /// One HTTPS + one HTTP block per site, using the detected docroot and a
 /// caller-supplied TLS line for the HTTPS block.
 pub fn generate_caddyfile_for_sites(
@@ -233,17 +257,18 @@ pub fn generate_caddyfile_for_sites(
         let docroot = site.docroot_str();
         let tls = tls_line(site);
         let body = if let Some(port) = site.proxy {
-            format!("\treverse_proxy 127.0.0.1:{port}\n")
+            format!("\theader -Server\n\treverse_proxy 127.0.0.1:{port}\n")
         } else if site.is_framework() {
             // Frameworks want every unknown path to reach index.php.
             format!(
-                "\troot * {docroot}\n\tphp_fastcgi 127.0.0.1:{php_fpm_port}\n\tfile_server browse\n"
+                "\theader -Server\n\troot * {docroot}\n\tphp_fastcgi 127.0.0.1:{php_fpm_port}\n\tfile_server browse\n"
             )
         } else {
             // Flat PHP projects only proxy .php files that exist, so missing
             // paths return 404 instead of the index page.
             format!(
-                "\troot * {docroot}\n\
+                "\theader -Server\n\
+                 \troot * {docroot}\n\
                  \t@php {{\n\
                  \t\tpath *.php /\n\
                  \t\tfile {{\n\
